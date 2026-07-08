@@ -1,0 +1,56 @@
+run_name: 2wiki-0708-default-region-th2
+dataset: longbench-2wiki
+
+dataset_prefix: /mnt/nvme1/datasets
+
+eval_script: run/eval.sh
+results_root: outputs/grid_search_lim
+
+fixed_env:
+  EVAL_BSZ: "auto"
+  MODEL_NAME: "meta-llama/Llama-3.1-8B-Instruct"
+  MODEL_LOAD_IN_4BIT: "False"
+  MEASURE_PROMPT_STATS: "False"
+  CHROMA_EMBED_BACKEND: "default"
+
+auto_eval_bsz:
+  enabled: true
+  candidates:
+    - 8
+    - 12
+    - 16
+    - 20
+    - 24
+    - 28
+    - 32
+    - 36
+    - 40
+    - 44
+    - 48
+    - 52
+    - 56
+    - 60
+    - 64
+  probe_total_num: 8
+
+eval_fixed_env:
+  USE_CLEANER: "False"
+
+preprocess_groups:
+  - name: colbert_sliding_region
+
+eval_axes:
+  DATA_SUBDIR:
+    - sent-default-512
+  EVAL_USE_PAST_CACHE:
+    - "False"
+  COMPRESS_METHOD:
+    - colbert_sliding_region
+  TOP_K:
+    - "10"
+    - "20"
+  RETAIN_TOKEN_RATIO:
+    - "0.125"
+    - "0.25"
+    - "0.5"
+    - "0.75"

@@ -1,0 +1,34 @@
+run_name: hotpotqa-context-0616
+dataset: longbench-hotpotqa
+
+dataset_prefix: /mnt/nvme1/datasets
+
+eval_script: run/eval_retrieval_and_compression.sh
+results_root: outputs/grid_search_context
+
+fixed_env:
+  EVAL_BSZ: "32"
+  TOTAL_NUM: "200"
+
+preprocess_groups:
+  - name: subchunk_sentence_ret1024
+    env:
+      DATA_SUBDIR: sent-title-test
+      COMPRESS_METHOD: compare_all_materialized
+
+eval_axes:
+  COMPARE_EMBED_DEVICE:
+    - cpu
+  COMPRESS_METHOD:
+    - compare_all_materialized
+  GLOBAL_TOP_R:
+    - "0.3"
+    - "0.4"
+    - "0.5"
+    - "0.6"
+  TOP_K:
+    - "5"
+    - "10"
+    - "15"
+    - "20"
+

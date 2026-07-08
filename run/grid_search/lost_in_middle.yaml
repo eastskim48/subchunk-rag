@@ -1,0 +1,46 @@
+run_name: lost-in-the-middle-topk-sweep
+
+dataset: longbench-hotpotqa
+
+dataset_prefix: /mnt/nvme1/datasets
+
+eval_script: run/eval.sh
+results_root: outputs/grid_search_litm
+
+fixed_env:
+  EVAL_BSZ: "4"
+
+eval_fixed_env:
+  USE_CLEANER: "False"
+
+preprocess_groups:
+  - name: subchunk_sentence_ret1024
+    env:
+      PREPROCESS_SUBDIR: sent
+      DATA_SUBDIR: sent
+      SPLITTER: sentence
+      MERGER: null
+      CACHEABLE_CHUNK_SIZE: null
+      RETRIEVABLE_CHUNK_SIZE: "1024"
+      MATERIALIZE_COMPARE_EMBEDS: "True"
+      COMPRESS_METHOD: compare_all_materialized
+
+eval_axes:
+  TOP_K:
+    - "1"
+    - "3"
+    - "5"
+    - "7"
+    - "9"
+    - "11"
+    - "13"
+    - "15"
+    - "17"
+    - "20"
+  GLOBAL_TOP_R:
+    - "0.05"
+    - "0.10"
+    - "0.15"
+  EVAL_USE_PAST_CACHE:
+    - "False"
+    - "True"
