@@ -1,5 +1,6 @@
 import math
 import os
+import time
 from typing import List
 
 import torch
@@ -42,6 +43,10 @@ class ColBERTWindowSummarizer(Compressor):
             os.getenv("COLBERT_LENGTH_PENALTY_ALPHA", "0.1")
         )
         self._token_len_cache: dict[str, int] = {}
+        self.last_profile: dict[str, float | int] = {}
+        self.use_sidecar_token_counts = parse_bool(
+            os.getenv("COLBERT_USE_SIDECAR_TOKEN_COUNTS", "True")
+        )
         artifact_dir = os.getenv("COLBERT_WINDOW_DIR")
         if not artifact_dir:
             dataset_path = os.getenv("DATASET_PATH")
@@ -96,6 +101,31 @@ class ColBERTWindowSummarizer(Compressor):
         )
 
     @staticmethod
+    def _empty_profile() -> dict[str, float | int]:
+        return {
+            "query_encode_time": 0.0,
+            "budget_time": 0.0,
+            "artifact_lookup_time": 0.0,
+            "region_spec_time": 0.0,
+            "region_object_time": 0.0,
+            "sentence_maxsim_time": 0.0,
+            "region_score_time": 0.0,
+            "sort_time": 0.0,
+            "select_time": 0.0,
+            "build_output_time": 0.0,
+            "query_count": 0,
+            "retrieved_doc_count": 0,
+            "region_count": 0,
+            "unique_sentence_count": 0,
+            "sentence_token_count": 0,
+        }
+
+    @staticmethod
+    def _profile_add(profile: dict[str, float | int] | None, key: str, value):
+        if profile is not None:
+            profile[key] = profile.get(key, 0) + value
+
+    @staticmethod
     def _parse_retain_token_ratio(raw_value: str) -> float:
         value = raw_value.strip()
         if value.endswith("%"):
@@ -110,8 +140,8 @@ class ColBERTWindowSummarizer(Compressor):
         return ratio
 
     def _retrieved_context_token_count(self, docs: List[RetrievableChunk]) -> int:
-        total = 0
         seen_ids = set()
+        unique_cacheables = []
         for doc in docs:
             for cacheable in getattr(doc, "cacheables", []) or []:
                 text = getattr(cacheable, "text", None)
@@ -122,8 +152,8 @@ class ColBERTWindowSummarizer(Compressor):
                     if cacheable_id in seen_ids:
                         continue
                     seen_ids.add(cacheable_id)
-                total += self._cacheable_token_len(cacheable)
-        return total
+                unique_cacheables.append(cacheable)
+        return sum(self._cacheable_token_lens(unique_cacheables))
 
     def _resolve_final_token_budget(
         self, docs: List[RetrievableChunk], absolute_budget: int | None
@@ -147,10 +177,68 @@ class ColBERTWindowSummarizer(Compressor):
             cached = self._token_len_cache.get(cacheable_id)
             if cached is not None:
                 return cached
+            sidecar_token_len = (
+                self.artifact.token_count_for_cacheable_id(cacheable_id)
+                if self.use_sidecar_token_counts
+                else None
+            )
+            if sidecar_token_len is not None:
+                self._token_len_cache[cacheable_id] = sidecar_token_len
+                return sidecar_token_len
         token_len = self.encoder.token_count(cacheable.text)
         if cacheable_id:
             self._token_len_cache[cacheable_id] = token_len
         return token_len
+
+    def _cacheable_token_lens(self, cacheables) -> list[int]:
+        lengths: list[int | None] = []
+        missing = []
+        missing_positions = []
+        for position, cacheable in enumerate(cacheables):
+            cacheable_id = getattr(cacheable, "id", None)
+            cached = self._token_len_cache.get(cacheable_id) if cacheable_id else None
+            if cached is None:
+                sidecar_token_len = (
+                    self.artifact.token_count_for_cacheable_id(cacheable_id)
+                    if cacheable_id and self.use_sidecar_token_counts
+                    else None
+                )
+                if sidecar_token_len is not None:
+                    self._token_len_cache[cacheable_id] = sidecar_token_len
+                    lengths.append(sidecar_token_len)
+                    continue
+                lengths.append(None)
+                missing.append(cacheable)
+                missing_positions.append(position)
+            else:
+                lengths.append(cached)
+
+        if missing:
+            token_lengths = self.encoder.token_counts(
+                [cacheable.text for cacheable in missing]
+            )
+            for cacheable, position, token_len in zip(
+                missing, missing_positions, token_lengths
+            ):
+                lengths[position] = token_len
+                cacheable_id = getattr(cacheable, "id", None)
+                if cacheable_id:
+                    self._token_len_cache[cacheable_id] = token_len
+
+        return [int(length) for length in lengths if length is not None]
+
+    @staticmethod
+    def _unique_cacheables(cacheables) -> list:
+        unique = []
+        seen_ids = set()
+        for cacheable in cacheables:
+            cacheable_id = getattr(cacheable, "id", None)
+            if cacheable_id:
+                if cacheable_id in seen_ids:
+                    continue
+                seen_ids.add(cacheable_id)
+            unique.append(cacheable)
+        return unique
 
     def _iter_candidates(self, docs: List[RetrievableChunk]):
         candidates = []
@@ -375,6 +463,24 @@ class FixedRegionColBERTSummarizer(ColBERTWindowSummarizer):
         return regions
 
     @staticmethod
+    def _make_region_cacheable(
+        doc: RetrievableChunk,
+        center_idx: int,
+        selected_indices,
+        cacheables: list[CacheableChunk],
+        region_token_budget: int,
+        suffix: str = "sliding_region",
+    ) -> CacheableChunk:
+        return CacheableChunk(
+            id=f"{doc.id}::{suffix}_{center_idx}",
+            text=" ".join(cacheables[idx].text for idx in selected_indices),
+            parent_doc_id=doc.id,
+            chunk_size=region_token_budget,
+            sentence_ids=[cacheables[idx].id for idx in selected_indices],
+            sentence_texts=[cacheables[idx].text for idx in selected_indices],
+        )
+
+    @staticmethod
     def _build_region_document(
         doc: RetrievableChunk, selected_cacheables: list[CacheableChunk]
     ) -> RetrievableChunk:
@@ -445,6 +551,7 @@ class FixedRegionColBERTSummarizer(ColBERTWindowSummarizer):
 class SlidingRegionColBERTWindowSummarizer(ColBERTWindowSummarizer):
     def __init__(self):
         super().__init__()
+        self._sliding_region_spec_cache = {}
         window_budget = os.getenv("COLBERT_SLIDING_WINDOW_TOKEN_BUDGET")
         artifact_window_budget = int(
             self.artifact.index.get("window_token_budget") or self.encoder.max_length
@@ -488,20 +595,40 @@ class SlidingRegionColBERTWindowSummarizer(ColBERTWindowSummarizer):
         cloned.cacheables = [cacheable.clone() for cacheable in selected_cacheables]
         return cloned
 
-    def _sliding_regions_for_doc(self, doc: RetrievableChunk, chunk_idx: int):
-        cacheables = [
-            cacheable
-            for cacheable in getattr(doc, "cacheables", []) or []
-            if cacheable.text
-        ]
-        if not cacheables:
-            return []
-        vectors = self.artifact.vectors_for_doc(doc)
+    def _sliding_region_cache_key(
+        self, doc: RetrievableChunk, cacheables: list[CacheableChunk]
+    ):
+        return (
+            str(doc.id),
+            self.region_token_budget,
+            tuple(
+                (str(getattr(cacheable, "id", "")), cacheable.text)
+                for cacheable in cacheables
+            ),
+        )
+
+    def _cached_sliding_region_specs(
+        self, doc: RetrievableChunk, cacheables: list[CacheableChunk]
+    ):
+        cache_key = self._sliding_region_cache_key(doc, cacheables)
+        cached = self._sliding_region_spec_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        region_specs = []
+        sidecar_specs = self.artifact.region_specs_for_doc(doc, self.region_token_budget)
+        if sidecar_specs is not None:
+            for center_idx, selected_indices in sidecar_specs:
+                if not selected_indices:
+                    continue
+                region_specs.append((center_idx, selected_indices))
+            self._sliding_region_spec_cache[cache_key] = region_specs
+            return region_specs
+
         specs = self.encoder.build_centered_windows(
             sentences=[cacheable.text for cacheable in cacheables],
             token_budget=self.region_token_budget,
         )
-        regions = []
         seen_region_keys = set()
         for center_idx, spec in enumerate(specs):
             selected_indices = tuple(
@@ -510,25 +637,52 @@ class SlidingRegionColBERTWindowSummarizer(ColBERTWindowSummarizer):
             if not selected_indices or selected_indices in seen_region_keys:
                 continue
             seen_region_keys.add(selected_indices)
-            sentence_ids = [cacheables[idx].id for idx in selected_indices]
-            cacheable = CacheableChunk(
-                id=f"{doc.id}::sliding_region_{center_idx}",
-                text=spec.text,
-                parent_doc_id=doc.id,
-                chunk_size=self.region_token_budget,
-                sentence_ids=sentence_ids,
-                sentence_texts=[cacheables[idx].text for idx in selected_indices],
-            )
+            region_specs.append((center_idx, selected_indices))
+
+        self._sliding_region_spec_cache[cache_key] = region_specs
+        return region_specs
+
+    def _sliding_regions_for_doc(
+        self,
+        doc: RetrievableChunk,
+        chunk_idx: int,
+        profile: dict[str, float | int] | None = None,
+    ):
+        cacheables = [
+            cacheable
+            for cacheable in getattr(doc, "cacheables", []) or []
+            if cacheable.text
+        ]
+        if not cacheables:
+            return []
+        lookup_start = time.perf_counter()
+        vectors = self.artifact.vectors_for_doc(doc)
+        self._profile_add(
+            profile, "artifact_lookup_time", time.perf_counter() - lookup_start
+        )
+        spec_start = time.perf_counter()
+        region_specs = self._cached_sliding_region_specs(doc, cacheables)
+        self._profile_add(profile, "region_spec_time", time.perf_counter() - spec_start)
+        regions = []
+        object_start = time.perf_counter()
+        for center_idx, selected_indices in region_specs:
             regions.append(
                 {
                     "chunk_idx": chunk_idx,
                     "center_idx": center_idx,
-                    "cacheable": cacheable,
+                    "cacheable": None,
+                    "region_id": f"{doc.id}::sliding_region_{center_idx}",
+                    "parent_doc_id": doc.id,
+                    "source_doc": doc,
                     "selected_indices": selected_indices,
                     "source_cacheables": cacheables,
                     "source_vectors": vectors,
                 }
             )
+        self._profile_add(
+            profile, "region_object_time", time.perf_counter() - object_start
+        )
+        self._profile_add(profile, "region_count", len(regions))
         return regions
 
     @staticmethod
@@ -549,6 +703,202 @@ class SlidingRegionColBERTWindowSummarizer(ColBERTWindowSummarizer):
         )
         return sims.max(dim=1).values
 
+    @staticmethod
+    def _sentence_score_cache_key(region, idx: int) -> str:
+        cacheables = region["source_cacheables"]
+        raw_cacheable_id = getattr(cacheables[idx], "id", None)
+        if raw_cacheable_id:
+            return str(raw_cacheable_id)
+        return f"{region['chunk_idx']}::{idx}"
+
+    def _score_sliding_regions_vectorized(
+        self,
+        query_vector: torch.Tensor,
+        regions,
+        profile: dict[str, float | int] | None = None,
+    ) -> list[float]:
+        if not regions:
+            return []
+
+        collect_start = time.perf_counter()
+        sentence_index_by_key: dict[str, int] = {}
+        sentence_vectors = []
+        region_sentence_indices = []
+        fallback_regions = []
+
+        for region_idx, region in enumerate(regions):
+            if region.get("source_vectors") is None:
+                fallback_regions.append(region_idx)
+                region_sentence_indices.append([])
+                continue
+            indices = []
+            source_vectors = region["source_vectors"]
+            cacheables = region["source_cacheables"]
+            for idx in region["selected_indices"]:
+                if not (0 <= idx < len(cacheables)):
+                    continue
+                cache_key = self._sentence_score_cache_key(region, idx)
+                sentence_idx = sentence_index_by_key.get(cache_key)
+                if sentence_idx is None:
+                    vectors = (
+                        source_vectors[idx]
+                        if idx < len(source_vectors)
+                        else torch.empty((0, 0))
+                    )
+                    sentence_idx = len(sentence_vectors)
+                    sentence_index_by_key[cache_key] = sentence_idx
+                    sentence_vectors.append(vectors)
+                indices.append(sentence_idx)
+            region_sentence_indices.append(indices)
+
+        if not sentence_vectors:
+            scores = [float("-inf")] * len(regions)
+            for region_idx in fallback_regions:
+                region = regions[region_idx]
+                scores[region_idx] = score_maxsim(
+                    query_vector, region.get("vectors", torch.empty((0, 0)))
+                )
+            return scores
+
+        self._profile_add(profile, "unique_sentence_count", len(sentence_vectors))
+        sentence_lengths = torch.tensor(
+            [int(vectors.shape[0]) for vectors in sentence_vectors],
+            dtype=torch.long,
+        )
+        nonempty_items = [
+            (idx, vectors)
+            for idx, vectors in enumerate(sentence_vectors)
+            if vectors.numel() > 0
+        ]
+        if nonempty_items:
+            sentence_ids = torch.repeat_interleave(
+                torch.tensor(
+                    [idx for idx, _ in nonempty_items],
+                    dtype=torch.long,
+                    device=query_vector.device,
+                ),
+                torch.tensor(
+                    [int(vectors.shape[0]) for _, vectors in nonempty_items],
+                    dtype=torch.long,
+                    device=query_vector.device,
+                ),
+            )
+            all_vectors = torch.cat(
+                [vectors for _, vectors in nonempty_items], dim=0
+            ).to(query_vector.device)
+        else:
+            sentence_ids = torch.empty((0,), dtype=torch.long, device=query_vector.device)
+            dim = int(query_vector.shape[1]) if query_vector.dim() == 2 else 0
+            all_vectors = torch.empty((0, dim), dtype=torch.float32, device=query_vector.device)
+        self._profile_add(profile, "sentence_token_count", int(sentence_lengths.sum().item()))
+        self._profile_add(
+            profile, "sentence_maxsim_time", time.perf_counter() - collect_start
+        )
+
+        maxsim_start = time.perf_counter()
+        query_float = query_vector.to(torch.float32)
+        sentence_scores = torch.full(
+            (len(sentence_vectors), query_float.shape[0]),
+            float("-inf"),
+            dtype=torch.float32,
+            device=query_float.device,
+        )
+        if all_vectors.numel() > 0:
+            sims = torch.matmul(query_float, all_vectors.to(torch.float32).T)
+            sentence_scores_t = sentence_scores.T.contiguous()
+            index = sentence_ids.unsqueeze(0).expand(query_float.shape[0], -1)
+            sentence_scores_t.scatter_reduce_(
+                1, index, sims, reduce="amax", include_self=True
+            )
+            sentence_scores = sentence_scores_t.T.contiguous()
+        self._profile_add(
+            profile, "sentence_maxsim_time", time.perf_counter() - maxsim_start
+        )
+
+        region_start = time.perf_counter()
+        max_region_sentences = max(
+            (len(indices) for indices in region_sentence_indices), default=0
+        )
+        if max_region_sentences == 0:
+            scores = [float("-inf")] * len(regions)
+        else:
+            region_index_tensor = torch.full(
+                (len(regions), max_region_sentences),
+                -1,
+                dtype=torch.long,
+                device=sentence_scores.device,
+            )
+            for region_idx, indices in enumerate(region_sentence_indices):
+                if indices:
+                    region_index_tensor[region_idx, : len(indices)] = torch.tensor(
+                        indices, dtype=torch.long, device=sentence_scores.device
+                    )
+            valid = region_index_tensor >= 0
+            gathered = sentence_scores[region_index_tensor.clamp_min(0)]
+            gathered = gathered.masked_fill(~valid.unsqueeze(-1), float("-inf"))
+            region_scores = gathered.max(dim=1).values.sum(dim=1)
+            scores = [float(value) for value in region_scores.detach().cpu().tolist()]
+
+        for region_idx in fallback_regions:
+            region = regions[region_idx]
+            scores[region_idx] = score_maxsim(
+                query_vector, region.get("vectors", torch.empty((0, 0)))
+            )
+        self._profile_add(
+            profile, "region_score_time", time.perf_counter() - region_start
+        )
+        return scores
+
+    def _populate_sentence_score_cache(
+        self,
+        query_vector: torch.Tensor,
+        regions,
+        sentence_score_cache: dict[str, torch.Tensor],
+    ) -> None:
+        missing_items = []
+        missing_keys = set()
+        for region in regions:
+            source_vectors = region.get("source_vectors")
+            if source_vectors is None:
+                continue
+            cacheables = region["source_cacheables"]
+            for idx in region["selected_indices"]:
+                if not (0 <= idx < len(cacheables)):
+                    continue
+                cache_key = self._sentence_score_cache_key(region, idx)
+                if cache_key in sentence_score_cache or cache_key in missing_keys:
+                    continue
+                vectors = (
+                    source_vectors[idx]
+                    if idx < len(source_vectors)
+                    else torch.empty((0, 0))
+                )
+                if vectors.numel() == 0:
+                    sentence_score_cache[cache_key] = torch.full(
+                        (query_vector.shape[0],),
+                        float("-inf"),
+                        dtype=torch.float32,
+                        device=query_vector.device,
+                    )
+                    continue
+                missing_items.append((cache_key, vectors))
+                missing_keys.add(cache_key)
+
+        if not missing_items:
+            return
+
+        all_vectors = torch.cat([vectors for _, vectors in missing_items], dim=0)
+        sims = torch.matmul(
+            query_vector.to(torch.float32), all_vectors.to(torch.float32).T
+        )
+        offset = 0
+        for cache_key, vectors in missing_items:
+            length = int(vectors.shape[0])
+            sentence_score_cache[cache_key] = (
+                sims[:, offset : offset + length].max(dim=1).values
+            )
+            offset += length
+
     def _score_sliding_region(
         self,
         query_vector: torch.Tensor,
@@ -566,8 +916,7 @@ class SlidingRegionColBERTWindowSummarizer(ColBERTWindowSummarizer):
         for idx in region["selected_indices"]:
             if not (0 <= idx < len(cacheables)):
                 continue
-            raw_cacheable_id = getattr(cacheables[idx], "id", None)
-            cacheable_id = f"{region['chunk_idx']}::{raw_cacheable_id or idx}"
+            cacheable_id = self._sentence_score_cache_key(region, idx)
             scores = sentence_score_cache.get(cacheable_id)
             if scores is None:
                 vectors = (
@@ -589,6 +938,31 @@ class SlidingRegionColBERTWindowSummarizer(ColBERTWindowSummarizer):
     ) -> set[int]:
         return set(region["selected_indices"])
 
+    @staticmethod
+    def _make_region_cacheable(
+        doc: RetrievableChunk,
+        center_idx: int,
+        selected_indices,
+        cacheables: list[CacheableChunk],
+        region_token_budget: int,
+        suffix: str = "sliding_region",
+    ) -> CacheableChunk:
+        selected_cacheables = [
+            cacheables[idx] for idx in selected_indices if 0 <= idx < len(cacheables)
+        ]
+        first = selected_cacheables[0] if selected_cacheables else None
+        last = selected_cacheables[-1] if selected_cacheables else None
+        return CacheableChunk(
+            id=f"{doc.id}::{suffix}_{center_idx}",
+            text=" ".join(cacheable.text for cacheable in selected_cacheables),
+            parent_doc_id=doc.id,
+            chunk_size=region_token_budget,
+            sentence_ids=[cacheable.id for cacheable in selected_cacheables],
+            sentence_texts=[cacheable.text for cacheable in selected_cacheables],
+            chunk_start=getattr(first, "chunk_start", None),
+            chunk_end=getattr(last, "chunk_end", None),
+        )
+
     def _select_sliding_regions(
         self,
         scored_regions,
@@ -597,8 +971,27 @@ class SlidingRegionColBERTWindowSummarizer(ColBERTWindowSummarizer):
     ):
         if final_token_budget is None:
             keep_count = global_top_count(len(scored_regions), self.global_top_r)
-            return [region["cacheable"] for _, region in scored_regions[:keep_count]]
+            return [
+                region["cacheable"]
+                or self._make_region_cacheable(
+                    region["source_doc"],
+                    region["center_idx"],
+                    region["selected_indices"],
+                    region["source_cacheables"],
+                    self.region_token_budget,
+                )
+                for _, region in scored_regions[:keep_count]
+            ]
 
+        self._cacheable_token_lens(
+            self._unique_cacheables(
+                [
+                    source
+                    for _, region in scored_regions
+                    for source in region["source_cacheables"]
+                ]
+            )
+        )
         selected_cacheables = []
         selected_sentence_ids = set()
         used_tokens = 0
@@ -634,11 +1027,11 @@ class SlidingRegionColBERTWindowSummarizer(ColBERTWindowSummarizer):
             if novel_sentence_cacheables:
                 first = novel_sentence_cacheables[0]
                 region_cacheable = CacheableChunk(
-                    id=f"{region['cacheable'].id}::dedup",
+                    id=f"{region['region_id']}::dedup",
                     text=" ".join(
                         cacheable.text for cacheable in novel_sentence_cacheables
                     ),
-                    parent_doc_id=region["cacheable"].parent_doc_id,
+                    parent_doc_id=region["parent_doc_id"],
                     chunk_size=self.region_token_budget,
                     sentence_ids=[
                         cacheable.id for cacheable in novel_sentence_cacheables
@@ -659,33 +1052,37 @@ class SlidingRegionColBERTWindowSummarizer(ColBERTWindowSummarizer):
     def compress_batch_top_k_docs(
         self, batch_top_k_docs: List[List[RetrievableChunk]], batch_queries: List[str]
     ):
+        profile = self._empty_profile()
+        profile["query_count"] = len(batch_queries)
+        profile["retrieved_doc_count"] = sum(len(docs) for docs in batch_top_k_docs)
+        query_encode_start = time.perf_counter()
         query_vectors = self.encoder.encode_queries(batch_queries)
+        profile["query_encode_time"] = time.perf_counter() - query_encode_start
         summarized_batches = []
 
         for docs, query_vector in zip(batch_top_k_docs, query_vectors):
             summarized_docs = [self._build_unselected_document(doc) for doc in docs]
+            budget_start = time.perf_counter()
             final_token_budget = self._resolve_final_token_budget(
                 docs, self.final_token_budget
             )
+            self._profile_add(profile, "budget_time", time.perf_counter() - budget_start)
             regions = []
             for chunk_idx, doc in enumerate(docs):
-                regions.extend(self._sliding_regions_for_doc(doc, chunk_idx))
+                regions.extend(self._sliding_regions_for_doc(doc, chunk_idx, profile))
             if not regions:
                 summarized_batches.append(summarized_docs)
                 continue
 
-            sentence_score_cache = {}
-            scored_regions = [
-                (
-                    self._score_sliding_region(
-                        query_vector, region, sentence_score_cache
-                    ),
-                    region,
-                )
-                for region in regions
-            ]
+            region_scores = self._score_sliding_regions_vectorized(
+                query_vector, regions, profile
+            )
+            scored_regions = list(zip(region_scores, regions))
+            sort_start = time.perf_counter()
             scored_regions.sort(key=lambda item: item[0], reverse=True)
+            self._profile_add(profile, "sort_time", time.perf_counter() - sort_start)
             selected_by_doc: dict[int, list[CacheableChunk]] = {}
+            select_start = time.perf_counter()
             if final_token_budget is None:
                 for cacheable in self._select_sliding_regions(
                     scored_regions,
@@ -704,13 +1101,19 @@ class SlidingRegionColBERTWindowSummarizer(ColBERTWindowSummarizer):
                     final_token_budget=final_token_budget,
                 ):
                     selected_by_doc.setdefault(chunk_idx, []).append(cacheable)
+            self._profile_add(profile, "select_time", time.perf_counter() - select_start)
 
+            output_start = time.perf_counter()
             for chunk_idx, selected_cacheables in selected_by_doc.items():
                 summarized_docs[chunk_idx] = self._build_region_document(
                     docs[chunk_idx], selected_cacheables
                 )
+            self._profile_add(
+                profile, "build_output_time", time.perf_counter() - output_start
+            )
             summarized_batches.append(summarized_docs)
 
+        self.last_profile = profile
         return summarized_batches
 
 
@@ -832,6 +1235,9 @@ class SupportPrunedSlidingRegionColBERTWindowSummarizer(
                 self.global_top_r,
             )
         )
+        self._cacheable_token_lens(
+            self._unique_cacheables([item[4] for item in ranked_sentences])
+        )
         for _, _, _, chunk_idx, cacheable in ranked_sentences:
             if cacheable.id in selected_sentence_ids:
                 continue
@@ -854,45 +1260,55 @@ class SupportPrunedSlidingRegionColBERTWindowSummarizer(
     def compress_batch_top_k_docs(
         self, batch_top_k_docs: List[List[RetrievableChunk]], batch_queries: List[str]
     ):
+        profile = self._empty_profile()
+        profile["query_count"] = len(batch_queries)
+        profile["retrieved_doc_count"] = sum(len(docs) for docs in batch_top_k_docs)
+        query_encode_start = time.perf_counter()
         query_vectors = self.encoder.encode_queries(batch_queries)
+        profile["query_encode_time"] = time.perf_counter() - query_encode_start
         summarized_batches = []
 
         for docs, query_vector in zip(batch_top_k_docs, query_vectors):
             summarized_docs = [self._build_unselected_document(doc) for doc in docs]
+            budget_start = time.perf_counter()
             final_token_budget = self._resolve_final_token_budget(
                 docs, self.final_token_budget
             )
+            self._profile_add(profile, "budget_time", time.perf_counter() - budget_start)
             regions = []
             for chunk_idx, doc in enumerate(docs):
-                regions.extend(self._sliding_regions_for_doc(doc, chunk_idx))
+                regions.extend(self._sliding_regions_for_doc(doc, chunk_idx, profile))
             if not regions:
                 summarized_batches.append(summarized_docs)
                 continue
 
-            sentence_score_cache = {}
-            scored_regions = [
-                (
-                    self._score_sliding_region(
-                        query_vector, region, sentence_score_cache
-                    ),
-                    region,
-                )
-                for region in regions
-            ]
+            region_scores = self._score_sliding_regions_vectorized(
+                query_vector, regions, profile
+            )
+            scored_regions = list(zip(region_scores, regions))
+            sort_start = time.perf_counter()
             scored_regions.sort(key=lambda item: item[0], reverse=True)
+            self._profile_add(profile, "sort_time", time.perf_counter() - sort_start)
             ranked_sentences = self._rank_sentences_by_window_support(scored_regions)
             selected_by_doc: dict[int, list[CacheableChunk]] = {}
+            select_start = time.perf_counter()
             for chunk_idx, cacheable in self._select_supported_sentences(
                 ranked_sentences, final_token_budget
             ):
                 selected_by_doc.setdefault(chunk_idx, []).append(cacheable)
+            self._profile_add(profile, "select_time", time.perf_counter() - select_start)
 
+            output_start = time.perf_counter()
             for chunk_idx, selected_cacheables in selected_by_doc.items():
                 summarized_docs[chunk_idx] = self._build_region_document(
                     docs[chunk_idx], selected_cacheables
                 )
+            self._profile_add(
+                profile, "build_output_time", time.perf_counter() - output_start
+            )
             summarized_batches.append(summarized_docs)
 
+        self.last_profile = profile
         return summarized_batches
 
 
@@ -972,11 +1388,11 @@ class SupportCleanupSlidingRegionColBERTWindowSummarizer(
                 if not kept_indices:
                     continue
                 cacheable = CacheableChunk(
-                    id=f"{region['cacheable'].id}::support_cleanup",
+                    id=f"{region['region_id']}::support_cleanup",
                     text=" ".join(
                         region["source_cacheables"][idx].text for idx in kept_indices
                     ),
-                    parent_doc_id=region["cacheable"].parent_doc_id,
+                    parent_doc_id=region["parent_doc_id"],
                     chunk_size=self.region_token_budget,
                     sentence_ids=[
                         region["source_cacheables"][idx].id for idx in kept_indices
@@ -991,6 +1407,15 @@ class SupportCleanupSlidingRegionColBERTWindowSummarizer(
         selected_cacheables = []
         selected_sentence_ids = set()
         used_tokens = 0
+        self._cacheable_token_lens(
+            self._unique_cacheables(
+                [
+                    source
+                    for _, region in scored_regions
+                    for source in region["source_cacheables"]
+                ]
+            )
+        )
         for _, region in scored_regions:
             novel_sentence_cacheables = []
             for idx in region["selected_indices"]:
@@ -1019,11 +1444,11 @@ class SupportCleanupSlidingRegionColBERTWindowSummarizer(
             if novel_sentence_cacheables:
                 first = novel_sentence_cacheables[0]
                 region_cacheable = CacheableChunk(
-                    id=f"{region['cacheable'].id}::support_cleanup",
+                    id=f"{region['region_id']}::support_cleanup",
                     text=" ".join(
                         cacheable.text for cacheable in novel_sentence_cacheables
                     ),
-                    parent_doc_id=region["cacheable"].parent_doc_id,
+                    parent_doc_id=region["parent_doc_id"],
                     chunk_size=self.region_token_budget,
                     sentence_ids=[
                         cacheable.id for cacheable in novel_sentence_cacheables
@@ -1044,35 +1469,39 @@ class SupportCleanupSlidingRegionColBERTWindowSummarizer(
     def compress_batch_top_k_docs(
         self, batch_top_k_docs: List[List[RetrievableChunk]], batch_queries: List[str]
     ):
+        profile = self._empty_profile()
+        profile["query_count"] = len(batch_queries)
+        profile["retrieved_doc_count"] = sum(len(docs) for docs in batch_top_k_docs)
+        query_encode_start = time.perf_counter()
         query_vectors = self.encoder.encode_queries(batch_queries)
+        profile["query_encode_time"] = time.perf_counter() - query_encode_start
         summarized_batches = []
 
         for docs, query_vector in zip(batch_top_k_docs, query_vectors):
             summarized_docs = [self._build_unselected_document(doc) for doc in docs]
+            budget_start = time.perf_counter()
             final_token_budget = self._resolve_final_token_budget(
                 docs, self.final_token_budget
             )
+            self._profile_add(profile, "budget_time", time.perf_counter() - budget_start)
             regions = []
             for chunk_idx, doc in enumerate(docs):
-                regions.extend(self._sliding_regions_for_doc(doc, chunk_idx))
+                regions.extend(self._sliding_regions_for_doc(doc, chunk_idx, profile))
             if not regions:
                 summarized_batches.append(summarized_docs)
                 continue
 
-            sentence_score_cache = {}
-            scored_regions = [
-                (
-                    self._score_sliding_region(
-                        query_vector, region, sentence_score_cache
-                    ),
-                    region,
-                )
-                for region in regions
-            ]
+            region_scores = self._score_sliding_regions_vectorized(
+                query_vector, regions, profile
+            )
+            scored_regions = list(zip(region_scores, regions))
+            sort_start = time.perf_counter()
             scored_regions.sort(key=lambda item: item[0], reverse=True)
+            self._profile_add(profile, "sort_time", time.perf_counter() - sort_start)
             cleanup_ids = self._cleanup_sentence_ids(scored_regions)
 
             selected_by_doc: dict[int, list[CacheableChunk]] = {}
+            select_start = time.perf_counter()
             if final_token_budget is None:
                 for cacheable in self._select_sliding_regions_with_cleanup(
                     scored_regions,
@@ -1091,18 +1520,30 @@ class SupportCleanupSlidingRegionColBERTWindowSummarizer(
                     final_token_budget,
                 ):
                     selected_by_doc.setdefault(chunk_idx, []).append(cacheable)
+            self._profile_add(profile, "select_time", time.perf_counter() - select_start)
 
+            output_start = time.perf_counter()
             for chunk_idx, selected_cacheables in selected_by_doc.items():
                 summarized_docs[chunk_idx] = self._build_region_document(
                     docs[chunk_idx], selected_cacheables
                 )
+            self._profile_add(
+                profile, "build_output_time", time.perf_counter() - output_start
+            )
             summarized_batches.append(summarized_docs)
 
+        self.last_profile = profile
         return summarized_batches
 
 
 class FullWindowRegionColBERTSummarizer(SlidingRegionColBERTWindowSummarizer):
-    def _sliding_regions_for_doc(self, doc: RetrievableChunk, chunk_idx: int):
+    def _sliding_regions_for_doc(
+        self,
+        doc: RetrievableChunk,
+        chunk_idx: int,
+        profile: dict[str, float | int] | None = None,
+    ):
+        del profile
         cacheables = [
             cacheable
             for cacheable in getattr(doc, "cacheables", []) or []

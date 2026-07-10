@@ -111,6 +111,30 @@ require_sudo() {
     command -v sudo >/dev/null 2>&1 || die "sudo not found; use --no-exclusive or install sudo"
     log "checking sudo access for NVIDIA compute-mode changes"
     sudo -v || die "sudo authentication failed; use --no-exclusive or fix sudo access"
+    start_sudo_keepalive
+}
+
+start_sudo_keepalive() {
+    if [ -n "${SUDO_KEEPALIVE_PID:-}" ]; then
+        return 0
+    fi
+    (
+        while true; do
+            sleep 60
+            sudo -n -v >/dev/null 2>&1 || exit 0
+        done
+    ) &
+    SUDO_KEEPALIVE_PID="$!"
+    log "started sudo keepalive pid=${SUDO_KEEPALIVE_PID}"
+}
+
+stop_sudo_keepalive() {
+    if [ -z "${SUDO_KEEPALIVE_PID:-}" ]; then
+        return 0
+    fi
+    kill "$SUDO_KEEPALIVE_PID" >/dev/null 2>&1 || true
+    wait "$SUDO_KEEPALIVE_PID" 2>/dev/null || true
+    SUDO_KEEPALIVE_PID=""
 }
 
 enable_exclusive_process() {
@@ -142,6 +166,11 @@ restore_compute_mode() {
     sudo nvidia-smi -i "$GPU_ID" -c "$PREVIOUS_COMPUTE_MODE" >&2 || true
 }
 
+cleanup() {
+    restore_compute_mode
+    stop_sudo_keepalive
+}
+
 run_grid() {
     local grid="$1"
     if [ ! -f "$grid" ]; then
@@ -168,6 +197,7 @@ ALLOW_BUSY="0"
 EXCLUSIVE_PROCESS="1"
 EXCLUSIVE_ENABLED="0"
 PREVIOUS_COMPUTE_MODE=""
+SUDO_KEEPALIVE_PID=""
 LOCK_DIR="/tmp"
 COMMAND_MODE="0"
 ARGS=()
@@ -249,7 +279,7 @@ if [ "$EXCLUSIVE_PROCESS" = "1" ]; then
     require_sudo
 fi
 
-trap restore_compute_mode EXIT
+trap cleanup EXIT
 
 acquire_lock
 

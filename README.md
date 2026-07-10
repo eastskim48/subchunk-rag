@@ -103,6 +103,21 @@ Run one grid YAML directly:
 python run/grid_search/eval.py run/grid_search/grid.yaml
 ```
 
+Use `eval_cases` when each case needs its own environment values, such as a
+fixed batch size for a specific `TOP_K` and `RETAIN_TOKEN_RATIO`:
+
+```yaml
+eval_cases:
+  - TOP_K: "10"
+    RETAIN_TOKEN_RATIO: "0.25"
+    EVAL_BSZ: "4"
+  - TOP_K: "20"
+    RETAIN_TOKEN_RATIO: "0.25"
+    EVAL_BSZ: "2"
+```
+
+`eval_cases` and `eval_axes` are mutually exclusive.
+
 Run one or more grid YAMLs through the GPU wrapper:
 
 ```bash

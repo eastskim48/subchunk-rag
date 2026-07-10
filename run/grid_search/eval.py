@@ -56,6 +56,8 @@ class GridRunner:
         }
         self.preprocess_groups = self.config.get("preprocess_groups", [])
         self.eval_axes = self.config.get("eval_axes", {})
+        self.eval_cases = self.config.get("eval_cases", [])
+        self._validate_eval_config()
         self.results_jsonl = self.results_dir / "results.jsonl"
         self.failures_jsonl = self.results_dir / "failures.jsonl"
         self.bsz_probe_jsonl = self.results_dir / "bsz_probes.jsonl"
@@ -95,10 +97,22 @@ class GridRunner:
             "auto_eval_bsz": self.config.get("auto_eval_bsz", {}),
             "preprocess_groups": self.preprocess_groups,
             "eval_axes": self.eval_axes,
+            "eval_cases": self.eval_cases,
         }
         (self.results_dir / "manifest.json").write_text(
             json.dumps(manifest, indent=2, sort_keys=True)
         )
+
+    def _validate_eval_config(self) -> None:
+        if self.eval_cases and self.eval_axes:
+            raise ValueError("eval_cases and eval_axes are mutually exclusive")
+        if self.eval_axes and not isinstance(self.eval_axes, dict):
+            raise ValueError("eval_axes must be a mapping")
+        if self.eval_cases and not isinstance(self.eval_cases, list):
+            raise ValueError("eval_cases must be a list of mappings")
+        for idx, case in enumerate(self.eval_cases):
+            if not isinstance(case, dict):
+                raise ValueError(f"eval_cases[{idx}] must be a mapping")
 
     def _stringify(self, value: Any) -> str:
         if value is None:
@@ -156,6 +170,31 @@ class GridRunner:
             candidates = self._parse_int_list(
                 self.fixed_env.get("AUTO_EVAL_BSZ_CANDIDATES")
             )
+        if not candidates:
+            min_value = config.get("min", self.fixed_env.get("AUTO_EVAL_BSZ_MIN"))
+            max_value = config.get("max", self.fixed_env.get("AUTO_EVAL_BSZ_MAX"))
+            if min_value is not None and max_value is not None:
+                step = int(
+                    config.get(
+                        "step", self.fixed_env.get("AUTO_EVAL_BSZ_STEP", 1)
+                    )
+                )
+                if step <= 0:
+                    raise ValueError(f"auto_eval_bsz.step must be positive, got {step}")
+                start = int(min_value)
+                stop = int(max_value)
+                if start <= 0 or stop <= 0:
+                    raise ValueError(
+                        "auto_eval_bsz min/max must be positive, "
+                        f"got min={start}, max={stop}"
+                    )
+                if start > stop:
+                    raise ValueError(
+                        f"auto_eval_bsz min must be <= max, got {start} > {stop}"
+                    )
+                candidates = list(range(start, stop + 1, step))
+                if candidates[-1] != stop:
+                    candidates.append(stop)
         return candidates or [1, 2, 4, 8]
 
     def _auto_bsz_probe_total_num(self) -> int:
@@ -166,6 +205,55 @@ class GridRunner:
                 self.fixed_env.get("AUTO_EVAL_BSZ_PROBE_TOTAL_NUM", 8),
             )
         )
+
+    def _auto_bsz_probe_total_num_for_candidate(self, candidate: int) -> int:
+        config = self._auto_bsz_config()
+        probe_batches = config.get(
+            "probe_batches", self.fixed_env.get("AUTO_EVAL_BSZ_PROBE_BATCHES")
+        )
+        if probe_batches is None:
+            total_num = self._auto_bsz_probe_total_num()
+        else:
+            batches = int(probe_batches)
+            if batches <= 0:
+                raise ValueError(
+                    f"auto_eval_bsz.probe_batches must be positive, got {batches}"
+                )
+            total_num = candidate * batches
+        probe_total_num_max = config.get(
+            "probe_total_num_max",
+            self.fixed_env.get("AUTO_EVAL_BSZ_PROBE_TOTAL_NUM_MAX"),
+        )
+        if probe_total_num_max is not None:
+            max_total_num = int(probe_total_num_max)
+            if max_total_num <= 0:
+                raise ValueError(
+                    "auto_eval_bsz.probe_total_num_max must be positive, "
+                    f"got {max_total_num}"
+                )
+            total_num = min(total_num, max_total_num)
+        return total_num
+
+    def _auto_bsz_search_mode(self) -> str:
+        config = self._auto_bsz_config()
+        mode = self._stringify(
+            config.get("search", self.fixed_env.get("AUTO_EVAL_BSZ_SEARCH", "linear"))
+        )
+        mode = mode.strip().lower()
+        aliases = {
+            "": "linear",
+            "sequential": "linear",
+            "seq": "linear",
+            "bounded_binary": "binary",
+            "bisect": "binary",
+        }
+        mode = aliases.get(mode, mode)
+        if mode not in {"linear", "binary"}:
+            raise ValueError(
+                "auto_eval_bsz.search must be one of {'linear', 'binary'}, "
+                f"got {mode!r}"
+            )
+        return mode
 
     def _is_oom_failure(self, stdout: str) -> bool:
         lowered = stdout.lower()
@@ -180,42 +268,55 @@ class GridRunner:
         )
         return any(pattern in lowered for pattern in patterns)
 
-    def _select_auto_bsz(
-        self, dataset: str, merged_eval_env: dict[str, str], log_prefix: str
-    ) -> int | None:
-        if not self._auto_bsz_enabled():
-            return None
+    def _run_bsz_probe(
+        self,
+        dataset: str,
+        merged_eval_env: dict[str, str],
+        log_prefix: str,
+        candidate: int,
+    ) -> CompletedStage:
+        probe_total_num = self._auto_bsz_probe_total_num_for_candidate(candidate)
+        probe_env = dict(merged_eval_env)
+        probe_env["EVAL_BSZ"] = str(candidate)
+        probe_env["TOTAL_NUM"] = str(probe_total_num)
+        probe_env["OUTPUT_FILE"] = str(
+            self.bsz_probe_dir / f"{log_prefix}__bsz={candidate}.jsonl"
+        )
+        probe_log_prefix = f"{log_prefix}__bsz_probe__bsz={candidate}"
+        self._print_status(
+            f"[bsz-probe] dataset={dataset} bsz={candidate} total_num={probe_total_num}"
+        )
+        probe_stage = self._run_script(
+            self.eval_script, dataset, probe_env, probe_log_prefix
+        )
+        probe_payload = {
+            "dataset": dataset,
+            "log_file": str(self.logs_dir / f"{probe_log_prefix}.log"),
+            "returncode": probe_stage.returncode,
+            "elapsed_sec": probe_stage.elapsed_sec,
+            "EVAL_BSZ": str(candidate),
+            "probe_total_num": probe_total_num,
+            "search": self._auto_bsz_search_mode(),
+            "oom": self._is_oom_failure(probe_stage.stdout),
+        }
+        probe_payload.update(
+            {k: v for k, v in merged_eval_env.items() if k != "EVAL_BSZ"}
+        )
+        self._append_jsonl(self.bsz_probe_jsonl, probe_payload)
+        return probe_stage
 
-        candidates = self._auto_bsz_candidates()
-        probe_total_num = self._auto_bsz_probe_total_num()
+    def _select_auto_bsz_linear(
+        self,
+        dataset: str,
+        merged_eval_env: dict[str, str],
+        log_prefix: str,
+        candidates: list[int],
+    ) -> int | None:
         last_ok = None
         for candidate in candidates:
-            probe_env = dict(merged_eval_env)
-            probe_env["EVAL_BSZ"] = str(candidate)
-            probe_env["TOTAL_NUM"] = str(probe_total_num)
-            probe_env["OUTPUT_FILE"] = str(
-                self.bsz_probe_dir / f"{log_prefix}__bsz={candidate}.jsonl"
+            probe_stage = self._run_bsz_probe(
+                dataset, merged_eval_env, log_prefix, candidate
             )
-            probe_log_prefix = f"{log_prefix}__bsz_probe__bsz={candidate}"
-            self._print_status(
-                f"[bsz-probe] dataset={dataset} bsz={candidate} total_num={probe_total_num}"
-            )
-            probe_stage = self._run_script(
-                self.eval_script, dataset, probe_env, probe_log_prefix
-            )
-            probe_payload = {
-                "dataset": dataset,
-                "log_file": str(self.logs_dir / f"{probe_log_prefix}.log"),
-                "returncode": probe_stage.returncode,
-                "elapsed_sec": probe_stage.elapsed_sec,
-                "EVAL_BSZ": str(candidate),
-                "probe_total_num": probe_total_num,
-                "oom": self._is_oom_failure(probe_stage.stdout),
-            }
-            probe_payload.update(
-                {k: v for k, v in merged_eval_env.items() if k != "EVAL_BSZ"}
-            )
-            self._append_jsonl(self.bsz_probe_jsonl, probe_payload)
             if probe_stage.returncode == 0:
                 last_ok = candidate
                 continue
@@ -224,9 +325,61 @@ class GridRunner:
                 break
             self._print_status(
                 f"[bsz-probe-failed] dataset={dataset} bsz={candidate} "
-                f'rc={probe_stage.returncode} log={self.logs_dir / f"{probe_log_prefix}.log"}'
+                f'rc={probe_stage.returncode} log={self.logs_dir / f"{log_prefix}__bsz_probe__bsz={candidate}.log"}'
             )
             break
+        return last_ok
+
+    def _select_auto_bsz_binary(
+        self,
+        dataset: str,
+        merged_eval_env: dict[str, str],
+        log_prefix: str,
+        candidates: list[int],
+    ) -> int | None:
+        last_ok = None
+        low = 0
+        high = len(candidates) - 1
+        while low <= high:
+            mid = (low + high) // 2
+            candidate = candidates[mid]
+            probe_stage = self._run_bsz_probe(
+                dataset, merged_eval_env, log_prefix, candidate
+            )
+            if probe_stage.returncode == 0:
+                last_ok = candidate
+                low = mid + 1
+                continue
+            if self._is_oom_failure(probe_stage.stdout):
+                self._print_status(f"[bsz-probe-oom] dataset={dataset} bsz={candidate}")
+                high = mid - 1
+                continue
+            self._print_status(
+                f"[bsz-probe-failed] dataset={dataset} bsz={candidate} "
+                f'rc={probe_stage.returncode} log={self.logs_dir / f"{log_prefix}__bsz_probe__bsz={candidate}.log"}'
+            )
+            break
+        return last_ok
+
+    def _select_auto_bsz(
+        self, dataset: str, merged_eval_env: dict[str, str], log_prefix: str
+    ) -> int | None:
+        if not self._auto_bsz_enabled():
+            return None
+
+        candidates = self._auto_bsz_candidates()
+        search_mode = self._auto_bsz_search_mode()
+        self._print_status(
+            f"[bsz-search] dataset={dataset} mode={search_mode} candidates={candidates}"
+        )
+        if search_mode == "binary":
+            last_ok = self._select_auto_bsz_binary(
+                dataset, merged_eval_env, log_prefix, candidates
+            )
+        else:
+            last_ok = self._select_auto_bsz_linear(
+                dataset, merged_eval_env, log_prefix, candidates
+            )
 
         if last_ok is None:
             raise RuntimeError(
@@ -281,6 +434,11 @@ class GridRunner:
         )
 
     def _iter_eval_envs(self):
+        if self.eval_cases:
+            for case in self.eval_cases:
+                yield {key: self._stringify(value) for key, value in case.items()}
+            return
+
         axes = list(self.eval_axes.keys())
         values = [
             (
@@ -495,6 +653,8 @@ class GridRunner:
             "elapsed_sec": row.get("elapsed_sec"),
             "end_to_end_time_sec": row.get("end_to_end_time_sec"),
             "time_per_batch_avg_sec": row.get("time_per_batch_avg_sec"),
+            "throughput_requests_per_sec": row.get("throughput_requests_per_sec"),
+            "throughput_batches_per_sec": row.get("throughput_batches_per_sec"),
             "compress_time_per_batch": row.get("compress_per_batch_avg_sec"),
             "TTFT_per_batch": row.get("ttft_per_batch_avg_sec"),
             "Retrieval_per_batch": row.get("retrieval_per_batch_avg_sec"),
@@ -515,6 +675,8 @@ class GridRunner:
             "elapsed_sec",
             "end_to_end_time_sec",
             "time_per_batch_avg_sec",
+            "throughput_requests_per_sec",
+            "throughput_batches_per_sec",
             "compress_time_per_batch",
             "TTFT_per_batch",
             "Retrieval_per_batch",
