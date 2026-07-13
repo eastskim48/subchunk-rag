@@ -137,6 +137,7 @@ class ColBERTWindowEncoder:
         device: str,
         batch_size: int,
         max_length: int = 0,
+        doc_maxlen: int | None = None,
         query_maxlen: int | None = None,
         attend_to_mask_tokens: bool | None = None,
         mask_punctuation: bool | None = None,
@@ -152,6 +153,8 @@ class ColBERTWindowEncoder:
             repo_path, disable_cpu_extension
         )
         config_kwargs: dict[str, Any] = {"checkpoint": model_name}
+        if doc_maxlen is not None:
+            config_kwargs["doc_maxlen"] = int(doc_maxlen)
         if query_maxlen is not None:
             config_kwargs["query_maxlen"] = int(query_maxlen)
         if attend_to_mask_tokens is not None:
@@ -994,9 +997,6 @@ class ColBERTWindowArtifact:
         self.retrievable_vectors_cache: dict[
             tuple[str, tuple[str | None, ...]], list[torch.Tensor]
         ] = {}
-        self.retrievable_window_ids_cache: dict[
-            tuple[str, tuple[str | None, ...]], list[list[str]]
-        ] = {}
         self.compact = None
         use_compact = parse_bool(os.getenv("COLBERT_USE_COMPACT_ARTIFACT", "True"))
         compact_dir = os.getenv("COLBERT_COMPACT_WINDOW_DIR")
@@ -1090,21 +1090,13 @@ class ColBERTWindowArtifact:
             getattr(cacheable, "id", None)
             for cacheable in getattr(doc, "cacheables", []) or []
         )
-        cache_key = (str(getattr(doc, "id", "")), cacheable_ids)
-        cached = self.retrievable_window_ids_cache.get(cache_key)
-        if cached is not None:
-            return cached
         if self.compact is not None:
-            window_ids = self.compact.window_ids_for_cacheable_ids(cacheable_ids)
-            self.retrievable_window_ids_cache[cache_key] = window_ids
-            return window_ids
+            return self.compact.window_ids_for_cacheable_ids(cacheable_ids)
         window_ids_by_id = self.window_ids_lookup_for_doc_id(parent_doc_id)
-        window_ids = [
+        return [
             window_ids_by_id.get(cacheable.id, [cacheable.id])
             for cacheable in getattr(doc, "cacheables", []) or []
         ]
-        self.retrievable_window_ids_cache[cache_key] = window_ids
-        return window_ids
 
     def region_specs_for_doc(self, doc, token_budget: int):
         if self.compact is None:

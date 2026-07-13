@@ -1,4 +1,5 @@
 from typing import List
+import os
 from chunk import RetrievableChunk
 
 from compressor.comparison_compressor import (
@@ -24,6 +25,7 @@ from compressor.bm25_compressor import (
 from compressor.colbert_window_compressor import (
     ColBERTWindowSummarizer,
     BudgetColBERTWindowSummarizer,
+    FixedChunkColBERTRerankSummarizer,
     FixedRegionColBERTSummarizer,
     FullWindowRegionColBERTSummarizer,
     PairGainColBERTWindowSummarizer,
@@ -39,6 +41,20 @@ from compressor.colbert_window_compressor import (
 from compressor.ml_compressor import EXITCompressor, ProvenceCompressor
 
 compressor = None
+compressor_warmed = False
+
+
+def _parse_bool(value, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    lowered = str(value).strip().lower()
+    if lowered in {"true", "1", "yes", "y", "on"}:
+        return True
+    if lowered in {"false", "0", "no", "n", "off"}:
+        return False
+    return default
 
 
 COMPRESSOR_TYPES = {
@@ -58,6 +74,7 @@ COMPRESSOR_TYPES = {
     "hybrid_bge_bm25_async": HybridBgeBM25AsyncSummarizer,
     "hybrid_bge_bm25_rrf_async": HybridBgeBM25RRFAsyncSummarizer,
     "colbert_window": ColBERTWindowSummarizer,
+    "colbert_chunk_rerank": FixedChunkColBERTRerankSummarizer,
     "colbert_window_budget": BudgetColBERTWindowSummarizer,
     "colbert_fixed_region": FixedRegionColBERTSummarizer,
     "colbert_sliding_region": SlidingRegionColBERTWindowSummarizer,
@@ -77,12 +94,21 @@ COMPRESSOR_TYPES = {
 
 
 def _ensure_compressor(option):
-    global compressor
+    global compressor, compressor_warmed
     compressor_type = COMPRESSOR_TYPES.get(option)
     if compressor_type is None:
         return None
     if compressor is None or not isinstance(compressor, compressor_type):
         compressor = compressor_type()
+        compressor_warmed = False
+    if (
+        not compressor_warmed
+        and _parse_bool(os.getenv("COLBERT_WARMUP_QUERY_ENCODER"), True)
+        and hasattr(compressor, "warmup_query_encoder")
+    ):
+        warmup_time = compressor.warmup_query_encoder()
+        print(f"ColBERT query encoder warmup completed in {warmup_time:.4f} seconds")
+        compressor_warmed = True
     return compressor
 
 
@@ -100,6 +126,10 @@ def compress_docs(
     active_compressor = _ensure_compressor(option)
     if active_compressor is None:
         raise ValueError(f"Unknown compression option: {option}")
+    if _parse_bool(os.getenv("COLBERT_CLEAR_INTER_BATCH_CACHE"), True) and hasattr(
+        active_compressor, "clear_inter_batch_cache"
+    ):
+        active_compressor.clear_inter_batch_cache()
     return active_compressor.compress_batch_top_k_docs(
         batch_top_k_docs=batch_top_k_docs, batch_queries=batch_queries
     )

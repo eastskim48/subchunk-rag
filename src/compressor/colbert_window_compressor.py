@@ -1,8 +1,10 @@
 import math
 import os
 import time
+import json
 from typing import List
 
+import numpy as np
 import torch
 
 from chunk import CacheableChunk, RetrievableChunk
@@ -17,6 +19,161 @@ from materialize.colbert_window import (
     parse_bool,
     score_maxsim,
 )
+
+
+class FixedChunkColBERTRerankArtifact:
+    FORMAT = "fixed_chunk_colbert_artifact_v1"
+
+    def __init__(self, artifact_dir: str):
+        self.artifact_dir = artifact_dir
+        index_path = os.path.join(artifact_dir, "index.json")
+        if not os.path.exists(index_path):
+            raise FileNotFoundError(
+                f"missing fixed-chunk ColBERT artifact index: {index_path}"
+            )
+        with open(index_path, "r", encoding="utf-8") as handle:
+            self.index = json.load(handle)
+        if self.index.get("format") != self.FORMAT:
+            raise ValueError(
+                "unsupported fixed-chunk ColBERT artifact format: "
+                f"{self.index.get('format')}"
+            )
+        if int(self.index.get("truncated_count", -1)) != 0:
+            raise ValueError(
+                "fixed-chunk ColBERT artifact has truncated chunks; rebuild with "
+                "--doc-maxlen 512 --segment-long-docs"
+            )
+        self.embedding_dim = int(self.index["embedding_dim"])
+        self.num_tokens = int(self.index["num_tokens"])
+        self.id_to_row = self.index["id_to_row"]
+        self.offsets = np.load(
+            os.path.join(artifact_dir, self.index["offsets_file"]), mmap_mode="r"
+        )
+        self.vectors = np.memmap(
+            os.path.join(artifact_dir, self.index["vectors_file"]),
+            dtype=np.float16,
+            mode="r",
+            shape=(self.num_tokens, self.embedding_dim),
+        )
+        self.empty = torch.empty((0, self.embedding_dim), dtype=torch.float16)
+
+    def vectors_for_chunk_id(self, chunk_id: str) -> torch.Tensor:
+        row = self.id_to_row.get(str(chunk_id))
+        if row is None:
+            return self.empty
+        start = int(self.offsets[row])
+        end = int(self.offsets[row + 1])
+        if end <= start:
+            return self.empty
+        return torch.from_numpy(self.vectors[start:end]).to(torch.float16)
+
+
+class FixedChunkColBERTRerankSummarizer(Compressor):
+    def __init__(self):
+        super().__init__()
+        artifact_dir = os.getenv("COLBERT_CHUNK_ARTIFACT_DIR")
+        if not artifact_dir:
+            dataset_path = os.getenv("DATASET_PATH")
+            data_subdir = os.getenv("DATA_SUBDIR")
+            if not dataset_path or not data_subdir:
+                raise ValueError(
+                    "COLBERT_CHUNK_ARTIFACT_DIR or DATASET_PATH/DATA_SUBDIR is required"
+                )
+            artifact_dir = os.path.join(
+                dataset_path, data_subdir, "colbert_fixed_chunk_docmax512"
+            )
+        self.keep = int(os.getenv("COLBERT_CHUNK_RERANK_KEEP", "0"))
+        if self.keep <= 0:
+            raise ValueError("COLBERT_CHUNK_RERANK_KEEP must be positive")
+        model_name = os.getenv("COLBERT_MODEL_NAME", "colbert-ir/colbertv2.0")
+        repo_path = os.getenv("COLBERT_REPO_PATH") or default_colbert_repo_path()
+        device = os.getenv("COLBERT_DEVICE") or "cpu"
+        batch_size = int(os.getenv("COLBERT_BATCH_SIZE", "32"))
+        query_maxlen_env = os.getenv("COLBERT_QUERY_MAXLEN")
+        query_maxlen = int(query_maxlen_env) if query_maxlen_env else None
+        attend_to_mask_tokens_env = os.getenv("COLBERT_ATTEND_TO_MASK_TOKENS")
+        attend_to_mask_tokens = (
+            parse_bool(attend_to_mask_tokens_env)
+            if attend_to_mask_tokens_env is not None
+            else None
+        )
+        disable_cpu_extension = parse_bool(
+            os.getenv("COLBERT_DISABLE_CPU_EXTENSION", "True")
+        )
+
+        print(f"Fixed-chunk ColBERT rerank enabled. Loading artifact: {artifact_dir}")
+        self.artifact = FixedChunkColBERTRerankArtifact(artifact_dir)
+        artifact_model_name = self.artifact.index.get("model_name")
+        if artifact_model_name != model_name:
+            raise ValueError(
+                "COLBERT_MODEL_NAME does not match the fixed-chunk ColBERT artifact: "
+                f"runtime={model_name!r}, artifact={artifact_model_name!r}"
+            )
+        self.encoder = ColBERTWindowEncoder(
+            model_name=model_name,
+            repo_path=repo_path,
+            device=device,
+            batch_size=batch_size,
+            max_length=int(self.artifact.index.get("official_doc_maxlen", 0)),
+            doc_maxlen=int(self.artifact.index.get("official_doc_maxlen", 0)),
+            query_maxlen=query_maxlen,
+            attend_to_mask_tokens=attend_to_mask_tokens,
+            disable_cpu_extension=disable_cpu_extension,
+            verify_tensorization=False,
+        )
+        self.query_encoder_warmup_time = 0.0
+        self.last_profile: dict[str, float | int] = {}
+
+    def warmup_query_encoder(self) -> float:
+        start = time.perf_counter()
+        self.encoder.encode_queries(["warmup query"])
+        self.query_encoder_warmup_time = time.perf_counter() - start
+        return self.query_encoder_warmup_time
+
+    def clear_inter_batch_cache(self) -> None:
+        return None
+
+    def compress_batch_top_k_docs(
+        self, batch_top_k_docs: List[List[RetrievableChunk]], batch_queries: List[str]
+    ):
+        profile = {
+            "query_encode_time": 0.0,
+            "artifact_lookup_time": 0.0,
+            "score_time": 0.0,
+            "sort_time": 0.0,
+            "build_output_time": 0.0,
+            "query_count": len(batch_queries),
+            "retrieved_doc_count": sum(len(docs) for docs in batch_top_k_docs),
+            "selected_doc_count": 0,
+        }
+        start = time.perf_counter()
+        query_vectors = self.encoder.encode_queries(batch_queries)
+        profile["query_encode_time"] = time.perf_counter() - start
+
+        summarized_batches = []
+        for docs, query_vector in zip(batch_top_k_docs, query_vectors):
+            scored_docs = []
+            for doc in docs:
+                lookup_start = time.perf_counter()
+                vectors = self.artifact.vectors_for_chunk_id(str(doc.id))
+                profile["artifact_lookup_time"] += time.perf_counter() - lookup_start
+                score_start = time.perf_counter()
+                score = score_maxsim(query_vector, vectors)
+                profile["score_time"] += time.perf_counter() - score_start
+                scored_docs.append((score, doc))
+
+            sort_start = time.perf_counter()
+            scored_docs.sort(key=lambda item: item[0], reverse=True)
+            selected = scored_docs[: min(self.keep, len(scored_docs))]
+            profile["sort_time"] += time.perf_counter() - sort_start
+
+            build_start = time.perf_counter()
+            summarized_batches.append([doc.clone() for _, doc in selected])
+            profile["selected_doc_count"] += len(selected)
+            profile["build_output_time"] += time.perf_counter() - build_start
+
+        self.last_profile = profile
+        return summarized_batches
 
 
 class ColBERTWindowSummarizer(Compressor):
@@ -99,6 +256,16 @@ class ColBERTWindowSummarizer(Compressor):
             disable_cpu_extension=disable_cpu_extension,
             verify_tensorization=False,
         )
+        self.query_encoder_warmup_time = 0.0
+
+    def warmup_query_encoder(self) -> float:
+        start = time.perf_counter()
+        self.encoder.encode_queries(["warmup query"])
+        self.query_encoder_warmup_time = time.perf_counter() - start
+        return self.query_encoder_warmup_time
+
+    def clear_inter_batch_cache(self) -> None:
+        self.artifact.retrievable_vectors_cache.clear()
 
     @staticmethod
     def _empty_profile() -> dict[str, float | int]:
@@ -571,6 +738,10 @@ class SlidingRegionColBERTWindowSummarizer(ColBERTWindowSummarizer):
                 f"COLBERT_FINAL_TOKEN_BUDGET must be positive, got {self.final_token_budget}"
             )
 
+    def clear_inter_batch_cache(self) -> None:
+        super().clear_inter_batch_cache()
+        self._sliding_region_spec_cache.clear()
+
     @staticmethod
     def _concat_candidate_vectors(candidates) -> torch.Tensor:
         vectors = [
@@ -602,7 +773,7 @@ class SlidingRegionColBERTWindowSummarizer(ColBERTWindowSummarizer):
             str(doc.id),
             self.region_token_budget,
             tuple(
-                (str(getattr(cacheable, "id", "")), cacheable.text)
+                str(getattr(cacheable, "id", ""))
                 for cacheable in cacheables
             ),
         )
