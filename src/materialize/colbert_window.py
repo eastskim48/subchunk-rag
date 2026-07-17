@@ -314,6 +314,7 @@ class ColBERTWindowEncoder:
                     int(state["token_count"]) + sentence_token_counts[candidate_idx]
                 )
                 if token_count > token_budget:
+                    state["active"] = False
                     continue
                 state["selected"].add(candidate_idx)
                 state["addition_order"].append(candidate_idx)
@@ -1435,10 +1436,8 @@ def _centered_region_index_specs(
 
             next_token_count = int(state["token_count"]) + token_counts[candidate_idx]
             if next_token_count > token_budget:
-                if direction == "left":
-                    state["left_active"] = False
-                else:
-                    state["right_active"] = False
+                state["left_active"] = False
+                state["right_active"] = False
                 continue
             state["selected"].add(candidate_idx)
             state["token_count"] = next_token_count
