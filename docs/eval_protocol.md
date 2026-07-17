@@ -110,6 +110,13 @@ Dense compare selectors use `COMPARE_EMBED_DIR`. ColBERT-window selectors use
 ColBERT environment variables. A result is valid only when these runtime
 settings match the artifact that was built.
 
+For `colbert_sliding_region`, compact artifacts with `region_specs_by_chunk`
+must be rebuilt after any change to region-spec construction. In particular,
+results produced before the skip-over packing fix in commit `6713d96` are not
+directly comparable to results produced after rebuilding those sidecar specs.
+The no-sidecar fallback was aligned with the same fixed region-spec constructor
+in commit `4ebf44c`.
+
 `RETRIEVAL_INCLUDE_DOCUMENTS=False` is allowed only for methods whose prompt
 text can be reconstructed from cacheable metadata. Do not use it for methods
 that require original retrieved document text unless that path has been
