@@ -877,12 +877,14 @@ class SlidingRegionColBERTWindowSummarizer(ColBERTWindowSummarizer):
         return sims.max(dim=1).values
 
     @staticmethod
-    def _sentence_score_cache_key(region, idx: int) -> str:
+    def _sentence_score_cache_key(region, idx: int):
         cacheables = region["source_cacheables"]
         raw_cacheable_id = getattr(cacheables[idx], "id", None)
+        source_vectors = region.get("source_vectors")
+        source_key = id(source_vectors) if source_vectors is not None else "no_source"
         if raw_cacheable_id:
-            return str(raw_cacheable_id)
-        return f"{region['chunk_idx']}::{idx}"
+            return (source_key, idx, str(raw_cacheable_id))
+        return (source_key, region["chunk_idx"], idx)
 
     def _score_sliding_regions_vectorized(
         self,
