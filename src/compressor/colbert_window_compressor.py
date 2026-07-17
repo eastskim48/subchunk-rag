@@ -14,6 +14,7 @@ from materialize.colbert_window import (
     ColBERTWindowArtifact,
     ColBERTWindowEncoder,
     WindowSpec,
+    _centered_region_index_specs,
     default_colbert_repo_path,
     global_top_count,
     parse_bool,
@@ -796,15 +797,16 @@ class SlidingRegionColBERTWindowSummarizer(ColBERTWindowSummarizer):
             self._sliding_region_spec_cache[cache_key] = region_specs
             return region_specs
 
-        specs = self.encoder.build_centered_windows(
-            sentences=[cacheable.text for cacheable in cacheables],
+        token_counts = self.encoder.token_counts_without_specials(
+            [cacheable.text for cacheable in cacheables]
+        )
+        computed_specs = _centered_region_index_specs(
+            token_counts=token_counts,
             token_budget=self.region_token_budget,
+            doc_token_overhead=self.encoder.doc_token_overhead,
         )
         seen_region_keys = set()
-        for center_idx, spec in enumerate(specs):
-            selected_indices = tuple(
-                idx for idx in spec.selected_indices if 0 <= idx < len(cacheables)
-            )
+        for center_idx, selected_indices in computed_specs:
             if not selected_indices or selected_indices in seen_region_keys:
                 continue
             seen_region_keys.add(selected_indices)
