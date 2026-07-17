@@ -1397,39 +1397,55 @@ def _centered_region_index_specs(
                 "right": center_idx + 1,
                 "token_count": center_token_count,
                 "take_left": True,
-                "active": True,
+                "left_active": True,
+                "right_active": True,
             }
         )
         specs.append(None)
 
-    while any(state is not None and state["active"] for state in states):
+    while any(
+        state is not None and (state["left_active"] or state["right_active"])
+        for state in states
+    ):
         for state in states:
-            if state is None or not state["active"]:
+            if state is None or not (state["left_active"] or state["right_active"]):
                 continue
-            left = state["left"]
-            right = state["right"]
-            take_left = state["take_left"]
-            if take_left and left >= 0:
-                candidate_idx = left
-                state["left"] = left - 1
-            elif (not take_left) and right < len(token_counts):
-                candidate_idx = right
-                state["right"] = right + 1
-            elif left >= 0:
-                candidate_idx = left
-                state["left"] = left - 1
-            elif right < len(token_counts):
-                candidate_idx = right
-                state["right"] = right + 1
-            else:
-                state["active"] = False
+
+            preferred_left = bool(state["take_left"])
+            directions = ("left", "right") if preferred_left else ("right", "left")
+            candidate_idx = None
+            direction = None
+            for candidate_direction in directions:
+                if candidate_direction == "left":
+                    if state["left_active"] and state["left"] >= 0:
+                        candidate_idx = int(state["left"])
+                        direction = "left"
+                        break
+                    state["left_active"] = False
+                else:
+                    if state["right_active"] and state["right"] < len(token_counts):
+                        candidate_idx = int(state["right"])
+                        direction = "right"
+                        break
+                    state["right_active"] = False
+
+            state["take_left"] = not preferred_left
+            if candidate_idx is None or direction is None:
                 continue
-            state["take_left"] = not take_left
+
             next_token_count = int(state["token_count"]) + token_counts[candidate_idx]
             if next_token_count > token_budget:
+                if direction == "left":
+                    state["left_active"] = False
+                else:
+                    state["right_active"] = False
                 continue
             state["selected"].add(candidate_idx)
             state["token_count"] = next_token_count
+            if direction == "left":
+                state["left"] = candidate_idx - 1
+            else:
+                state["right"] = candidate_idx + 1
 
     final_specs = []
     seen = set()
