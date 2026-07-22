@@ -51,8 +51,8 @@ cat <<EOF
 
 example commands:
   DATASET=longbench-hotpotqa PREPROCESS_SUBDIR=sent SPLITTER=sentence CACHEABLE_CHUNK_SIZE=None RETRIEVABLE_CHUNK_SIZE=1024 ./run/preprocess.sh
-  DATASET=longbench-hotpotqa CHUNK_SIZE=1024 ./run/preprocess_matkv.sh
+  DATASET=longbench-hotpotqa CHUNK_SIZE=1024 ./run/preprocess_vanilla.sh
   DATASET=longbench-hotpotqa DATA_SUBDIR=sent TOP_K=5 GLOBAL_TOP_R=0.10 EVAL_USE_PAST_CACHE=True ./run/eval.sh
   python run/grid_search/eval.py run/grid_search/grid.yaml
-  python run/grid_search/eval.py run/grid_search/grid_matkv.yaml
+  python run/grid_search/eval.py run/grid_search/grid_vanilla.yaml
 EOF

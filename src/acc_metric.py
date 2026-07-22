@@ -204,11 +204,6 @@ def load_predictions(prediction_file: str, use_clean_prediction: bool) -> list[s
     ]
 
 
-def load_ground_truths(ground_truth_file: str) -> list[str]:
-    records = load_json_records(ground_truth_file)
-    return [extract_ground_truth_from_record(record) for record in records]
-
-
 class BaseEvaluator(ABC):
     name = "base"
 

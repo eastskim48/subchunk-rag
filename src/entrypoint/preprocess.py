@@ -1,7 +1,9 @@
 import sys
+import os
 from pathlib import Path
 
 import fire
+from transformers import AutoTokenizer
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -9,12 +11,21 @@ if str(ROOT) not in sys.path:
 
 from model import LLMModel
 from vectordb import ChromaDB
-from materialize.colbert_window import (
-    build_colbert_window_artifact,
-    default_colbert_repo_path,
-)
 from materialize.materialize import DocumentPreprocessor
+from materialize.db_manifest import build_db_manifest, write_db_build_manifest
 from embedding_utils import BGE_M3_MODEL
+
+
+class TokenizerOnlyModel:
+    PASSAGE_PREFIX = LLMModel.PASSAGE_PREFIX
+
+    def __init__(self, model_name: str):
+        self.model_name = model_name
+        print(f"LOADING TOKENIZER {model_name} ...", flush=True)
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name, padding_side="right")
+        if self.tokenizer.pad_token is None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
+        print("TOKENIZER LOADED", flush=True)
 
 
 def main(
@@ -37,30 +48,16 @@ def main(
     sentence_cache_token_format: str = "legacy",
     resume_from_cache: bool = False,
     materialize_doc_ids_file: str | None = None,
-    sentence_resolver: str = "openai",
-    openai_model: str = "gpt-4o-mini",
-    fastcoref_model_name: str = "biu-nlp/f-coref",
-    pn_mapping_dir: str | None = None,
-    materialize_colbert_window: bool = False,
-    colbert_window_dir: str | None = None,
-    colbert_window_model: str = "colbert-ir/colbertv2.0",
-    colbert_window_device: str | None = None,
-    colbert_window_batch_size: int = 32,
-    colbert_window_token_budget: int = 180,
-    colbert_window_overwrite: bool = False,
-    colbert_source_tokenizer_name: str = "meta-llama/Llama-3.1-8B-Instruct",
-    colbert_repo_path: str | None = None,
-    colbert_disable_cpu_extension: bool = True,
-    colbert_verify_tensorization: bool = True,
-    colbert_window_center_unit: str = "sentence",
-    colbert_window_fixed_chunk_size: int | None = None,
-    colbert_window_prefix_title: bool = False,
-    colbert_window_title_separator: str = "[SEP]",
+    deduplicate_documents_by_hash: bool = False,
+    max_subchunk_tokens: int | None = None,
 ):
+    model = (
+        LLMModel(model_name) if materialize_cache else TokenizerOnlyModel(model_name)
+    )
     preprocessor = DocumentPreprocessor(
         docs_dir=docs_dir,
-        vectordb=ChromaDB(db_dir),
-        model=LLMModel(model_name),
+        vectordb=ChromaDB(db_dir) if materialize_db else None,
+        model=model,
         cache_dir=cache_dir,
         cacheable_chunk_size=cacheable_chunk_size,
         retrievable_chunk_size=retrievable_chunk_size,
@@ -77,35 +74,29 @@ def main(
         sentence_cache_token_format=sentence_cache_token_format,
         resume_from_cache=resume_from_cache,
         materialize_doc_ids_file=materialize_doc_ids_file,
-        sentence_resolver=sentence_resolver,
-        openai_model=openai_model,
-        fastcoref_model_name=fastcoref_model_name,
-        pn_mapping_dir=pn_mapping_dir,
+        deduplicate_documents_by_hash=deduplicate_documents_by_hash,
+        max_subchunk_tokens=max_subchunk_tokens,
     )
 
     preprocessor.process_documents()
 
-    if materialize_colbert_window:
-        output_dir = colbert_window_dir or str(Path(db_dir).parent / "colbert_window")
-        repo_path = colbert_repo_path or default_colbert_repo_path()
-        summary = build_colbert_window_artifact(
-            docs_dir=docs_dir,
-            output_dir=output_dir,
-            source_tokenizer_name=colbert_source_tokenizer_name,
-            model_name=colbert_window_model,
-            device=colbert_window_device,
-            batch_size=colbert_window_batch_size,
-            window_token_budget=colbert_window_token_budget,
-            overwrite=colbert_window_overwrite,
-            repo_path=repo_path,
-            disable_cpu_extension=colbert_disable_cpu_extension,
-            verify_tensorization=colbert_verify_tensorization,
-            center_unit=colbert_window_center_unit,
-            fixed_chunk_size=colbert_window_fixed_chunk_size,
-            prefix_title=colbert_window_prefix_title,
-            title_separator=colbert_window_title_separator,
+    if materialize_db:
+        manifest = build_db_manifest(
+            splitter=splitter,
+            merger=merger,
+            cacheable_chunk_size=cacheable_chunk_size,
+            retrievable_chunk_size=retrievable_chunk_size,
+            max_subchunk_tokens=max_subchunk_tokens,
+            tokenizer_name=model_name,
+            dummy_bos_count=dummy_bos_count,
+            sentence_cache_token_format=sentence_cache_token_format,
+            deduplicate_documents_by_hash=deduplicate_documents_by_hash,
+            embedding_backend=os.getenv(
+                "CHROMA_EMBED_BACKEND", ChromaDB.DEFAULT_EMBED_BACKEND
+            ),
         )
-        print(f"ColBERT window artifact materialized: {summary}")
+        manifest_path = write_db_build_manifest(db_dir, manifest)
+        print(f"DB build manifest materialized: {manifest_path}")
 
 
 if __name__ == "__main__":

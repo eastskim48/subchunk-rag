@@ -5,11 +5,6 @@ from typing import List
 
 from chunk import RetrievableChunk, CacheableChunk
 from materialize.splitter.merger import SubchunkMerger
-from materialize.splitter.resolution import (
-    build_openai_client,
-    resolve_leading_pronouns_with_fastcoref,
-    resolve_pronouns_with_openai,
-)
 
 
 @dataclass
@@ -38,12 +33,21 @@ class DocumentSplitter:
         cacheable_chunk_size,
         retrievable_chunk_size,
         content_chunk_size,
+        max_subchunk_tokens: int | None = None,
     ):
         self.docs_dir = docs_dir
         self.model = model
         self.cacheable_chunk_size = cacheable_chunk_size
         self.retrievable_chunk_size = retrievable_chunk_size
         self.content_chunk_size = content_chunk_size
+        self.max_subchunk_tokens = max_subchunk_tokens
+        self.prompt_tokenizer_name = getattr(model, "model_name", None) or getattr(
+            model.tokenizer, "name_or_path", None
+        )
+        if self.max_subchunk_tokens is not None and self.max_subchunk_tokens <= 0:
+            raise ValueError(
+                f"max_subchunk_tokens must be positive, got {self.max_subchunk_tokens}"
+            )
 
     def split_document(self, filename: str) -> SplitDocumentResult:
         text, token_ids = self._load_source_document(filename)
@@ -94,6 +98,16 @@ class DocumentSplitter:
             text = f.read()
         token_ids = self.model.tokenizer.encode(text, add_special_tokens=False)
         return text, token_ids
+
+    def _prompt_visible_token_count(self, text: str) -> int:
+        prompt_text = f"{text.strip()}\n\n"
+        return len(
+            self.model.tokenizer(
+                prompt_text,
+                add_special_tokens=False,
+                truncation=False,
+            )["input_ids"]
+        )
 
     def _split_sentence_texts(self, text: str) -> List[str]:
         try:
@@ -276,6 +290,45 @@ class DocumentSplitter:
 
         return sentence_views
 
+    def _split_long_sentence_views(
+        self, sentence_views: List[SentenceView], token_ids: List[int]
+    ) -> List[SentenceView]:
+        if self.max_subchunk_tokens is None:
+            return sentence_views
+
+        split_views: List[SentenceView] = []
+        for view in sentence_views:
+            token_length = view.token_end - view.token_start
+            if token_length <= self.max_subchunk_tokens:
+                split_views.append(view)
+                continue
+
+            part_start = view.token_start
+            while part_start < view.token_end:
+                part_end = min(part_start + self.max_subchunk_tokens, view.token_end)
+                if part_end <= part_start:
+                    raise ValueError(
+                        "failed to split long sentence into a non-empty subchunk: "
+                        f"token_start={view.token_start}, token_end={view.token_end}, "
+                        f"part_start={part_start}, part_end={part_end}"
+                    )
+                part_tokens = token_ids[part_start:part_end]
+                part_text = self.model.tokenizer.decode(
+                    part_tokens, skip_special_tokens=True
+                ).strip()
+                if part_text:
+                    split_views.append(
+                        SentenceView(
+                            text=part_text,
+                            char_start=view.char_start,
+                            char_end=view.char_end,
+                            token_start=part_start,
+                            token_end=part_end,
+                        )
+                    )
+                part_start = part_end
+        return split_views
+
     def _build_retrievable_chunks(
         self,
         filename: str,
@@ -351,6 +404,8 @@ class FixedSizeSplitter(DocumentSplitter):
                     chunk_size=self.cacheable_chunk_size,
                     chunk_start=i,
                     chunk_end=i + len(chunk_tokens),
+                    prompt_token_count=self._prompt_visible_token_count(chunk_text),
+                    prompt_tokenizer_name=self.prompt_tokenizer_name,
                 )
             )
         return chunks, chunk_starts, chunk_ends, max_chunk_tokens
@@ -358,17 +413,16 @@ class FixedSizeSplitter(DocumentSplitter):
 
 class SentenceWiseSplitter(DocumentSplitter):
     def build_chunks(self, filename: str, text: str, token_ids: List[int]):
-        sentence_views = self._build_sentence_views(text, token_ids)
-        sentence_texts = [
-            sentence_view.text.strip() for sentence_view in sentence_views
-        ]
+        sentence_views = self._split_long_sentence_views(
+            self._build_sentence_views(text, token_ids), token_ids
+        )
 
         chunks = []
         chunk_starts = []
         chunk_ends = []
         max_chunk_tokens = 0
-        for sent_idx, sentence_text in enumerate(sentence_texts):
-            sentence_view = sentence_views[sent_idx]
+        for sent_idx, sentence_view in enumerate(sentence_views):
+            sentence_text = sentence_view.text.strip()
             sentence_token_ids = self.model.tokenizer.encode(
                 sentence_text, add_special_tokens=False
             )
@@ -390,240 +444,12 @@ class SentenceWiseSplitter(DocumentSplitter):
                     chunk_end=chunk_end,
                     sentence_ids=[chunk_id],
                     sentence_texts=[sentence_text],
+                    prompt_token_count=self._prompt_visible_token_count(sentence_text),
+                    prompt_tokenizer_name=self.prompt_tokenizer_name,
                 )
             )
 
         return chunks, chunk_starts, chunk_ends, max_chunk_tokens
-
-
-class ResolvedSentenceWiseSplitter(DocumentSplitter):
-    def __init__(
-        self,
-        docs_dir,
-        model,
-        cacheable_chunk_size,
-        retrievable_chunk_size,
-        content_chunk_size,
-        sentence_resolver: str = "openai",
-        openai_model: str = "gpt-4o-mini",
-        fastcoref_model_name: str = "biu-nlp/f-coref",
-    ):
-        super().__init__(
-            docs_dir,
-            model,
-            cacheable_chunk_size,
-            retrievable_chunk_size,
-            content_chunk_size,
-        )
-        self.sentence_resolver = sentence_resolver
-        self.openai_model = openai_model
-        self.fastcoref_model_name = fastcoref_model_name
-        self.openai_client = None
-        self.coref_model = None
-        if self.sentence_resolver == "openai":
-            project_root = os.path.abspath(
-                os.path.join(os.path.dirname(__file__), "..", "..", "..")
-            )
-            self.openai_client = build_openai_client(project_root)
-        elif self.sentence_resolver == "fastcoref":
-            from fastcoref import FCoref
-            import torch
-
-            device = "cuda:0" if torch.cuda.is_available() else "cpu"
-            self.coref_model = FCoref(
-                device=device, model_name_or_path=self.fastcoref_model_name
-            )
-        elif self.sentence_resolver != "none":
-            raise ValueError(f"unsupported sentence_resolver: {self.sentence_resolver}")
-
-    def _resolve_sentence_texts(self, sentence_texts: List[str]) -> List[str]:
-        if self.sentence_resolver == "none":
-            return list(sentence_texts)
-        if self.sentence_resolver == "fastcoref":
-            rewritten, _ = resolve_leading_pronouns_with_fastcoref(
-                sentence_texts, self.coref_model
-            )
-            return rewritten
-        rewritten, _ = resolve_pronouns_with_openai(
-            sentence_texts, self.openai_client, self.openai_model
-        )
-        return rewritten
-
-    def build_chunks(self, filename: str, text: str, token_ids: List[int]):
-        sentence_views = self._build_sentence_views(text, token_ids)
-        sentence_texts = [
-            sentence_view.text.strip() for sentence_view in sentence_views
-        ]
-        resolved_sentence_texts = self._resolve_sentence_texts(sentence_texts)
-
-        chunks = []
-        chunk_starts = []
-        chunk_ends = []
-        max_chunk_tokens = 0
-        for sent_idx, sentence_text in enumerate(resolved_sentence_texts):
-            sentence_view = sentence_views[sent_idx]
-            sentence_token_ids = self.model.tokenizer.encode(
-                sentence_text, add_special_tokens=False
-            )
-            if not sentence_token_ids:
-                continue
-            chunk_start = sentence_view.token_start
-            chunk_end = sentence_view.token_end
-            max_chunk_tokens = max(max_chunk_tokens, len(sentence_token_ids))
-            chunk_starts.append(chunk_start)
-            chunk_ends.append(chunk_end)
-            chunk_id = f"{filename}::resolved_sent_{sent_idx}"
-            chunks.append(
-                CacheableChunk(
-                    id=chunk_id,
-                    text=sentence_text,
-                    parent_doc_id=filename,
-                    chunk_size=self.cacheable_chunk_size,
-                    chunk_start=chunk_start,
-                    chunk_end=chunk_end,
-                    sentence_ids=[f"{filename}::sent_{sent_idx}"],
-                    sentence_texts=[sentence_text],
-                )
-            )
-
-        return chunks, chunk_starts, chunk_ends, max_chunk_tokens
-
-
-class PNMappedSentenceWiseSplitter(DocumentSplitter):
-    def __init__(
-        self,
-        docs_dir,
-        model,
-        cacheable_chunk_size,
-        retrievable_chunk_size,
-        content_chunk_size,
-        pn_mapping_dir: str,
-    ):
-        super().__init__(
-            docs_dir,
-            model,
-            cacheable_chunk_size,
-            retrievable_chunk_size,
-            content_chunk_size,
-        )
-        self.pn_mapping_dir = pn_mapping_dir
-        self._validate_mapping_manifest()
-
-    def _validate_mapping_manifest(self) -> None:
-        manifest_path = os.path.join(self.pn_mapping_dir, "_pn_manifest.json")
-        if not os.path.exists(manifest_path):
-            return
-
-        import json
-
-        with open(manifest_path, "r", encoding="utf-8") as f:
-            manifest = json.load(f)
-        mapped_retrievable_chunk_size = manifest.get("retrievable_chunk_size")
-        if mapped_retrievable_chunk_size is None:
-            return
-
-        mapped_retrievable_chunk_size = int(mapped_retrievable_chunk_size)
-        if self.retrievable_chunk_size is None:
-            self.retrievable_chunk_size = mapped_retrievable_chunk_size
-            return
-        if int(self.retrievable_chunk_size) != mapped_retrievable_chunk_size:
-            raise ValueError(
-                "pn_mapping retrievable_chunk_size mismatch: "
-                f"mapping={mapped_retrievable_chunk_size}, preprocess={self.retrievable_chunk_size}"
-            )
-
-    def _load_mapping(self, filename: str):
-        mapping_path = os.path.join(self.pn_mapping_dir, f"{filename}.json")
-        if not os.path.exists(mapping_path):
-            raise FileNotFoundError(f"pn mapping missing: {mapping_path}")
-        import json
-
-        with open(mapping_path, "r", encoding="utf-8") as f:
-            return json.load(f)
-
-    def split_document(self, filename: str) -> SplitDocumentResult:
-        text, token_ids = self._load_source_document(filename)
-        token_count = len(token_ids)
-        mapping = self._load_mapping(filename)
-        sentence_views = mapping.get("sentence_views", [])
-        windows = mapping.get("retrievable_windows", [])
-
-        chunks = []
-        chunk_starts = []
-        chunk_ends = []
-        max_chunk_tokens = 0
-        sentence_id_to_chunk = {}
-        resolved_sentence_texts = [
-            sentence_view.get("resolved_text", "") for sentence_view in sentence_views
-        ]
-        for sent_idx, sentence_view in enumerate(sentence_views):
-            sentence_text = sentence_view.get("resolved_text", "").strip()
-            if not sentence_text:
-                continue
-            sentence_token_ids = self.model.tokenizer.encode(
-                sentence_text, add_special_tokens=False
-            )
-            if not sentence_token_ids:
-                continue
-            chunk_start = int(sentence_view["token_start"])
-            chunk_end = int(sentence_view["token_end"])
-            sentence_id = sentence_view["sentence_id"]
-            chunk = CacheableChunk(
-                id=sentence_id,
-                text=sentence_text,
-                parent_doc_id=filename,
-                chunk_size=self.cacheable_chunk_size,
-                chunk_start=chunk_start,
-                chunk_end=chunk_end,
-                sentence_ids=[sentence_id],
-                sentence_texts=[sentence_text],
-            )
-            chunks.append(chunk)
-            sentence_id_to_chunk[sentence_id] = chunk
-            chunk_starts.append(chunk_start)
-            chunk_ends.append(chunk_end)
-            max_chunk_tokens = max(max_chunk_tokens, len(sentence_token_ids))
-
-        retrievable_chunks = []
-        for window in windows:
-            window_start = int(window["window_token_start"])
-            window_end = int(window["window_token_end"])
-            overlapping_cacheables = [
-                sentence_id_to_chunk[sentence_id]
-                for sentence_id in window.get("sentence_ids", [])
-                if sentence_id in sentence_id_to_chunk
-            ]
-            if not overlapping_cacheables:
-                continue
-            window_token_ids = token_ids[window_start:window_end]
-            window_text = self.model.tokenizer.decode(
-                window_token_ids, skip_special_tokens=True
-            )
-            retrievable_chunks.append(
-                RetrievableChunk(
-                    id=window["id"],
-                    text=window_text,
-                    cacheables=overlapping_cacheables,
-                    chunk_size=self.retrievable_chunk_size,
-                    token_count=len(window_token_ids),
-                    cache_unit="sentence",
-                    metadata={
-                        "parent_doc_id": filename,
-                        "window_token_start": window_start,
-                        "window_token_end": window_end,
-                    },
-                )
-            )
-
-        return SplitDocumentResult(
-            chunks=chunks,
-            retrievable_chunk=(
-                retrievable_chunks[0] if len(retrievable_chunks) == 1 else None
-            ),
-            retrievable_chunks=retrievable_chunks,
-            token_count=token_count,
-            max_chunk_tokens=max_chunk_tokens,
-        )
 
 
 class SemanticSplitter(DocumentSplitter):
@@ -685,6 +511,8 @@ class SemanticSplitter(DocumentSplitter):
                     chunk_end=chunk_end,
                     sentence_ids=sentence_ids,
                     sentence_texts=merged_sentence_texts,
+                    prompt_token_count=self._prompt_visible_token_count(merged_text),
+                    prompt_tokenizer_name=self.prompt_tokenizer_name,
                 )
             )
 

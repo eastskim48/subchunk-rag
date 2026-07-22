@@ -355,9 +355,7 @@ class QueryProcessor:
                         ):
                             log_entry = {
                                 "question": query,
-                                "ctxs": [
-                                    {"title": "", "text": doc.text} for doc in docs
-                                ],
+                                "ctxs": self._ctxs_for_output(docs),
                                 "prediction": text,
                             }
                             lf.write(json.dumps(log_entry, ensure_ascii=False) + "\n")
@@ -422,7 +420,7 @@ class QueryProcessor:
                     ):
                         log_entry = {
                             "question": query,
-                            "ctxs": [{"title": "", "text": doc.text} for doc in docs],
+                            "ctxs": self._ctxs_for_output(docs),
                             "prediction": text,
                         }
                         lf.write(json.dumps(log_entry, ensure_ascii=False) + "\n")
@@ -574,6 +572,11 @@ class QueryProcessor:
                 cacheable.text for cacheable in getattr(doc, "cacheables", [])
             )
         return passages
+
+    def _ctxs_for_output(self, docs: List[RetrievableChunk]):
+        return [
+            {"title": "", "text": passage} for passage in self._extract_passages(docs)
+        ]
 
     def concatenate_query_and_doc(self, docs: List[RetrievableChunk], query: str):
         passages = self._extract_passages(docs)

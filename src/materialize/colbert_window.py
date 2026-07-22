@@ -17,18 +17,20 @@ from tqdm import tqdm
 from transformers import AutoTokenizer
 
 from chunk import CacheableChunk
+from materialize.db_manifest import (
+    DB_BUILD_MANIFEST_FILENAME,
+    build_db_manifest_reference,
+    db_build_manifest_sha256,
+    read_referenced_db_manifest,
+)
 from materialize.splitter.base import DocumentSplitter
 
-ARTIFACT_FORMAT = "matkv_official_colbert_doc_window_v1"
-COMPACT_ARTIFACT_FORMAT = "matkv_official_colbert_doc_window_compact_v1"
+ARTIFACT_FORMAT = "colbert_window_artifact_v1"
+DATA_ARTIFACT_FORMAT = "colbert_window_data_v1"
 
 
 def default_colbert_repo_path() -> str:
     return str(Path(__file__).resolve().parents[2] / "third_party" / "ColBERT")
-
-
-def safe_doc_filename(doc_id: str) -> str:
-    return "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in doc_id) + ".pt"
 
 
 def parse_bool(value: str | bool) -> bool:
@@ -475,39 +477,6 @@ class ColBERTWindowEncoder:
                     vectors.append(torch.empty((0, self.dim), dtype=torch.float16))
         return vectors
 
-    def encode_full_windows(
-        self, specs: list[WindowSpec], show_progress: bool = False
-    ) -> list[torch.Tensor]:
-        vectors: list[torch.Tensor] = []
-        iterator = range(0, len(specs), self.batch_size)
-        for start in tqdm(
-            iterator,
-            desc="encode official colbert full windows",
-            disable=not show_progress,
-            leave=False,
-        ):
-            batch_specs = specs[start : start + self.batch_size]
-            texts = [spec.text for spec in batch_specs]
-            ids, mask, _ = self.tensorize_docs_with_offsets(texts)
-            self._verify_official_tensorization(texts, ids, mask)
-            with torch.no_grad():
-                doc_vectors, doc_mask = self.checkpoint.doc(
-                    ids,
-                    mask,
-                    keep_dims="return_mask",
-                    to_cpu=True,
-                )
-            doc_mask = doc_mask.squeeze(-1).detach().cpu()
-            for row_idx in range(len(batch_specs)):
-                positions = doc_mask[row_idx].nonzero().flatten().tolist()
-                if positions:
-                    vectors.append(
-                        doc_vectors[row_idx, positions].contiguous().to(torch.float16)
-                    )
-                else:
-                    vectors.append(torch.empty((0, self.dim), dtype=torch.float16))
-        return vectors
-
     def encode_queries(self, queries: list[str]) -> list[torch.Tensor]:
         query_vectors = self.checkpoint.queryFromText(
             queries,
@@ -521,10 +490,29 @@ def _iter_document_files(docs_dir: Path) -> Iterable[Path]:
     return (path for path in sorted(docs_dir.iterdir()) if path.is_file())
 
 
+def _document_id_from_cacheable_id(cacheable_id: str) -> str | None:
+    if "::" in cacheable_id:
+        return cacheable_id.split("::", 1)[0]
+    marker = ".txt-"
+    marker_index = cacheable_id.find(marker)
+    if marker_index >= 0:
+        return cacheable_id[: marker_index + len(".txt")]
+    return None
+
+
+def db_document_ids(db_dir: str | Path, batch_size: int = 2048) -> set[str]:
+    doc_ids: set[str] = set()
+    for cacheable in _iter_db_cacheables(db_dir=str(db_dir), batch_size=batch_size):
+        doc_id = _document_id_from_cacheable_id(str(cacheable.id))
+        if doc_id is not None:
+            doc_ids.add(doc_id)
+    return doc_ids
+
+
 def build_colbert_window_artifact(
     docs_dir: str,
     output_dir: str,
-    source_tokenizer_name: str = "meta-llama/Llama-3.1-8B-Instruct",
+    db_dir: str,
     model_name: str = "colbert-ir/colbertv2.0",
     device: str | None = None,
     batch_size: int = 32,
@@ -538,11 +526,18 @@ def build_colbert_window_artifact(
     fixed_chunk_size: int | None = None,
     prefix_title: bool = False,
     title_separator: str = "[SEP]",
+    include_doc_ids: set[str] | None = None,
 ) -> dict[str, Any]:
     title_separator = _normalize_title_separator(title_separator)
-    if center_unit not in {"sentence", "fixed_chunk", "fixed_chunk_window"}:
+    if center_unit not in {
+        "sentence",
+        "sentence_only",
+        "fixed_chunk",
+        "fixed_chunk_window",
+    }:
         raise ValueError(
-            "center_unit must be one of {'sentence', 'fixed_chunk', 'fixed_chunk_window'}, "
+            "center_unit must be one of "
+            "{'sentence', 'sentence_only', 'fixed_chunk', 'fixed_chunk_window'}, "
             f"got {center_unit!r}"
         )
     if center_unit in {"fixed_chunk", "fixed_chunk_window"} and (
@@ -554,20 +549,54 @@ def build_colbert_window_artifact(
 
     docs_path = Path(docs_dir)
     artifact_dir = Path(output_dir)
+    data_dir = artifact_dir / "data"
+    db_manifest, db_manifest_reference = build_db_manifest_reference(
+        db_dir=db_dir, artifact_dir=artifact_dir
+    )
+    source_tokenizer_name = db_manifest.get("tokenizer_name")
+    if not isinstance(source_tokenizer_name, str) or not source_tokenizer_name:
+        raise ValueError("DB build manifest tokenizer_name must be a non-empty string")
+    max_subchunk_tokens = db_manifest.get("max_subchunk_tokens")
+    if max_subchunk_tokens is not None and (
+        isinstance(max_subchunk_tokens, bool)
+        or not isinstance(max_subchunk_tokens, int)
+    ):
+        raise ValueError(
+            "DB build manifest max_subchunk_tokens must be an integer or null, "
+            f"got {max_subchunk_tokens!r}"
+        )
     repo_path = repo_path or default_colbert_repo_path()
-    docs_out_dir = artifact_dir / "docs"
-    if overwrite and docs_out_dir.exists():
-        shutil.rmtree(docs_out_dir)
-    docs_out_dir.mkdir(parents=True, exist_ok=True)
+    if overwrite and artifact_dir.exists():
+        shutil.rmtree(artifact_dir)
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    data_dir.mkdir(parents=True, exist_ok=True)
 
     index_path = artifact_dir / "index.json"
-    if index_path.exists() and not overwrite:
+    data_index_path = data_dir / "index.json"
+    if index_path.exists() and data_index_path.exists() and not overwrite:
         existing = json.loads(index_path.read_text(encoding="utf-8"))
         if existing.get("format") != ARTIFACT_FORMAT:
             raise ValueError(
                 "existing ColBERT artifact was built by an unsupported/non-official implementation; "
                 "set COLBERT_WINDOW_OVERWRITE=True to rebuild it"
             )
+        existing_reference = existing.get("db_manifest")
+        if not isinstance(existing_reference, dict):
+            raise ValueError("existing ColBERT v2 artifact is missing db_manifest")
+        read_referenced_db_manifest(
+            artifact_dir=artifact_dir, reference=existing_reference
+        )
+        if existing_reference.get("sha256") != db_manifest_reference["sha256"]:
+            raise ValueError(
+                "existing ColBERT artifact does not match the requested DB manifest"
+            )
+        data_existing = json.loads(data_index_path.read_text(encoding="utf-8"))
+        if data_existing.get("format") != DATA_ARTIFACT_FORMAT:
+            raise ValueError(
+                "existing ColBERT data has unsupported format: "
+                f"{data_existing.get('format')}"
+            )
+        return existing
 
     start_time = time.perf_counter()
     source_tokenizer = AutoTokenizer.from_pretrained(source_tokenizer_name)
@@ -588,6 +617,7 @@ def build_colbert_window_artifact(
         cacheable_chunk_size=None,
         retrievable_chunk_size=None,
         content_chunk_size=None,
+        max_subchunk_tokens=max_subchunk_tokens,
     )
     encoder = ColBERTWindowEncoder(
         model_name=model_name,
@@ -662,7 +692,14 @@ def build_colbert_window_artifact(
             truncated_center=False,
         )
 
+    vectors_file = "vectors.fp16.bin"
+    offsets_file = "offsets.npy"
+    vectors_path = data_dir / vectors_file
+
     index_docs: dict[str, dict[str, Any]] = {}
+    offsets: list[int] = []
+    id_to_row: dict[str, int] = {}
+    window_ids_by_row: list[list[str]] = []
     total_cacheables = 0
     total_center_tokens = 0
     truncated_centers = 0
@@ -670,6 +707,8 @@ def build_colbert_window_artifact(
     failed_docs: list[dict[str, str]] = []
     pending_docs: list[dict[str, Any]] = []
     pending_window_count = 0
+    embedding_dim: int | None = None
+    vector_handle = vectors_path.open("wb")
 
     def flush_pending_docs():
         nonlocal pending_docs
@@ -677,6 +716,7 @@ def build_colbert_window_artifact(
         nonlocal total_cacheables
         nonlocal total_center_tokens
         nonlocal truncated_centers
+        nonlocal embedding_dim
 
         if not pending_docs:
             return
@@ -691,62 +731,47 @@ def build_colbert_window_artifact(
             specs = pending_doc["specs"]
             vectors = flat_vectors[cursor : cursor + len(specs)]
             cursor += len(specs)
-            token_counts = [int(vector.shape[0]) for vector in vectors]
-            payload = {
-                "format": f"{ARTIFACT_FORMAT}_doc",
-                "doc_id": pending_doc["doc_id"],
-                "cacheable_ids": pending_doc["cacheable_ids"],
-                "cacheable_texts": pending_doc["sentences"],
-                "embedding_dim": int(vectors[0].shape[1]) if vectors else encoder.dim,
-                "window_texts": [spec.text for spec in specs],
-                "window_selected_indices": [spec.selected_indices for spec in specs],
-                "window_addition_order": [spec.addition_order for spec in specs],
-                "window_truncated_center": [spec.truncated_center for spec in specs],
-                "center_token_vectors": vectors,
-            }
-            torch.save(payload, pending_doc["out_file"])
+            doc_token_counts = [int(vector.shape[0]) for vector in vectors]
+            if vectors and embedding_dim is None:
+                embedding_dim = int(vectors[0].shape[1])
 
             index_docs[pending_doc["doc_id"]] = {
-                "file": f"docs/{pending_doc['out_file'].name}",
                 "cacheable_count": len(pending_doc["cacheable_ids"]),
-                "center_token_count": sum(token_counts),
+                "center_token_count": sum(doc_token_counts),
             }
+            for cacheable_id, vector, spec in zip(
+                pending_doc["cacheable_ids"], vectors, specs
+            ):
+                row = len(id_to_row)
+                id_to_row[str(cacheable_id)] = row
+                offsets.append(total_center_tokens)
+                if int(vector.shape[1]) != (embedding_dim or encoder.dim):
+                    raise ValueError(
+                        f"embedding dim mismatch for {cacheable_id}: "
+                        f"{vector.shape[1]} != {embedding_dim or encoder.dim}"
+                    )
+                vector = vector.contiguous().to(torch.float16).cpu()
+                vector_handle.write(vector.numpy().tobytes(order="C"))
+                total_center_tokens += int(vector.shape[0])
+                cacheable_ids = pending_doc["cacheable_ids"]
+                window_ids_by_row.append(
+                    [
+                        str(cacheable_ids[idx])
+                        for idx in spec.selected_indices
+                        if isinstance(idx, int) and 0 <= idx < len(cacheable_ids)
+                    ]
+                )
             total_cacheables += len(pending_doc["cacheable_ids"])
-            total_center_tokens += sum(token_counts)
             truncated_centers += sum(1 for spec in specs if spec.truncated_center)
 
         pending_docs = []
         pending_window_count = 0
 
     doc_files = list(_iter_document_files(docs_path))
-    for path in tqdm(
-        doc_files, desc="build official colbert document-window artifacts"
-    ):
+    if include_doc_ids is not None:
+        doc_files = [path for path in doc_files if path.name in include_doc_ids]
+    for path in tqdm(doc_files, desc="build colbert window artifact"):
         doc_id = path.name
-        out_file = docs_out_dir / safe_doc_filename(doc_id)
-        if out_file.exists() and not overwrite:
-            payload = torch.load(out_file, map_location="cpu")
-            if payload.get("format") != f"{ARTIFACT_FORMAT}_doc":
-                raise ValueError(
-                    f"existing doc artifact was built by an unsupported/non-official implementation: {out_file}"
-                )
-            token_counts = [
-                int(vector.shape[0])
-                for vector in payload.get("center_token_vectors", [])
-            ]
-            index_docs[doc_id] = {
-                "file": f"docs/{out_file.name}",
-                "cacheable_count": len(payload.get("cacheable_ids", [])),
-                "center_token_count": sum(token_counts),
-            }
-            total_cacheables += len(payload.get("cacheable_ids", []))
-            total_center_tokens += sum(token_counts)
-            truncated_centers += sum(
-                1 for item in payload.get("window_truncated_center", []) if item
-            )
-            skipped_existing += 1
-            continue
-
         try:
             text = path.read_text(encoding="utf-8")
             title = _document_title(text) if prefix_title else ""
@@ -764,16 +789,31 @@ def build_colbert_window_artifact(
                     f"title_prefix_tokens={title_prefix_tokens}"
                 )
             token_ids = source_tokenizer.encode(text, add_special_tokens=False)
-            if center_unit == "sentence":
-                sentence_views = splitter._build_sentence_views(text, token_ids)
+            if center_unit in {"sentence", "sentence_only"}:
+                sentence_views = splitter._split_long_sentence_views(
+                    splitter._build_sentence_views(text, token_ids), token_ids
+                )
                 units = [
                     view.text.strip() for view in sentence_views if view.text.strip()
                 ]
                 cacheable_ids = [f"{doc_id}::sent_{idx}" for idx in range(len(units))]
-                specs = encoder.build_centered_windows(
-                    sentences=units,
-                    token_budget=content_token_budget,
-                )
+                if center_unit == "sentence_only":
+                    specs = [
+                        WindowSpec(
+                            text=unit,
+                            center_start=0,
+                            center_end=len(unit),
+                            selected_indices=[idx],
+                            addition_order=[idx],
+                            truncated_center=False,
+                        )
+                        for idx, unit in enumerate(units)
+                    ]
+                else:
+                    specs = encoder.build_centered_windows(
+                        sentences=units,
+                        token_budget=content_token_budget,
+                    )
                 if title:
                     specs = [
                         _prefix_window_with_title(spec, title, title_separator)
@@ -818,7 +858,6 @@ def build_colbert_window_artifact(
         pending_docs.append(
             {
                 "doc_id": doc_id,
-                "out_file": out_file,
                 "sentences": units,
                 "cacheable_ids": cacheable_ids,
                 "specs": specs,
@@ -829,12 +868,17 @@ def build_colbert_window_artifact(
             flush_pending_docs()
 
     flush_pending_docs()
+    vector_handle.close()
+    final_offsets = np.asarray(offsets + [total_center_tokens], dtype=np.int64)
+    np.save(data_dir / offsets_file, final_offsets)
+    embedding_dim = int(embedding_dim or encoder.dim)
 
     summary = {
         "format": ARTIFACT_FORMAT,
         "encoder_impl": "official_colbert_checkpoint",
+        "data_dir": "data",
         "docs_dir": str(docs_path),
-        "source_tokenizer_name": source_tokenizer_name,
+        "db_manifest": db_manifest_reference,
         "model_name": model_name,
         "checkpoint_name": model_name,
         "repo_path": repo_path,
@@ -844,7 +888,7 @@ def build_colbert_window_artifact(
         "official_doc_maxlen": encoder.doc_maxlen,
         "official_query_maxlen": encoder.query_maxlen,
         "mask_punctuation": bool(encoder.checkpoint.colbert_config.mask_punctuation),
-        "embedding_dim": encoder.dim,
+        "embedding_dim": embedding_dim,
         "window_scope": "parent_document",
         "prefix_title": bool(prefix_title),
         "title_separator": title_separator,
@@ -868,6 +912,22 @@ def build_colbert_window_artifact(
         json.dumps(summary, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
+    data_summary = {
+        "format": DATA_ARTIFACT_FORMAT,
+        "source_format": summary["format"],
+        "embedding_dim": embedding_dim,
+        "num_cacheables": total_cacheables,
+        "num_tokens": total_center_tokens,
+        "vectors_file": vectors_file,
+        "offsets_file": offsets_file,
+        "id_to_row": id_to_row,
+        "window_ids_by_row": window_ids_by_row,
+        "build_time_sec": summary["build_time_sec"],
+    }
+    data_index_path.write_text(
+        json.dumps(data_summary, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
     return summary
 
 
@@ -886,36 +946,33 @@ def score_maxsim(query_vectors: torch.Tensor, doc_vectors: torch.Tensor) -> floa
     return float(sims.max(dim=1).values.sum().item())
 
 
-class CompactColBERTWindowArtifact:
-    def __init__(self, compact_dir: str | Path):
-        self.compact_dir = Path(compact_dir)
-        self.index_path = self.compact_dir / "index.json"
+class ColBERTWindowData:
+    def __init__(self, data_dir: str | Path):
+        self.data_dir = Path(data_dir)
+        self.index_path = self.data_dir / "index.json"
         if not self.index_path.exists():
-            raise FileNotFoundError(
-                f"missing compact ColBERT artifact index: {self.index_path}"
-            )
+            raise FileNotFoundError(f"missing ColBERT data index: {self.index_path}")
         self.index = json.loads(self.index_path.read_text(encoding="utf-8"))
-        if self.index.get("format") != COMPACT_ARTIFACT_FORMAT:
+        if self.index.get("format") != DATA_ARTIFACT_FORMAT:
             raise ValueError(
-                "unsupported compact ColBERT artifact format: "
-                f"{self.index.get('format')}"
+                "unsupported ColBERT data format: " f"{self.index.get('format')}"
             )
         self.embedding_dim = int(self.index["embedding_dim"])
         self.num_tokens = int(self.index["num_tokens"])
         self.id_to_row = self.index["id_to_row"]
         self.window_ids_by_row = self.index.get("window_ids_by_row", [])
         self.region_token_budget = self.index.get("region_token_budget")
-        self.region_specs_by_chunk = self.index.get("region_specs_by_chunk", {})
-        token_counts_file = self.index.get("token_counts_file")
-        self.token_counts = (
-            np.load(self.compact_dir / token_counts_file, mmap_mode="r")
-            if token_counts_file
-            else None
-        )
+        if not isinstance(self.region_token_budget, int) or isinstance(
+            self.region_token_budget, bool
+        ):
+            raise ValueError("ColBERT data requires an integer region_token_budget")
+        self.region_specs_by_chunk = self.index.get("region_specs_by_chunk")
+        if not isinstance(self.region_specs_by_chunk, dict):
+            raise ValueError("ColBERT data requires region_specs_by_chunk")
         self.offsets = np.load(
-            self.compact_dir / self.index["offsets_file"], mmap_mode="r"
+            self.data_dir / self.index["offsets_file"], mmap_mode="r"
         )
-        vectors_path = self.compact_dir / self.index["vectors_file"]
+        vectors_path = self.data_dir / self.index["vectors_file"]
         self.vectors = np.memmap(
             vectors_path,
             dtype=np.float16,
@@ -953,29 +1010,28 @@ class CompactColBERTWindowArtifact:
 
     def region_specs_for_doc(self, doc, token_budget: int):
         if self.region_token_budget != int(token_budget):
-            return None
-        payload = self.region_specs_by_chunk.get(str(getattr(doc, "id", "")))
+            raise ValueError(
+                "runtime region budget does not match ColBERT artifact: "
+                f"runtime={token_budget}, artifact={self.region_token_budget}"
+            )
+        doc_id = str(getattr(doc, "id", ""))
+        payload = self.region_specs_by_chunk.get(doc_id)
         if payload is None:
-            return None
+            raise ValueError(f"ColBERT region specs missing runtime chunk: {doc_id}")
         cacheable_ids = [
             getattr(cacheable, "id", None)
             for cacheable in getattr(doc, "cacheables", []) or []
             if getattr(cacheable, "text", None)
         ]
         if payload.get("cacheable_ids") != cacheable_ids:
-            return None
+            raise ValueError(
+                "runtime cacheable IDs do not match ColBERT region specs: "
+                f"chunk={doc_id}"
+            )
         return [
             (int(item[0]), tuple(int(idx) for idx in item[1]))
             for item in payload.get("specs", [])
         ]
-
-    def token_count_for_cacheable_id(self, cacheable_id: str) -> int | None:
-        if self.token_counts is None:
-            return None
-        row = self.id_to_row.get(cacheable_id)
-        if row is None:
-            return None
-        return int(self.token_counts[row])
 
 
 class ColBERTWindowArtifact:
@@ -987,81 +1043,56 @@ class ColBERTWindowArtifact:
                 f"missing ColBERT window artifact index: {self.index_path}"
             )
         self.index = json.loads(self.index_path.read_text(encoding="utf-8"))
-        if self.index.get("format") != ARTIFACT_FORMAT:
+        artifact_format = self.index.get("format")
+        if artifact_format != ARTIFACT_FORMAT:
             raise ValueError(
                 "unsupported ColBERT window artifact format: "
-                f"{self.index.get('format')}; rebuild with the official ColBERT path"
+                f"{artifact_format}; rebuild with the official ColBERT path"
             )
-        self.doc_cache: dict[str, dict[str, Any]] = {}
-        self.vector_lookup_cache: dict[str, dict[str, torch.Tensor]] = {}
-        self.window_ids_lookup_cache: dict[str, dict[str, list[str]]] = {}
+        self.db_manifest_reference = self.index.get("db_manifest")
+        if not isinstance(self.db_manifest_reference, dict):
+            raise ValueError("ColBERT artifact requires a DB manifest reference")
+        self.db_manifest = read_referenced_db_manifest(
+            artifact_dir=self.artifact_dir,
+            reference=self.db_manifest_reference,
+        )
         self.retrievable_vectors_cache: dict[
             tuple[str, tuple[str | None, ...]], list[torch.Tensor]
         ] = {}
-        self.compact = None
-        use_compact = parse_bool(os.getenv("COLBERT_USE_COMPACT_ARTIFACT", "True"))
-        compact_dir = os.getenv("COLBERT_COMPACT_WINDOW_DIR")
-        compact_path = Path(compact_dir) if compact_dir else self.artifact_dir / "compact"
-        if use_compact and compact_path.exists():
-            self.compact = CompactColBERTWindowArtifact(compact_path)
-
-    @staticmethod
-    def parent_doc_id_for_retrievable(doc) -> str:
-        parent_doc_id = getattr(doc, "metadata", {}).get("parent_doc_id")
-        if isinstance(parent_doc_id, str) and parent_doc_id:
-            return parent_doc_id
-        for cacheable in getattr(doc, "cacheables", []) or []:
-            if getattr(cacheable, "parent_doc_id", None):
-                return cacheable.parent_doc_id
-        if "::ret_" in doc.id:
-            return doc.id.split("::ret_", 1)[0]
-        return doc.id
-
-    def load_doc(self, doc_id: str) -> dict[str, Any]:
-        if doc_id not in self.doc_cache:
-            docs = self.index.get("docs", {})
-            if doc_id not in docs:
-                raise KeyError(
-                    f"ColBERT window artifact missing parent doc_id={doc_id}"
-                )
-            path = self.artifact_dir / docs[doc_id]["file"]
-            self.doc_cache[doc_id] = torch.load(path, map_location="cpu")
-        return self.doc_cache[doc_id]
-
-    def vector_lookup_for_doc_id(self, doc_id: str) -> dict[str, torch.Tensor]:
-        if self.compact is not None:
-            return {}
-        if doc_id not in self.vector_lookup_cache:
-            payload = self.load_doc(doc_id)
-            self.vector_lookup_cache[doc_id] = dict(
-                zip(
-                    payload.get("cacheable_ids", []),
-                    payload.get("center_token_vectors", []),
-                )
+        data_dir = self.index.get("data_dir")
+        if not isinstance(data_dir, str) or not data_dir:
+            raise ValueError("ColBERT artifact requires a data_dir")
+        self.data = ColBERTWindowData(self.artifact_dir / data_dir)
+        window_token_budget = self.index.get("window_token_budget")
+        if not isinstance(window_token_budget, int) or isinstance(
+            window_token_budget, bool
+        ):
+            raise ValueError("ColBERT artifact requires an integer window_token_budget")
+        if self.data.region_token_budget != window_token_budget:
+            raise ValueError(
+                "ColBERT region budget does not match artifact window budget: "
+                f"region={self.data.region_token_budget}, window={window_token_budget}"
             )
-        return self.vector_lookup_cache[doc_id]
 
-    def window_ids_lookup_for_doc_id(self, doc_id: str) -> dict[str, list[str]]:
-        if self.compact is not None:
-            return {}
-        if doc_id not in self.window_ids_lookup_cache:
-            payload = self.load_doc(doc_id)
-            artifact_ids = payload.get("cacheable_ids", [])
-            window_selected_indices = payload.get("window_selected_indices", [])
-            window_ids_by_id = {}
-            for cacheable_id, selected_indices in zip(
-                artifact_ids, window_selected_indices
-            ):
-                window_ids_by_id[cacheable_id] = [
-                    artifact_ids[idx]
-                    for idx in selected_indices
-                    if isinstance(idx, int) and 0 <= idx < len(artifact_ids)
-                ]
-            self.window_ids_lookup_cache[doc_id] = window_ids_by_id
-        return self.window_ids_lookup_cache[doc_id]
+    def validate_db_manifest(self, db_dir: str | Path) -> None:
+        referenced_path = (
+            self.artifact_dir / self.db_manifest_reference["path"]
+        ).resolve()
+        runtime_path = (Path(db_dir) / DB_BUILD_MANIFEST_FILENAME).resolve()
+        if runtime_path != referenced_path:
+            raise ValueError(
+                "runtime DB manifest path does not match ColBERT artifact reference: "
+                f"artifact={referenced_path}, runtime={runtime_path}"
+            )
+        expected_sha256 = self.db_manifest_reference["sha256"]
+        actual_sha256 = db_build_manifest_sha256(db_dir)
+        if actual_sha256 != expected_sha256:
+            raise ValueError(
+                "runtime DB build manifest does not match ColBERT artifact: "
+                f"artifact={expected_sha256}, runtime={actual_sha256}, db_dir={db_dir}"
+            )
 
     def vectors_for_doc(self, doc) -> list[torch.Tensor]:
-        parent_doc_id = self.parent_doc_id_for_retrievable(doc)
         cacheable_ids = tuple(
             getattr(cacheable, "id", None)
             for cacheable in getattr(doc, "cacheables", []) or []
@@ -1070,44 +1101,19 @@ class ColBERTWindowArtifact:
         cached = self.retrievable_vectors_cache.get(cache_key)
         if cached is not None:
             return cached
-        if self.compact is not None:
-            vectors = self.compact.vectors_for_cacheable_ids(cacheable_ids)
-            self.retrievable_vectors_cache[cache_key] = vectors
-            return vectors
-        payload = self.load_doc(parent_doc_id)
-        vector_by_id = self.vector_lookup_for_doc_id(parent_doc_id)
-        dim = int(payload.get("embedding_dim", self.index.get("embedding_dim", 0)))
-        empty = torch.empty((0, dim), dtype=torch.float16)
-        vectors = [
-            vector_by_id.get(cacheable.id, empty)
-            for cacheable in getattr(doc, "cacheables", []) or []
-        ]
+        vectors = self.data.vectors_for_cacheable_ids(cacheable_ids)
         self.retrievable_vectors_cache[cache_key] = vectors
         return vectors
 
     def window_cacheable_ids_for_doc(self, doc) -> list[list[str]]:
-        parent_doc_id = self.parent_doc_id_for_retrievable(doc)
         cacheable_ids = tuple(
             getattr(cacheable, "id", None)
             for cacheable in getattr(doc, "cacheables", []) or []
         )
-        if self.compact is not None:
-            return self.compact.window_ids_for_cacheable_ids(cacheable_ids)
-        window_ids_by_id = self.window_ids_lookup_for_doc_id(parent_doc_id)
-        return [
-            window_ids_by_id.get(cacheable.id, [cacheable.id])
-            for cacheable in getattr(doc, "cacheables", []) or []
-        ]
+        return self.data.window_ids_for_cacheable_ids(cacheable_ids)
 
     def region_specs_for_doc(self, doc, token_budget: int):
-        if self.compact is None:
-            return None
-        return self.compact.region_specs_for_doc(doc, token_budget)
-
-    def token_count_for_cacheable_id(self, cacheable_id: str) -> int | None:
-        if self.compact is None:
-            return None
-        return self.compact.token_count_for_cacheable_id(cacheable_id)
+        return self.data.region_specs_for_doc(doc, token_budget)
 
 
 def _iter_db_cacheables(
@@ -1181,14 +1187,7 @@ def validate_colbert_window_artifact_against_db(
     batch_size: int = 2048,
 ) -> dict[str, Any]:
     artifact = ColBERTWindowArtifact(artifact_dir)
-    artifact_text_by_id: dict[str, str] = {}
-
-    for doc_id in artifact.index.get("docs", {}):
-        payload = artifact.load_doc(doc_id)
-        for cacheable_id, text in zip(
-            payload.get("cacheable_ids", []), payload.get("cacheable_texts", [])
-        ):
-            artifact_text_by_id[str(cacheable_id)] = str(text)
+    artifact_ids = set(str(cacheable_id) for cacheable_id in artifact.data.id_to_row)
 
     db_text_by_id: dict[str, str] = {}
     duplicate_db_ids = 0
@@ -1202,27 +1201,20 @@ def validate_colbert_window_artifact_against_db(
             continue
         db_text_by_id[cacheable.id] = cacheable.text
 
-    missing_in_artifact = sorted(set(db_text_by_id) - set(artifact_text_by_id))
-    extra_in_artifact = sorted(set(artifact_text_by_id) - set(db_text_by_id))
-    text_mismatches = [
-        {
-            "cacheable_id": cacheable_id,
-            "db_text": db_text_by_id[cacheable_id],
-            "artifact_text": artifact_text_by_id[cacheable_id],
-        }
-        for cacheable_id in sorted(set(db_text_by_id) & set(artifact_text_by_id))
-        if db_text_by_id[cacheable_id] != artifact_text_by_id[cacheable_id]
-    ]
+    missing_in_artifact = sorted(set(db_text_by_id) - artifact_ids)
+    extra_in_artifact = sorted(artifact_ids - set(db_text_by_id))
+    text_mismatches = []
 
     summary = {
         "db_dir": str(db_dir),
         "artifact_dir": str(artifact_dir),
         "db_cacheable_count": len(db_text_by_id),
-        "artifact_cacheable_count": len(artifact_text_by_id),
+        "artifact_cacheable_count": len(artifact_ids),
         "duplicate_db_ids": duplicate_db_ids,
         "missing_in_artifact_count": len(missing_in_artifact),
         "extra_in_artifact_count": len(extra_in_artifact),
         "text_mismatch_count": len(text_mismatches),
+        "text_validation": "not_stored",
     }
 
     if missing_in_artifact or extra_in_artifact or text_mismatches:
@@ -1240,239 +1232,59 @@ def validate_colbert_window_artifact_against_db(
     return summary
 
 
-def build_compact_colbert_window_artifact(
-    artifact_dir: str | Path,
-    output_dir: str | Path | None = None,
-    overwrite: bool = False,
-    db_dir: str | Path | None = None,
-    region_token_budget: int | None = None,
-) -> dict[str, Any]:
-    source_dir = Path(artifact_dir)
-    compact_dir = Path(output_dir) if output_dir else source_dir / "compact"
-    index_path = source_dir / "index.json"
-    if not index_path.exists():
-        raise FileNotFoundError(f"missing ColBERT window artifact index: {index_path}")
-    source_index = json.loads(index_path.read_text(encoding="utf-8"))
-    if source_index.get("format") != ARTIFACT_FORMAT:
-        raise ValueError(
-            "unsupported source ColBERT artifact format: "
-            f"{source_index.get('format')}"
-        )
-
-    compact_index_path = compact_dir / "index.json"
-    if compact_index_path.exists() and not overwrite:
-        existing = json.loads(compact_index_path.read_text(encoding="utf-8"))
-        if db_dir is not None and region_token_budget is not None:
-            return add_region_specs_to_compact_colbert_artifact(
-                compact_dir=compact_dir,
-                db_dir=db_dir,
-                region_token_budget=region_token_budget,
-                overwrite=True,
-            )
-        return existing
-    if overwrite and compact_dir.exists():
-        shutil.rmtree(compact_dir)
-    compact_dir.mkdir(parents=True, exist_ok=True)
-
-    docs = source_index.get("docs", {})
-    embedding_dim = int(source_index.get("embedding_dim", 0))
-    num_cacheables = int(source_index.get("num_cacheables", 0))
-    num_tokens = int(source_index.get("num_center_tokens", 0))
-    if embedding_dim <= 0:
-        raise ValueError(f"invalid source embedding_dim={embedding_dim}")
-
-    vectors_file = "vectors.fp16.bin"
-    offsets_file = "offsets.npy"
-    token_counts_file = "token_counts.npy"
-    vectors_path = compact_dir / vectors_file
-    offsets_path = compact_dir / offsets_file
-    token_counts_path = compact_dir / token_counts_file
-    offsets = np.zeros(num_cacheables + 1, dtype=np.int64)
-    token_counts = np.zeros(num_cacheables, dtype=np.int32)
-    id_to_row: dict[str, int] = {}
-    window_ids_by_row: list[list[str]] = []
-    encoder = ColBERTWindowEncoder(
-        model_name=source_index.get("checkpoint_name")
-        or source_index.get("model_name", "colbert-ir/colbertv2.0"),
-        repo_path=source_index.get("repo_path") or default_colbert_repo_path(),
-        device="cpu",
-        batch_size=128,
-        max_length=int(source_index.get("official_doc_maxlen", 0)),
-        disable_cpu_extension=True,
-        verify_tensorization=False,
-    )
-
-    row = 0
-    token_offset = 0
-    start_time = time.perf_counter()
-    with vectors_path.open("wb") as vector_handle:
-        for doc_id, meta in tqdm(
-            docs.items(), desc="build compact colbert window artifact"
-        ):
-            del doc_id
-            payload = torch.load(source_dir / meta["file"], map_location="cpu")
-            cacheable_ids = payload.get("cacheable_ids", [])
-            cacheable_texts = payload.get("cacheable_texts", [])
-            vectors = payload.get("center_token_vectors", [])
-            window_selected_indices = payload.get("window_selected_indices", [])
-            doc_token_counts = encoder.token_counts(cacheable_texts)
-            for cacheable_id, vector, selected_indices, token_count in zip(
-                cacheable_ids, vectors, window_selected_indices, doc_token_counts
-            ):
-                if row >= num_cacheables:
-                    raise ValueError(
-                        "source artifact has more cacheables than index declares"
-                    )
-                id_to_row[cacheable_id] = row
-                offsets[row] = token_offset
-                token_counts[row] = int(token_count)
-                if isinstance(vector, torch.Tensor) and vector.numel() > 0:
-                    vector = vector.contiguous().to(torch.float16).cpu()
-                    if int(vector.shape[1]) != embedding_dim:
-                        raise ValueError(
-                            f"embedding dim mismatch for {cacheable_id}: "
-                            f"{vector.shape[1]} != {embedding_dim}"
-                        )
-                    vector_handle.write(vector.numpy().tobytes(order="C"))
-                    token_offset += int(vector.shape[0])
-                window_ids_by_row.append(
-                    [
-                        cacheable_ids[idx]
-                        for idx in selected_indices
-                        if isinstance(idx, int) and 0 <= idx < len(cacheable_ids)
-                    ]
-                )
-                row += 1
-
-    offsets[row] = token_offset
-    if row != num_cacheables:
-        offsets = offsets[: row + 1]
-        num_cacheables = row
-    if token_offset != num_tokens:
-        num_tokens = token_offset
-    np.save(offsets_path, offsets)
-    np.save(token_counts_path, token_counts[:num_cacheables])
-
-    summary = {
-        "format": COMPACT_ARTIFACT_FORMAT,
-        "source_format": source_index.get("format"),
-        "source_artifact_dir": str(source_dir),
-        "embedding_dim": embedding_dim,
-        "num_cacheables": num_cacheables,
-        "num_tokens": num_tokens,
-        "vectors_file": vectors_file,
-        "offsets_file": offsets_file,
-        "token_counts_file": token_counts_file,
-        "id_to_row": id_to_row,
-        "window_ids_by_row": window_ids_by_row,
-        "build_time_sec": time.perf_counter() - start_time,
-    }
-    compact_index_path.write_text(
-        json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8"
-    )
-    if db_dir is not None and region_token_budget is not None:
-        summary = add_region_specs_to_compact_colbert_artifact(
-            compact_dir=compact_dir,
-            db_dir=db_dir,
-            region_token_budget=region_token_budget,
-            overwrite=True,
-        )
-    return summary
-
-
-def _centered_region_index_specs(
-    token_counts: list[int], token_budget: int, doc_token_overhead: int
+def _window_bounded_region_index_specs(
+    cacheable_ids: list[str],
+    window_ids_by_cacheable_id: dict[str, list[str]],
 ) -> list[tuple[int, tuple[int, ...]]]:
-    specs = []
-    states: list[dict[str, Any] | None] = []
-    for center_idx, token_count in enumerate(token_counts):
-        center_token_count = int(token_count) + doc_token_overhead
-        if center_token_count >= token_budget:
-            specs.append((center_idx, (center_idx,)))
-            states.append(None)
-            continue
-        states.append(
-            {
-                "selected": {center_idx},
-                "left": center_idx - 1,
-                "right": center_idx + 1,
-                "token_count": center_token_count,
-                "take_left": True,
-                "left_active": True,
-                "right_active": True,
-            }
+    chunk_index_by_id = {
+        str(cacheable_id): idx for idx, cacheable_id in enumerate(cacheable_ids)
+    }
+    raw_specs: list[tuple[int, tuple[int, ...]]] = []
+    for center_idx, cacheable_id in enumerate(cacheable_ids):
+        window_ids = window_ids_by_cacheable_id.get(str(cacheable_id), [cacheable_id])
+        selected_indices = tuple(
+            sorted(
+                {
+                    chunk_index_by_id[str(window_id)]
+                    for window_id in window_ids
+                    if str(window_id) in chunk_index_by_id
+                }
+            )
         )
-        specs.append(None)
+        if not selected_indices:
+            continue
+        raw_specs.append((center_idx, selected_indices))
 
-    while any(
-        state is not None and (state["left_active"] or state["right_active"])
-        for state in states
-    ):
-        for state in states:
-            if state is None or not (state["left_active"] or state["right_active"]):
-                continue
-
-            preferred_left = bool(state["take_left"])
-            directions = ("left", "right") if preferred_left else ("right", "left")
-            candidate_idx = None
-            direction = None
-            for candidate_direction in directions:
-                if candidate_direction == "left":
-                    if state["left_active"] and state["left"] >= 0:
-                        candidate_idx = int(state["left"])
-                        direction = "left"
-                        break
-                    state["left_active"] = False
-                else:
-                    if state["right_active"] and state["right"] < len(token_counts):
-                        candidate_idx = int(state["right"])
-                        direction = "right"
-                        break
-                    state["right_active"] = False
-
-            state["take_left"] = not preferred_left
-            if candidate_idx is None or direction is None:
-                continue
-
-            next_token_count = int(state["token_count"]) + token_counts[candidate_idx]
-            if next_token_count > token_budget:
-                state["left_active"] = False
-                state["right_active"] = False
-                continue
-            state["selected"].add(candidate_idx)
-            state["token_count"] = next_token_count
-            if direction == "left":
-                state["left"] = candidate_idx - 1
-            else:
-                state["right"] = candidate_idx + 1
-
+    selected_sets = [selected for _, selected in raw_specs]
     final_specs = []
     seen = set()
-    for center_idx, state in enumerate(states):
-        if specs[center_idx] is not None:
-            selected_indices = specs[center_idx][1]
-        else:
-            selected_indices = tuple(sorted(state["selected"]))
-        if not selected_indices or selected_indices in seen:
+    for center_idx, selected_indices in raw_specs:
+        if selected_indices in seen:
+            continue
+        selected_set = set(selected_indices)
+        if any(
+            len(selected_indices) < len(other) and selected_set.issubset(other)
+            for other in selected_sets
+        ):
             continue
         seen.add(selected_indices)
         final_specs.append((center_idx, selected_indices))
     return final_specs
 
 
-def add_region_specs_to_compact_colbert_artifact(
-    compact_dir: str | Path,
+def add_region_specs_to_colbert_window_data(
+    data_dir: str | Path,
     db_dir: str | Path,
     region_token_budget: int,
     overwrite: bool = True,
 ) -> dict[str, Any]:
-    compact_path = Path(compact_dir)
-    index_path = compact_path / "index.json"
+    data_path = Path(data_dir)
+    index_path = data_path / "index.json"
     if not index_path.exists():
-        raise FileNotFoundError(f"missing compact artifact index: {index_path}")
+        raise FileNotFoundError(f"missing ColBERT data index: {index_path}")
     index = json.loads(index_path.read_text(encoding="utf-8"))
-    if index.get("format") != COMPACT_ARTIFACT_FORMAT:
-        raise ValueError(f"unsupported compact artifact format: {index.get('format')}")
+    if index.get("format") != DATA_ARTIFACT_FORMAT:
+        raise ValueError(f"unsupported ColBERT data format: {index.get('format')}")
     if (
         not overwrite
         and index.get("region_token_budget") == int(region_token_budget)
@@ -1480,56 +1292,41 @@ def add_region_specs_to_compact_colbert_artifact(
     ):
         return index
 
-    source_index_path = Path(index["source_artifact_dir"]) / "index.json"
+    source_index_path = data_path.parent / "index.json"
     source_index = json.loads(source_index_path.read_text(encoding="utf-8"))
-    encoder = ColBERTWindowEncoder(
-        model_name=source_index.get("checkpoint_name")
-        or source_index.get("model_name", "colbert-ir/colbertv2.0"),
-        repo_path=source_index.get("repo_path") or default_colbert_repo_path(),
-        device="cpu",
-        batch_size=128,
-        max_length=int(source_index.get("official_doc_maxlen", 0)),
-        disable_cpu_extension=True,
-        verify_tensorization=False,
-    )
-    doc_token_overhead = encoder.doc_token_overhead
-    if not index.get("token_counts_file"):
-        token_counts_file = "token_counts.npy"
-        token_counts_path = compact_path / token_counts_file
-        token_counts = np.zeros(int(index["num_cacheables"]), dtype=np.int32)
-        source_dir = Path(index["source_artifact_dir"])
-        for meta in tqdm(
-            source_index.get("docs", {}).values(),
-            desc="build compact colbert token counts",
-        ):
-            payload = torch.load(source_dir / meta["file"], map_location="cpu")
-            cacheable_ids = payload.get("cacheable_ids", [])
-            cacheable_texts = payload.get("cacheable_texts", [])
-            counts = encoder.token_counts(cacheable_texts)
-            for cacheable_id, count in zip(cacheable_ids, counts):
-                row = index["id_to_row"].get(cacheable_id)
-                if row is not None:
-                    token_counts[row] = int(count)
-        np.save(token_counts_path, token_counts)
-        index["token_counts_file"] = token_counts_file
+    window_token_budget = source_index.get("window_token_budget")
+    if not isinstance(window_token_budget, int) or isinstance(
+        window_token_budget, bool
+    ):
+        raise ValueError("ColBERT artifact requires an integer window_token_budget")
+    if int(region_token_budget) != window_token_budget:
+        raise ValueError(
+            "region token budget must match the artifact window token budget: "
+            f"region={region_token_budget}, window={window_token_budget}"
+        )
 
     start_time = time.perf_counter()
     region_specs_by_chunk = {}
     chunk_count = 0
     region_count = 0
-    for cacheables in _iter_db_cacheable_groups(db_dir):
-        if not cacheables:
+    window_ids_by_cacheable_id = {}
+    id_by_row = {
+        int(row): str(cacheable_id)
+        for cacheable_id, row in index.get("id_to_row", {}).items()
+    }
+    for row_idx, window_ids in enumerate(index.get("window_ids_by_row", [])):
+        cacheable_id = id_by_row.get(row_idx)
+        if cacheable_id is None:
             continue
-        chunk_id, chunk_cacheables = cacheables
+        window_ids_by_cacheable_id[cacheable_id] = [str(item) for item in window_ids]
+    for chunk_id, chunk_cacheables in _iter_db_cacheable_groups(db_dir):
         filtered = [cacheable for cacheable in chunk_cacheables if cacheable.text]
+        if not filtered:
+            continue
         cacheable_ids = [cacheable.id for cacheable in filtered]
-        token_counts = encoder.token_counts_without_specials(
-            [cacheable.text for cacheable in filtered]
-        )
-        specs = _centered_region_index_specs(
-            token_counts=token_counts,
-            token_budget=int(region_token_budget),
-            doc_token_overhead=doc_token_overhead,
+        specs = _window_bounded_region_index_specs(
+            cacheable_ids=cacheable_ids,
+            window_ids_by_cacheable_id=window_ids_by_cacheable_id,
         )
         region_specs_by_chunk[str(chunk_id)] = {
             "cacheable_ids": cacheable_ids,
@@ -1543,7 +1340,11 @@ def add_region_specs_to_compact_colbert_artifact(
     index["region_spec_chunk_count"] = chunk_count
     index["region_spec_count"] = region_count
     index["region_spec_build_time_sec"] = time.perf_counter() - start_time
-    index["region_spec_tokenizer"] = source_index.get("checkpoint_name") or source_index.get("model_name")
-    index["region_spec_doc_token_overhead"] = doc_token_overhead
-    index_path.write_text(json.dumps(index, ensure_ascii=False, indent=2), encoding="utf-8")
+    index["region_spec_reuse_mode"] = "document_window_bound"
+    index.pop("region_spec_validation_mismatch_count", None)
+    index.pop("region_spec_tokenizer", None)
+    index.pop("region_spec_doc_token_overhead", None)
+    index_path.write_text(
+        json.dumps(index, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
     return index

@@ -1,5 +1,7 @@
 import json
 import os
+import hashlib
+import re
 import torch
 from tqdm import tqdm
 from typing import List
@@ -12,9 +14,7 @@ from model import LLMModel
 from chunk import Chunk, CacheableChunk, RetrievableChunk
 from materialize.splitter import (
     FixedSizeSplitter,
-    PNMappedSentenceWiseSplitter,
     SentenceWiseSplitter,
-    ResolvedSentenceWiseSplitter,
     SemanticSplitter,
     build_merger,
 )
@@ -27,7 +27,7 @@ from embedding_utils import BGE_M3_MODEL
 class DocumentPreprocessor:
     def __init__(
         self,
-        vectordb: VectorDB,
+        vectordb: VectorDB | None,
         model: LLMModel,
         docs_dir: str,
         cache_dir: str,
@@ -46,10 +46,8 @@ class DocumentPreprocessor:
         sentence_cache_token_format: str = "legacy",
         resume_from_cache: bool = False,
         materialize_doc_ids_file: str | None = None,
-        sentence_resolver: str = "openai",
-        openai_model: str = "gpt-4o-mini",
-        fastcoref_model_name: str = "biu-nlp/f-coref",
-        pn_mapping_dir: str | None = None,
+        deduplicate_documents_by_hash: bool = False,
+        max_subchunk_tokens: int | None = None,
     ):
         self.docs_dir = docs_dir
         self.cache_dir = cache_dir
@@ -68,15 +66,17 @@ class DocumentPreprocessor:
         self.sentence_cache_token_format = sentence_cache_token_format
         self.resume_from_cache = resume_from_cache
         self.materialize_doc_ids_file = materialize_doc_ids_file
-        self.sentence_resolver = sentence_resolver
-        self.openai_model = openai_model
-        self.fastcoref_model_name = fastcoref_model_name
-        self.pn_mapping_dir = pn_mapping_dir
+        self.deduplicate_documents_by_hash = deduplicate_documents_by_hash
+        self.max_subchunk_tokens = max_subchunk_tokens
+        self._seen_document_hashes: dict[str, str] = {}
+        self.duplicate_document_count = 0
         if self.materialize_cache:
             os.makedirs(self.cache_dir, exist_ok=True)
         if self.materialize_compare_embeds and self.compare_embed_dir:
             os.makedirs(self.compare_embed_dir, exist_ok=True)
         self.vectordb = vectordb
+        if self.materialize_db and self.vectordb is None:
+            raise ValueError("vectordb must be set when materialize_db=True")
         self.model = model
         self.total_doc_tokens = 0
         self.processed_doc_count = 0
@@ -103,8 +103,6 @@ class DocumentPreprocessor:
             "fixed_size",
             "fixed_subchunk",
             "sentence",
-            "resolved_sentence",
-            "pn_sentence",
             "semantic",
         }:
             raise ValueError(f"unsupported splitter: {self.splitter_name}")
@@ -146,8 +144,6 @@ class DocumentPreprocessor:
         if self.cacheable_chunk_size is None and self.retrievable_chunk_size is None:
             if self.splitter_name not in {
                 "sentence",
-                "resolved_sentence",
-                "pn_sentence",
                 "semantic",
             }:
                 raise NotImplementedError(
@@ -160,12 +156,10 @@ class DocumentPreprocessor:
         ):
             if self.splitter_name not in {
                 "sentence",
-                "resolved_sentence",
-                "pn_sentence",
                 "semantic",
             }:
                 raise NotImplementedError(
-                    "cacheable_chunk_size=None with retrievable_chunk_size set is only supported for sentence/resolved_sentence/semantic splitters"
+                    "cacheable_chunk_size=None with retrievable_chunk_size set is only supported for sentence/semantic splitters"
                 )
             self.content_chunk_size = None
         elif (
@@ -197,30 +191,7 @@ class DocumentPreprocessor:
                 cacheable_chunk_size=self.cacheable_chunk_size,
                 retrievable_chunk_size=self.retrievable_chunk_size,
                 content_chunk_size=self.content_chunk_size,
-            )
-        elif self.splitter_name == "resolved_sentence":
-            self.splitter = ResolvedSentenceWiseSplitter(
-                docs_dir=self.docs_dir,
-                model=self.model,
-                cacheable_chunk_size=self.cacheable_chunk_size,
-                retrievable_chunk_size=self.retrievable_chunk_size,
-                content_chunk_size=self.content_chunk_size,
-                sentence_resolver=self.sentence_resolver,
-                openai_model=self.openai_model,
-                fastcoref_model_name=self.fastcoref_model_name,
-            )
-        elif self.splitter_name == "pn_sentence":
-            if not self.pn_mapping_dir:
-                raise ValueError(
-                    "splitter=pn_sentence requires pn_mapping_dir to be set"
-                )
-            self.splitter = PNMappedSentenceWiseSplitter(
-                docs_dir=self.docs_dir,
-                model=self.model,
-                cacheable_chunk_size=self.cacheable_chunk_size,
-                retrievable_chunk_size=self.retrievable_chunk_size,
-                content_chunk_size=self.content_chunk_size,
-                pn_mapping_dir=self.pn_mapping_dir,
+                max_subchunk_tokens=self.max_subchunk_tokens,
             )
         elif self.splitter_name == "semantic":
             self.splitter = SemanticSplitter(
@@ -251,8 +222,7 @@ class DocumentPreprocessor:
                 embedding_batch_size=self.batch_size,
                 cache_unit=(
                     "sentence"
-                    if self.splitter_name
-                    in {"sentence", "resolved_sentence", "pn_sentence", "semantic"}
+                    if self.splitter_name in {"sentence", "semantic"}
                     else "token"
                 ),
                 overwrite=self.compare_embed_overwrite,
@@ -261,14 +231,19 @@ class DocumentPreprocessor:
     def process_documents(self):
         start_time = time.time()
         files = os.listdir(self.docs_dir)
+        if self.deduplicate_documents_by_hash:
+            files = sorted(files, key=self._document_sort_key)
         print(f"Processing {len(files)} documents...")
         pending_chunks = []
 
         for filename in tqdm(files):
+            if self._should_skip_duplicate_document(filename):
+                continue
             cacheable_chunks, retrievable_chunks = self.split_document(filename)
             if not cacheable_chunks:
                 continue
             if self.materialize_db:
+                assert self.vectordb is not None
                 self.vectordb.store(retrievable_chunks)
             should_materialize_doc = (
                 self.materialize_doc_ids is None or filename in self.materialize_doc_ids
@@ -312,8 +287,38 @@ class DocumentPreprocessor:
             print(
                 f"Rebuilt invalid existing chunks: {self.rebuilt_invalid_chunk_count}"
             )
+        if self.deduplicate_documents_by_hash:
+            print(
+                "Skipped duplicate documents by normalized text hash: "
+                f"{self.duplicate_document_count}"
+            )
 
         print(f"Processing completed in {elapsed_time:.2f} seconds.")
+
+    @staticmethod
+    def _normalized_document_text_for_hash(text: str) -> str:
+        return " ".join(text.split())
+
+    @staticmethod
+    def _document_sort_key(filename: str):
+        match = re.fullmatch(r"doc_(\d+)\.txt", filename)
+        if match:
+            return (0, int(match.group(1)), filename)
+        return (1, filename)
+
+    def _should_skip_duplicate_document(self, filename: str) -> bool:
+        if not self.deduplicate_documents_by_hash:
+            return False
+        path = os.path.join(self.docs_dir, filename)
+        with open(path, "r", encoding="utf-8") as handle:
+            normalized_text = self._normalized_document_text_for_hash(handle.read())
+        digest = hashlib.sha256(normalized_text.encode("utf-8")).hexdigest()
+        existing_filename = self._seen_document_hashes.get(digest)
+        if existing_filename is not None:
+            self.duplicate_document_count += 1
+            return True
+        self._seen_document_hashes[digest] = filename
+        return False
 
     def _cache_path_for_chunk(self, chunk: Chunk) -> str:
         return os.path.join(self.cache_dir, f"{chunk.id}.pt")
@@ -378,10 +383,7 @@ class DocumentPreprocessor:
                 )
             )
         cache_unit = (
-            "sentence"
-            if self.splitter_name
-            in {"sentence", "resolved_sentence", "pn_sentence", "semantic"}
-            else "token"
+            "sentence" if self.splitter_name in {"sentence", "semantic"} else "token"
         )
         for retrievable_chunk in retrievable_chunks:
             if retrievable_chunk.cache_unit is None:
@@ -436,14 +438,14 @@ class DocumentPreprocessor:
             chunk.text, add_special_tokens=False
         )
         if (
-            self.splitter_name in {"sentence", "pn_sentence", "semantic"}
+            self.splitter_name in {"sentence", "semantic"}
             and self.sentence_cache_token_format == "space_prefix_newline_suffix"
         ):
             return (
                 self.space_token_ids + chunk_token_ids + self.visible_suffix_token_ids
             )
         if (
-            self.splitter_name in {"sentence", "pn_sentence", "semantic"}
+            self.splitter_name in {"sentence", "semantic"}
             and self.sentence_cache_token_format == "merged_space_prefix_newline_suffix"
         ):
             merged_prefix_chunk_token_ids = self.model.tokenizer.encode(
@@ -452,7 +454,7 @@ class DocumentPreprocessor:
             )
             return merged_prefix_chunk_token_ids + self.visible_suffix_token_ids
         if (
-            self.splitter_name in {"sentence", "pn_sentence", "semantic"}
+            self.splitter_name in {"sentence", "semantic"}
             and self.sentence_cache_token_format
             == "merged_space_prefix_space_newline_suffix"
         ):

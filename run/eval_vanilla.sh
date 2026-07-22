@@ -10,14 +10,14 @@ else
     export DATASET_PATH="$DATASET"
 fi
 export CHUNK_SIZE="${CHUNK_SIZE:-1024}"
-export MATKV_SUBDIR="${MATKV_SUBDIR:-matkv_${CHUNK_SIZE}}"
+export VANILLA_SUBDIR="${VANILLA_SUBDIR:-vanilla-default-${CHUNK_SIZE}}"
 export CHROMA_EMBED_DEVICE="${CHROMA_EMBED_DEVICE:-cpu}"
 export COMPARE_EMBED_DEVICE="${COMPARE_EMBED_DEVICE:-cpu}"
 export DEFAULT_MODEL_NAME="meta-llama/Llama-3.1-8B-Instruct"
 export MODEL_NAME="${MODEL_NAME:-$DEFAULT_MODEL_NAME}"
 export CACHE_SUBDIR="${CACHE_SUBDIR:-cache}"
-export DB_DIR="${DB_DIR:-$DATASET_PATH/$MATKV_SUBDIR/db}"
-export CACHE_DIR="${CACHE_DIR:-$DATASET_PATH/$MATKV_SUBDIR/$CACHE_SUBDIR}"
+export DB_DIR="${DB_DIR:-$DATASET_PATH/$VANILLA_SUBDIR/db}"
+export CACHE_DIR="${CACHE_DIR:-$DATASET_PATH/$VANILLA_SUBDIR/$CACHE_SUBDIR}"
 export EVAL_USE_PAST_CACHE="${EVAL_USE_PAST_CACHE:-False}"
 export DISABLE_ROPE="${DISABLE_ROPE:-False}"
 export USE_FRONT_BOS_CACHE="${USE_FRONT_BOS_CACHE:-False}"
@@ -54,5 +54,5 @@ torchrun --nproc_per_node 1 src/entrypoint/eval.py \
     --use_front_bos_cache "$USE_FRONT_BOS_CACHE" \
     --model_load_in_4bit "$MODEL_LOAD_IN_4BIT" \
     --use_cleaner "$USE_CLEANER" \
-    --output_file "./outputs/eval-matkv-$DATASET-topk${TOP_K}-$OUTPUT_SUFFIX.jsonl" \
+    --output_file "./outputs/eval-vanilla-$DATASET-topk${TOP_K}-$OUTPUT_SUFFIX.jsonl" \
     --answer_file "$DATASET_PATH/answers/answer.jsonl"

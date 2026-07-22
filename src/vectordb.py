@@ -111,12 +111,6 @@ class DenseEmbeddingFunction:
         return
 
 
-class MatKVDenseEmbeddingFunction(DenseEmbeddingFunction):
-    def __init__(self, *args, **kwargs):
-        kwargs.setdefault("function_name", "matkv_bge_m3")
-        super().__init__(*args, **kwargs)
-
-
 class VectorDB(abc.ABC):
     def __init__(self):
         pass
@@ -134,7 +128,6 @@ class ChromaDB(VectorDB):
     DEFAULT_EMBEDDING_MODEL = BGE_M3_MODEL
     DEFAULT_EMBED_BACKEND = "default"
     BGE_M3_EMBED_BACKEND = "bge_m3"
-    LEGACY_EMBED_BACKENDS = {"matkv_bge_m3"}
     DEFAULT_COLLECTION_CONFIGURATION = {
         "hnsw": {
             "space": "cosine",
@@ -173,26 +166,17 @@ class ChromaDB(VectorDB):
         )
         if embed_backend in {"default", "chroma_default"}:
             return chroma_client.get_or_create_collection(name="doc_collection")
-        if (
-            embed_backend != ChromaDB.BGE_M3_EMBED_BACKEND
-            and embed_backend not in ChromaDB.LEGACY_EMBED_BACKENDS
-        ):
+        if embed_backend != ChromaDB.BGE_M3_EMBED_BACKEND:
             raise ValueError(
                 f"unsupported CHROMA_EMBED_BACKEND={embed_backend!r}; "
-                "expected 'default', 'bge_m3', 'chroma_default', "
-                "or 'matkv_bge_m3' for legacy DBs"
+                "expected 'default', 'bge_m3', or 'chroma_default'"
             )
-        function_name = (
-            "matkv_bge_m3"
-            if embed_backend in ChromaDB.LEGACY_EMBED_BACKENDS
-            else ChromaDB.BGE_M3_EMBED_BACKEND
-        )
         return chroma_client.get_or_create_collection(
             name="doc_collection",
             configuration=ChromaDB.DEFAULT_COLLECTION_CONFIGURATION,
             embedding_function=DenseEmbeddingFunction(
                 model_name=ChromaDB.DEFAULT_EMBEDDING_MODEL,
-                function_name=function_name,
+                function_name=ChromaDB.BGE_M3_EMBED_BACKEND,
             ),
         )
 

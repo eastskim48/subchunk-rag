@@ -20,7 +20,7 @@ from prompt import PromptProcessor
 
 
 @dataclass
-class MatKVTimeLog:
+class InferenceTimeLog:
     prefill: float
     decode: float
     model_input_lengths: Optional[List[int]] = None
@@ -480,7 +480,7 @@ class LLMModel:
         past_kv_caches=None,
         past_lengths=None,
         max_new_tokens: int = 100,
-    ) -> Tuple[MatKVTimeLog, List[str]]:
+    ) -> Tuple[InferenceTimeLog, List[str]]:
         if torch.cuda.is_available():
             torch.cuda.synchronize()
         start_prefill = time.perf_counter()
@@ -656,7 +656,7 @@ class LLMModel:
 
         responses = [self.post_process_response(line) for line in generated_text]
         return (
-            MatKVTimeLog(
+            InferenceTimeLog(
                 decode=unit_decode,
                 prefill=unit_prefill,
                 model_input_lengths=[int(length) for length in model_input_lengths],

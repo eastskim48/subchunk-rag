@@ -18,10 +18,6 @@ def _env_similarity_threshold(default: float = 0.7) -> float:
     return float(os.getenv("SIMILARITY_THRESHOLD", str(default)))
 
 
-def _env_fastcoref_model_name(default: str = "biu-nlp/f-coref") -> str:
-    return os.getenv("FASTCOREF_MODEL_NAME", default)
-
-
 PRONOUN_LIKE_STARTS = {
     "he",
     "she",
@@ -299,11 +295,7 @@ class CorefPronounDPMerger(DPMerger):
         from datasets.utils.logging import disable_progress_bar
 
         device = "cuda:0" if torch.cuda.is_available() else "cpu"
-        self.fastcoref_model_name = (
-            _env_fastcoref_model_name()
-            if fastcoref_model_name is None
-            else fastcoref_model_name
-        )
+        self.fastcoref_model_name = fastcoref_model_name or "biu-nlp/f-coref"
         disable_progress_bar()
         transformers_logging.set_verbosity_error()
         logging.getLogger("fastcoref").setLevel(logging.ERROR)

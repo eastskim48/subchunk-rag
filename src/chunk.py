@@ -29,6 +29,8 @@ class CacheableChunk(Chunk):
         chunk_end: Optional[int] = None,
         sentence_ids: Optional[List[str]] = None,
         sentence_texts: Optional[List[str]] = None,
+        prompt_token_count: Optional[int] = None,
+        prompt_tokenizer_name: Optional[str] = None,
     ):
         self.id = id
         self.text = text
@@ -38,6 +40,8 @@ class CacheableChunk(Chunk):
         self.chunk_end = chunk_end
         self.sentence_ids = list(sentence_ids or [])
         self.sentence_texts = list(sentence_texts or [])
+        self.prompt_token_count = prompt_token_count
+        self.prompt_tokenizer_name = prompt_tokenizer_name
 
     def clone(self) -> CacheableChunk:
         return CacheableChunk(
@@ -49,6 +53,8 @@ class CacheableChunk(Chunk):
             chunk_end=self.chunk_end,
             sentence_ids=deepcopy(self.sentence_ids),
             sentence_texts=deepcopy(self.sentence_texts),
+            prompt_token_count=self.prompt_token_count,
+            prompt_tokenizer_name=self.prompt_tokenizer_name,
         )
 
     def to_payload(self) -> Dict[str, Any]:
@@ -61,6 +67,8 @@ class CacheableChunk(Chunk):
             "chunk_end": self.chunk_end,
             "sentence_ids": list(self.sentence_ids),
             "sentence_texts": list(self.sentence_texts),
+            "prompt_token_count": self.prompt_token_count,
+            "prompt_tokenizer_name": self.prompt_tokenizer_name,
         }
 
     @classmethod
@@ -74,6 +82,8 @@ class CacheableChunk(Chunk):
             chunk_end=payload.get("chunk_end"),
             sentence_ids=payload.get("sentence_ids"),
             sentence_texts=payload.get("sentence_texts"),
+            prompt_token_count=payload.get("prompt_token_count"),
+            prompt_tokenizer_name=payload.get("prompt_tokenizer_name"),
         )
 
 

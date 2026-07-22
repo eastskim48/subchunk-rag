@@ -28,16 +28,10 @@ export CACHE_DIR="${CACHE_DIR:-$DATASET_PATH/$DATA_SUBDIR/$CACHE_SUBDIR}"
 export CHROMA_EMBED_DEVICE="${CHROMA_EMBED_DEVICE:-cpu}"
 export COMPARE_EMBED_DEVICE="${COMPARE_EMBED_DEVICE:-cpu}"
 export COMPARE_EMBED_DIR="${COMPARE_EMBED_DIR:-$DATASET_PATH/$DATA_SUBDIR/compare_embed}"
-export TITLE_COMPARE_EMBED_DIR="${TITLE_COMPARE_EMBED_DIR:-$DATASET_PATH/sent-title-test/compare_embed}"
 export COLBERT_WINDOW_DIR="${COLBERT_WINDOW_DIR:-$DATASET_PATH/$DATA_SUBDIR/colbert_window}"
 export COLBERT_MODEL_NAME="${COLBERT_MODEL_NAME:-colbert-ir/colbertv2.0}"
-export COLBERT_DEVICE="${COLBERT_DEVICE:-cpu}"
 export COLBERT_BATCH_SIZE="${COLBERT_BATCH_SIZE:-32}"
 export COLBERT_REPO_PATH="${COLBERT_REPO_PATH:-$REPO_ROOT/third_party/ColBERT}"
-export COLBERT_DISABLE_CPU_EXTENSION="${COLBERT_DISABLE_CPU_EXTENSION:-True}"
-export COLBERT_USE_COMPACT_ARTIFACT="${COLBERT_USE_COMPACT_ARTIFACT:-True}"
-export COLBERT_CLEAR_INTER_BATCH_CACHE="${COLBERT_CLEAR_INTER_BATCH_CACHE:-True}"
-export COLBERT_WARMUP_QUERY_ENCODER="${COLBERT_WARMUP_QUERY_ENCODER:-True}"
 export EVAL_USE_PAST_CACHE="${EVAL_USE_PAST_CACHE:-False}"
 export DISABLE_ROPE="${DISABLE_ROPE:-False}"
 export USE_FRONT_BOS_CACHE="${USE_FRONT_BOS_CACHE:-False}"
@@ -49,28 +43,44 @@ export EVAL_BSZ="${EVAL_BSZ:-4}"
 export TOP_K="${TOP_K:-20}"
 export TOTAL_NUM="${TOTAL_NUM:-200}"
 export MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-20}"
-export COMPRESS_METHOD="${COMPRESS_METHOD-compare_all_materialized}"
+export COMPRESS_METHOD="${COMPRESS_METHOD-dense}"
 export GLOBAL_TOP_R="${GLOBAL_TOP_R:-0.1}"
 export TORCHRUN_MASTER_PORT="${TORCHRUN_MASTER_PORT:-29500}"
+
+USES_TOKEN_BUDGET=False
+USES_GLOBAL_TOP_R=False
+case "$COMPRESS_METHOD" in
+    dense)
+        USES_GLOBAL_TOP_R=True
+        ;;
+    colbert_window_budget)
+        USES_TOKEN_BUDGET=True
+        ;;
+    colbert_subchunk|colbert_sliding_region|rerank_and_region)
+        USES_TOKEN_BUDGET=True
+        if [ -z "${RETAIN_TOKEN_RATIO:-}" ] && [ -z "${COLBERT_FINAL_TOKEN_BUDGET:-}" ]; then
+            USES_GLOBAL_TOP_R=True
+        fi
+        ;;
+esac
+
 if [ "$EVAL_USE_PAST_CACHE" = "True" ]; then
     OUTPUT_SUFFIX="cacheon"
 else
     OUTPUT_SUFFIX="cacheoff"
 fi
-if [ -n "$HYBRID_BGE_WEIGHT" ]; then
-    OUTPUT_SUFFIX="hbw${HYBRID_BGE_WEIGHT}-$OUTPUT_SUFFIX"
+if [ "$USES_TOKEN_BUDGET" = "True" ]; then
+    if [ -n "${RETAIN_TOKEN_RATIO:-}" ]; then
+        OUTPUT_SUFFIX="rtr${RETAIN_TOKEN_RATIO}-$OUTPUT_SUFFIX"
+    elif [ -n "${COLBERT_FINAL_TOKEN_BUDGET:-}" ]; then
+        OUTPUT_SUFFIX="cfb${COLBERT_FINAL_TOKEN_BUDGET}-$OUTPUT_SUFFIX"
+    fi
 fi
-if [ -n "$TITLE_RRF_K" ]; then
-    OUTPUT_SUFFIX="trrfk${TITLE_RRF_K}-$OUTPUT_SUFFIX"
-fi
-if [ -n "${COLBERT_FINAL_TOKEN_BUDGET:-}" ]; then
-    OUTPUT_SUFFIX="cfb${COLBERT_FINAL_TOKEN_BUDGET}-$OUTPUT_SUFFIX"
-fi
-if [ -n "${COLBERT_CHUNK_RERANK_KEEP:-}" ]; then
+if [ "$COMPRESS_METHOD" = "colbert_chunk_rerank" ] && [ -n "${COLBERT_CHUNK_RERANK_KEEP:-}" ]; then
     OUTPUT_SUFFIX="ccrk${COLBERT_CHUNK_RERANK_KEEP}-$OUTPUT_SUFFIX"
 fi
-if [ -n "${RETAIN_TOKEN_RATIO:-}" ]; then
-    OUTPUT_SUFFIX="rtr${RETAIN_TOKEN_RATIO}-$OUTPUT_SUFFIX"
+if { [ "$COMPRESS_METHOD" = "colbert_rerank" ] || [ "$COMPRESS_METHOD" = "rerank_and_region" ]; } && [ -n "${COLBERT_RERANK_KEEP:-}" ]; then
+    OUTPUT_SUFFIX="crk${COLBERT_RERANK_KEEP}-$OUTPUT_SUFFIX"
 fi
 if [ "$MODEL_LOAD_IN_4BIT" = "True" ] || [ "$MODEL_LOAD_IN_4BIT" = "true" ] || [ "$MODEL_LOAD_IN_4BIT" = "1" ]; then
     OUTPUT_SUFFIX="llm4bit-$OUTPUT_SUFFIX"
@@ -93,7 +103,11 @@ if [ -n "$COMPRESS_METHOD" ]; then
     elif [ "$COMPRESS_METHOD" = "exit" ]; then
         METHOD_SUFFIX="${METHOD_SUFFIX}-eth${EXIT_THRESHOLD}"
     fi
-    OUTPUT_PATH_SUFFIX="-${METHOD_SUFFIX}-topk${TOP_K}-gtr${GLOBAL_TOP_R}-$OUTPUT_SUFFIX"
+    OUTPUT_PATH_SUFFIX="-${METHOD_SUFFIX}-topk${TOP_K}"
+    if [ "$USES_GLOBAL_TOP_R" = "True" ]; then
+        OUTPUT_PATH_SUFFIX="${OUTPUT_PATH_SUFFIX}-gtr${GLOBAL_TOP_R}"
+    fi
+    OUTPUT_PATH_SUFFIX="${OUTPUT_PATH_SUFFIX}-$OUTPUT_SUFFIX"
 else
     OUTPUT_PATH_SUFFIX="-topk${TOP_K}-$OUTPUT_SUFFIX"
 fi

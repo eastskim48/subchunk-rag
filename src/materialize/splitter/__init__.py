@@ -3,8 +3,6 @@ from .base import (
     DocumentSplitter,
     FixedSizeSplitter,
     SentenceWiseSplitter,
-    ResolvedSentenceWiseSplitter,
-    PNMappedSentenceWiseSplitter,
     SemanticSplitter,
 )
 from .merger import (

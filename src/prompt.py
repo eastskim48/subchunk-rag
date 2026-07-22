@@ -20,21 +20,6 @@ class PromptProcessor:
     def build_query_prompt(self, query: str) -> str:
         return f"{self.system_prompt}\n\n" f"Question: {query.strip()}\n" "Answer:"
 
-    def render_chat_prompt(self, user_content: str) -> str:
-        messages = [
-            {"role": "system", "content": self.system_prompt},
-            {"role": "user", "content": user_content},
-        ]
-        if getattr(self.tokenizer, "chat_template", None):
-            return self.tokenizer.apply_chat_template(
-                messages,
-                tokenize=False,
-                add_generation_prompt=True,
-            )
-        return (
-            f"System: {self.system_prompt}\n\n" f"User: {user_content}\n\n" "Assistant:"
-        )
-
     def build_qa_prompt(self, query: str, passages: List[str]) -> str:
         return f"{self.format_passages(passages)}{self.build_query_prompt(query)}"
 
