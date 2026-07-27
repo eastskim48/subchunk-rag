@@ -1,4 +1,5 @@
-import json
+"""Document preprocessing pipeline for chunks, KV caches, and vector DB input."""
+
 import os
 import hashlib
 import re
@@ -6,8 +7,8 @@ import torch
 from tqdm import tqdm
 from typing import List
 import time
-from deepspeed.ops.op_builder import AsyncIOBuilder
-from deepspeed.ops.op_builder import GDSBuilder
+# from deepspeed.ops.op_builder import AsyncIOBuilder
+# from deepspeed.ops.op_builder import GDSBuilder
 
 from vectordb import VectorDB
 from model import LLMModel
@@ -16,15 +17,15 @@ from materialize.splitter import (
     FixedSizeSplitter,
     SentenceWiseSplitter,
     SemanticSplitter,
-    build_merger,
+    build_grouper,
 )
-from materialize.subchunk_embeds import CompareEmbeddingWriter
-from embedding_utils import BGE_M3_MODEL
 
 # from utils import file_write
 
 
 class DocumentPreprocessor:
+    """Coordinate splitting, cache materialization, resume checks, and DB writes."""
+
     def __init__(
         self,
         vectordb: VectorDB | None,
@@ -34,18 +35,14 @@ class DocumentPreprocessor:
         cacheable_chunk_size: int | None = 1024,
         retrievable_chunk_size: int | None = None,
         batch_size: int = 1,
+        db_batch_size: int = 256,
         dummy_bos_count: int = 0,
         splitter: str = "fixed_size",
         merger: str | None = None,
         materialize_cache: bool = True,
         materialize_db: bool = True,
-        materialize_compare_embeds: bool = True,
-        compare_embed_dir: str | None = None,
-        compare_embed_model: str = BGE_M3_MODEL,
-        compare_embed_overwrite: bool = False,
         sentence_cache_token_format: str = "legacy",
         resume_from_cache: bool = False,
-        materialize_doc_ids_file: str | None = None,
         deduplicate_documents_by_hash: bool = False,
         max_subchunk_tokens: int | None = None,
     ):
@@ -54,29 +51,25 @@ class DocumentPreprocessor:
         self.cacheable_chunk_size = cacheable_chunk_size
         self.retrievable_chunk_size = retrievable_chunk_size
         self.batch_size = batch_size
+        self.db_batch_size = db_batch_size
         self.dummy_bos_count = dummy_bos_count
         self.splitter_name = splitter
-        self.merger_name = merger
+        self.grouper_name = merger
         self.materialize_cache = materialize_cache
         self.materialize_db = materialize_db
-        self.materialize_compare_embeds = materialize_compare_embeds
-        self.compare_embed_dir = compare_embed_dir
-        self.compare_embed_model = compare_embed_model
-        self.compare_embed_overwrite = compare_embed_overwrite
         self.sentence_cache_token_format = sentence_cache_token_format
         self.resume_from_cache = resume_from_cache
-        self.materialize_doc_ids_file = materialize_doc_ids_file
         self.deduplicate_documents_by_hash = deduplicate_documents_by_hash
         self.max_subchunk_tokens = max_subchunk_tokens
         self._seen_document_hashes: dict[str, str] = {}
         self.duplicate_document_count = 0
         if self.materialize_cache:
             os.makedirs(self.cache_dir, exist_ok=True)
-        if self.materialize_compare_embeds and self.compare_embed_dir:
-            os.makedirs(self.compare_embed_dir, exist_ok=True)
         self.vectordb = vectordb
         if self.materialize_db and self.vectordb is None:
             raise ValueError("vectordb must be set when materialize_db=True")
+        if self.db_batch_size <= 0:
+            raise ValueError("db_batch_size must be positive")
         self.model = model
         self.total_doc_tokens = 0
         self.processed_doc_count = 0
@@ -85,16 +78,6 @@ class DocumentPreprocessor:
         self.max_chunk_tokens = 0
         self.skipped_existing_chunk_count = 0
         self.rebuilt_invalid_chunk_count = 0
-        self.materialize_doc_ids = None
-        if self.materialize_doc_ids_file:
-            with open(self.materialize_doc_ids_file, "r", encoding="utf-8") as f:
-                payload = json.load(f)
-            doc_ids = payload.get("doc_ids")
-            if not isinstance(doc_ids, list):
-                raise ValueError(
-                    "materialize_doc_ids_file must contain a JSON object with a 'doc_ids' list"
-                )
-            self.materialize_doc_ids = set(doc_ids)
         if self.dummy_bos_count > 0 and self.model.tokenizer.bos_token_id is None:
             raise ValueError(
                 "dummy_bos_count requires tokenizer.bos_token_id to be set"
@@ -106,9 +89,9 @@ class DocumentPreprocessor:
             "semantic",
         }:
             raise ValueError(f"unsupported splitter: {self.splitter_name}")
-        if self.merger_name is not None and self.splitter_name != "semantic":
+        if self.grouper_name is not None and self.splitter_name != "semantic":
             raise ValueError("merger can only be set when splitter=semantic")
-        if self.splitter_name == "semantic" and self.merger_name is None:
+        if self.splitter_name == "semantic" and self.grouper_name is None:
             raise ValueError("splitter=semantic requires merger to be set")
         if self.sentence_cache_token_format not in {
             "legacy",
@@ -200,7 +183,9 @@ class DocumentPreprocessor:
                 cacheable_chunk_size=self.cacheable_chunk_size,
                 retrievable_chunk_size=self.retrievable_chunk_size,
                 content_chunk_size=self.content_chunk_size,
-                merger=build_merger(self.merger_name, tokenizer=self.model.tokenizer),
+                grouper=build_grouper(
+                    self.grouper_name, tokenizer=self.model.tokenizer
+                ),
             )
         else:
             self.splitter = FixedSizeSplitter(
@@ -210,23 +195,6 @@ class DocumentPreprocessor:
                 retrievable_chunk_size=self.retrievable_chunk_size,
                 content_chunk_size=self.content_chunk_size,
             )
-        self.compare_embed_writer = None
-        if self.materialize_compare_embeds:
-            if not self.compare_embed_dir:
-                raise ValueError(
-                    "compare_embed_dir must be set when materialize_compare_embeds=True"
-                )
-            self.compare_embed_writer = CompareEmbeddingWriter(
-                output_dir=self.compare_embed_dir,
-                embedding_model=self.compare_embed_model,
-                embedding_batch_size=self.batch_size,
-                cache_unit=(
-                    "sentence"
-                    if self.splitter_name in {"sentence", "semantic"}
-                    else "token"
-                ),
-                overwrite=self.compare_embed_overwrite,
-            )
 
     def process_documents(self):
         start_time = time.time()
@@ -234,7 +202,8 @@ class DocumentPreprocessor:
         if self.deduplicate_documents_by_hash:
             files = sorted(files, key=self._document_sort_key)
         print(f"Processing {len(files)} documents...")
-        pending_chunks = []
+        pending_cache_chunks = []
+        pending_db_chunks = []
 
         for filename in tqdm(files):
             if self._should_skip_duplicate_document(filename):
@@ -244,29 +213,27 @@ class DocumentPreprocessor:
                 continue
             if self.materialize_db:
                 assert self.vectordb is not None
-                self.vectordb.store(retrievable_chunks)
-            should_materialize_doc = (
-                self.materialize_doc_ids is None or filename in self.materialize_doc_ids
-            )
-            if not should_materialize_doc:
-                continue
-            if self.compare_embed_writer is not None:
-                self.compare_embed_writer.write_document(filename, cacheable_chunks)
+                pending_db_chunks.extend(retrievable_chunks)
+                while len(pending_db_chunks) >= self.db_batch_size:
+                    current_batch = pending_db_chunks[: self.db_batch_size]
+                    self.vectordb.store(current_batch)
+                    pending_db_chunks = pending_db_chunks[self.db_batch_size :]
             if self.materialize_cache:
                 if self.resume_from_cache:
                     cacheable_chunks = self._filter_chunks_for_resume(cacheable_chunks)
                     if not cacheable_chunks:
                         continue
-                pending_chunks.extend(cacheable_chunks)
-                while len(pending_chunks) >= self.batch_size:
-                    current_batch = pending_chunks[: self.batch_size]
+                pending_cache_chunks.extend(cacheable_chunks)
+                while len(pending_cache_chunks) >= self.batch_size:
+                    current_batch = pending_cache_chunks[: self.batch_size]
                     self.save_kv_cache(current_batch)
-                    pending_chunks = pending_chunks[self.batch_size :]
+                    pending_cache_chunks = pending_cache_chunks[self.batch_size :]
 
-        if self.materialize_cache and pending_chunks:
-            self.save_kv_cache(pending_chunks)
-        if self.compare_embed_writer is not None:
-            self.compare_embed_writer.finalize()
+        if self.materialize_db and pending_db_chunks:
+            assert self.vectordb is not None
+            self.vectordb.store(pending_db_chunks)
+        if self.materialize_cache and pending_cache_chunks:
+            self.save_kv_cache(pending_cache_chunks)
 
         end_time = time.time()
         elapsed_time = end_time - start_time
@@ -370,6 +337,11 @@ class DocumentPreprocessor:
                         0, int(chunk.chunk_end or 0) - int(chunk.chunk_start or 0)
                     ),
                     cache_unit="token",
+                    metadata={
+                        "parent_doc_id": chunk.parent_doc_id,
+                        "source_token_start": chunk.chunk_start,
+                        "source_token_end": chunk.chunk_end,
+                    },
                 )
                 for chunk in result.chunks
             ]

@@ -1,4 +1,8 @@
+"""Dataset-aware exact-match and token-F1 evaluation utilities."""
+
 import json
+import itertools
+import math
 import re
 import string
 from abc import ABC, abstractmethod
@@ -24,6 +28,7 @@ SUPPORTED_DATASETS = {
     "hotpotqa": "longbench-hotpotqa",
     "longbench-triviaqa": "longbench-triviaqa",
     "triviaqa": "longbench-triviaqa",
+    "triviaqa-unfiltered-wikipedia": "longbench-triviaqa",
     "longbench-2wiki": "longbench-2wiki",
     "2wiki": "longbench-2wiki",
     "longbench-musique": "longbench-musique",
@@ -32,6 +37,10 @@ SUPPORTED_DATASETS = {
     "qasper": "longbench-qasper",
     "longbench-narrativeqa": "longbench-narrativeqa",
     "narrativeqa": "longbench-narrativeqa",
+    "conditionalqa": "conditionalqa",
+    "dapr-nq-open": "dapr-nq-open",
+    "nq-open": "dapr-nq-open",
+    "newsqa": "newsqa",
 }
 
 
@@ -183,7 +192,7 @@ def load_json_records(path: str):
         return data
 
     records = []
-    for line_no, line in enumerate(raw.splitlines(), start=1):
+    for line_no, line in enumerate(raw.split("\n"), start=1):
         line = line.strip()
         if not line:
             continue
@@ -205,6 +214,8 @@ def load_predictions(prediction_file: str, use_clean_prediction: bool) -> list[s
 
 
 class BaseEvaluator(ABC):
+    """Common record-level evaluation loop for dataset-specific scorers."""
+
     name = "base"
 
     @abstractmethod
@@ -361,6 +372,227 @@ class NarrativeQAEvaluator(LongBenchQAEvaluator):
     name = "narrativeqa_longbench_qa"
 
 
+def conditionalqa_answer_only_scores(
+    predicted_answers: list[str],
+    reference_answers: list[str],
+) -> tuple[float, float]:
+    """Official ConditionalQA permutation scoring without condition labels.
+
+    Ported from ``compute_metrics`` and ``compute_em_f1`` in the official
+    ConditionalQA evaluator at commit 77bd295952daf415548b3244db10880d3d55cfe0:
+    https://github.com/haitian-sun/ConditionalQA/blob/master/evaluate.py
+    """
+    if not reference_answers:
+        score = float(not predicted_answers)
+        return score, score
+
+    num_answers = len(reference_answers)
+    padded_predictions = [(answer, []) for answer in predicted_answers]
+    if len(padded_predictions) < num_answers:
+        padded_predictions.extend([("", [])] * (num_answers - len(padded_predictions)))
+
+    max_em = 0.0
+    max_f1 = 0.0
+    for ordered_predictions in itertools.permutations(padded_predictions):
+        total_em = 0.0
+        total_f1 = 0.0
+        for (predicted_text, _), reference_text in zip(
+            ordered_predictions, reference_answers
+        ):
+            normalized_prediction = legacy_normalize_answer(predicted_text)
+            normalized_reference = legacy_normalize_answer(reference_text)
+            total_em += float(normalized_prediction == normalized_reference)
+            total_f1 += token_f1(normalized_prediction, normalized_reference)
+
+        max_em = max(max_em, total_em / num_answers)
+        max_f1 = max(max_f1, total_f1 / num_answers)
+
+    gamma = math.exp(1.0 - len(padded_predictions) / num_answers)
+    return max_em * gamma, max_f1 * gamma
+
+
+class ConditionalQAAnswerOnlyEvaluator(BaseEvaluator):
+    """Official ConditionalQA answer EM/F1 with condition scoring omitted."""
+
+    name = "conditionalqa_official_answer_only"
+
+    @staticmethod
+    def _reference_answers(ground_truth_record: dict) -> list[str]:
+        answers = ground_truth_record.get("answers")
+        if not isinstance(answers, list):
+            raise ValueError("ConditionalQA ground truth must contain an answers list")
+        if not all(isinstance(answer, str) for answer in answers):
+            raise ValueError("ConditionalQA answer entries must be strings")
+        return answers
+
+    def example_ground_truth(self, ground_truth_record: dict) -> str:
+        return json.dumps(
+            self._reference_answers(ground_truth_record), ensure_ascii=False
+        )
+
+    def score_prediction(
+        self, prediction: str, ground_truth_record: dict
+    ) -> tuple[float, float]:
+        predicted_answers = [prediction] if prediction else []
+        return conditionalqa_answer_only_scores(
+            predicted_answers,
+            self._reference_answers(ground_truth_record),
+        )
+
+
+class NQOpenOfficialEvaluator(BaseEvaluator):
+    """Official NQ-open exact match with auxiliary token F1.
+
+    Exact-match normalization and max-over-answers scoring are ported from the
+    official FiD/DPR evaluator at commit
+    fe769f30e3714e22476910ee39ea0054dd7921de:
+    https://github.com/facebookresearch/FiD/blob/fe769f30e3714e22476910ee39ea0054dd7921de/src/evaluation.py
+
+    The upstream evaluator reports exact match only. Token F1 is retained here
+    as an explicitly auxiliary diagnostic and is not an official NQ-open score.
+    """
+
+    name = "nq_open_official_em_aux_token_f1"
+
+    @staticmethod
+    def normalize_answer(text: str) -> str:
+        def remove_articles(value: str) -> str:
+            return re.sub(r"\b(a|an|the)\b", " ", value)
+
+        def white_space_fix(value: str) -> str:
+            return " ".join(value.split())
+
+        def remove_punc(value: str) -> str:
+            exclude = set(string.punctuation)
+            return "".join(ch for ch in value if ch not in exclude)
+
+        return white_space_fix(remove_articles(remove_punc(text.lower())))
+
+    @staticmethod
+    def _reference_answers(ground_truth_record: dict) -> list[str]:
+        answers = ground_truth_record.get("answers")
+        if not isinstance(answers, list) or not answers:
+            raise ValueError(
+                "NQ-open ground truth must contain a non-empty answers list"
+            )
+        if not all(isinstance(answer, str) for answer in answers):
+            raise ValueError("NQ-open answer entries must be strings")
+        return answers
+
+    def _exact_match(self, prediction: str, ground_truth: str) -> float:
+        return float(
+            self.normalize_answer(prediction) == self.normalize_answer(ground_truth)
+        )
+
+    def _auxiliary_token_f1(self, prediction: str, ground_truth: str) -> float:
+        prediction_tokens = self.normalize_answer(prediction).split()
+        ground_truth_tokens = self.normalize_answer(ground_truth).split()
+
+        if not prediction_tokens and not ground_truth_tokens:
+            return 1.0
+        if not prediction_tokens or not ground_truth_tokens:
+            return 0.0
+
+        common = Counter(prediction_tokens) & Counter(ground_truth_tokens)
+        num_same = sum(common.values())
+        if num_same == 0:
+            return 0.0
+
+        precision = num_same / len(prediction_tokens)
+        recall = num_same / len(ground_truth_tokens)
+        return 2 * precision * recall / (precision + recall)
+
+    def example_ground_truth(self, ground_truth_record: dict) -> str:
+        return json.dumps(
+            self._reference_answers(ground_truth_record), ensure_ascii=False
+        )
+
+    def score_prediction(
+        self, prediction: str, ground_truth_record: dict
+    ) -> tuple[float, float]:
+        ground_truths = self._reference_answers(ground_truth_record)
+        exact_match_score = max(
+            self._exact_match(prediction, ground_truth)
+            for ground_truth in ground_truths
+        )
+        auxiliary_token_f1 = max(
+            self._auxiliary_token_f1(prediction, ground_truth)
+            for ground_truth in ground_truths
+        )
+        return exact_match_score, auxiliary_token_f1
+
+
+class NewsQAOfficialEvaluator(BaseEvaluator):
+    """NewsQA EM/F1 using the official SQuAD v1.1 scoring rules.
+
+    The NewsQA paper specifies the official SQuAD evaluator:
+    https://aclanthology.org/W17-2623/
+
+    This implementation ports:
+    https://github.com/allenai/bi-att-flow/blob/master/squad/evaluate-v1.1.py
+    """
+
+    name = "newsqa_official_squad_v1_1"
+
+    @staticmethod
+    def normalize_answer(text: str) -> str:
+        def remove_articles(value: str) -> str:
+            return re.sub(r"\b(a|an|the)\b", " ", value)
+
+        def white_space_fix(value: str) -> str:
+            return " ".join(value.split())
+
+        def remove_punc(value: str) -> str:
+            exclude = set(string.punctuation)
+            return "".join(ch for ch in value if ch not in exclude)
+
+        return white_space_fix(remove_articles(remove_punc(text.lower())))
+
+    @staticmethod
+    def _reference_answers(ground_truth_record: dict) -> list[str]:
+        answers = ground_truth_record.get("answers")
+        if not isinstance(answers, list) or not answers:
+            raise ValueError(
+                "NewsQA ground truth must contain a non-empty answers list"
+            )
+        if not all(isinstance(answer, str) for answer in answers):
+            raise ValueError("NewsQA answer entries must be strings")
+        return answers
+
+    def _exact_match(self, prediction: str, ground_truth: str) -> float:
+        return float(
+            self.normalize_answer(prediction) == self.normalize_answer(ground_truth)
+        )
+
+    def _f1_score(self, prediction: str, ground_truth: str) -> float:
+        prediction_tokens = self.normalize_answer(prediction).split()
+        ground_truth_tokens = self.normalize_answer(ground_truth).split()
+        common = Counter(prediction_tokens) & Counter(ground_truth_tokens)
+        num_same = sum(common.values())
+        if num_same == 0:
+            return 0.0
+
+        precision = num_same / len(prediction_tokens)
+        recall = num_same / len(ground_truth_tokens)
+        return 2 * precision * recall / (precision + recall)
+
+    def example_ground_truth(self, ground_truth_record: dict) -> str:
+        return self._reference_answers(ground_truth_record)[0]
+
+    def score_prediction(
+        self, prediction: str, ground_truth_record: dict
+    ) -> tuple[float, float]:
+        ground_truths = self._reference_answers(ground_truth_record)
+        exact_match_score = max(
+            self._exact_match(prediction, ground_truth)
+            for ground_truth in ground_truths
+        )
+        f1_score = max(
+            self._f1_score(prediction, ground_truth) for ground_truth in ground_truths
+        )
+        return exact_match_score, f1_score
+
+
 class TriviaQAOfficialEvaluator(BaseEvaluator):
     name = "triviaqa_official"
 
@@ -471,6 +703,12 @@ def build_evaluator(dataset: Optional[str]) -> BaseEvaluator:
         return QasperEvaluator()
     if normalized_dataset == "longbench-narrativeqa":
         return NarrativeQAEvaluator()
+    if normalized_dataset == "conditionalqa":
+        return ConditionalQAAnswerOnlyEvaluator()
+    if normalized_dataset == "dapr-nq-open":
+        return NQOpenOfficialEvaluator()
+    if normalized_dataset == "newsqa":
+        return NewsQAOfficialEvaluator()
     raise ValueError(f"no evaluator configured for dataset '{dataset}'")
 
 

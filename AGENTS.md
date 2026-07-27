@@ -22,6 +22,31 @@ specific old decision/result is needed.
 
 ## Scope rules
 - Work mainly in `src/` and `test/`.
+- Follow the user's requested change literally and limit edits to that exact scope.
+- Do not extend a requested change into adjacent cleanup, dead-code removal, refactoring, renaming, or behavior changes
+  without explicit user approval.
+- If a potentially better or cleaner approach exceeds the requested scope, explain it as a proposal and wait for
+  approval before implementing it.
+- Preserve code that the user asked to comment out; do not delete it unless the user explicitly asks for deletion.
+
+## Communication rules
+- On first use, expand every acronym and abbreviation and explain every unfamiliar technical or project-specific term
+  in plain language.
+- Do not assume that a term is familiar merely because it is common in systems or machine-learning research.
+- After defining a term once in the current conversation, the abbreviated form may be used.
+- Clearly distinguish verified facts, measured results, code-derived conclusions, and estimates.
+- Do not present an inference or assumption as a verified fact.
+- When the user asks to research or look up information, report verified facts without subjective judgment,
+  recommendation, or preference unless the user explicitly requests interpretation or a recommendation. If the
+  available evidence is insufficient, state that the point is unknown or unverified.
+- Explicitly label every custom dataset subset, corpus construction, preprocessing rule, or evaluation protocol as
+  custom when first mentioning it. Never present a custom configuration as an official dataset or benchmark setting.
+- Use engineering and logical language for technical explanations. State the concrete component, field, function,
+  input, transformation, invariant, and observed output involved in a claim.
+- Avoid anthropomorphic or metaphorical descriptions of code and data, such as saying that metadata "claims,"
+  "thinks," "wants," or "knows" something. Describe the exact stored value and the operation that consumes it.
+- Explain causal chains explicitly: identify the incorrect representation or operation, the affected downstream
+  component, and the resulting observable behavior.
 
 ## Coding rules
 - Make the smallest change that solves the task.

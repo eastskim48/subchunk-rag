@@ -1,10 +1,10 @@
-run_name: 2wiki-0708-default-region3
+run_name: 2wiki-0722
 dataset: longbench-2wiki
 
 dataset_prefix: /mnt/nvme1/datasets
 
 eval_script: run/eval.sh
-results_root: outputs/grid_search_lim
+results_root: outputs/grid_07
 
 fixed_env:
   EVAL_BSZ: "1"
@@ -30,7 +30,7 @@ eval_axes:
     - "10"
     - "20"
   RETAIN_TOKEN_RATIO:
-    - "0.125"
+    - "0.15"
     - "0.25"
     - "0.5"
     - "0.75"

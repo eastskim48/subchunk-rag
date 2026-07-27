@@ -1,3 +1,5 @@
+"""Build and verify reproducibility metadata for a retrieval database."""
+
 import json
 import hashlib
 import os
@@ -28,6 +30,9 @@ def build_db_manifest(
     sentence_cache_token_format: str,
     deduplicate_documents_by_hash: bool,
     embedding_backend: str,
+    db_batch_size: int,
+    embedding_device: str,
+    embedding_batch_size: int,
 ) -> dict[str, Any]:
     return {
         "format": DB_BUILD_MANIFEST_FORMAT,
@@ -42,6 +47,9 @@ def build_db_manifest(
         "sentence_cache_token_format": sentence_cache_token_format,
         "deduplicate_documents_by_hash": deduplicate_documents_by_hash,
         "embedding_backend": normalize_embedding_backend(embedding_backend),
+        "db_batch_size": db_batch_size,
+        "embedding_device": embedding_device,
+        "embedding_batch_size": embedding_batch_size,
     }
 
 
@@ -83,47 +91,5 @@ def read_db_build_manifest(db_dir: str | Path) -> dict[str, Any] | None:
         raise ValueError(
             f"unsupported DB build manifest version in {manifest_path}: "
             f"{manifest.get('format_version')!r}"
-        )
-    return manifest
-
-
-def build_db_manifest_reference(
-    *, db_dir: str | Path, artifact_dir: str | Path
-) -> tuple[dict[str, Any], dict[str, Any]]:
-    db_path = Path(db_dir)
-    manifest = read_db_build_manifest(db_path)
-    if manifest is None:
-        raise FileNotFoundError(
-            f"missing DB build manifest: {db_path / DB_BUILD_MANIFEST_FILENAME}"
-        )
-    manifest_path = db_path / DB_BUILD_MANIFEST_FILENAME
-    reference = {
-        "path": os.path.relpath(manifest_path, start=Path(artifact_dir)),
-        "sha256": db_build_manifest_sha256(db_path),
-    }
-    return manifest, reference
-
-
-def read_referenced_db_manifest(
-    *, artifact_dir: str | Path, reference: dict[str, Any]
-) -> dict[str, Any]:
-    relative_path = reference.get("path")
-    expected_sha256 = reference.get("sha256")
-    if not isinstance(relative_path, str) or not relative_path:
-        raise ValueError("ColBERT artifact DB manifest reference requires a path")
-    if not isinstance(expected_sha256, str) or len(expected_sha256) != 64:
-        raise ValueError("ColBERT artifact DB manifest reference requires a SHA-256")
-    manifest_path = Path(artifact_dir) / relative_path
-    manifest = read_db_build_manifest(manifest_path.parent)
-    if manifest is None:
-        raise FileNotFoundError(
-            f"missing referenced DB build manifest: {manifest_path}"
-        )
-    actual_sha256 = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
-    if actual_sha256 != expected_sha256:
-        raise ValueError(
-            "referenced DB build manifest SHA-256 mismatch: "
-            f"expected={expected_sha256}, actual={actual_sha256}, "
-            f"path={manifest_path}"
         )
     return manifest

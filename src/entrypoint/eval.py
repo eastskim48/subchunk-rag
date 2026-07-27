@@ -1,3 +1,5 @@
+"""CLI entrypoint for retrieval, compression, and answer evaluation."""
+
 import fire
 import time
 import sys
@@ -9,6 +11,7 @@ if str(_SRC_DIR) not in sys.path:
 
 from transformers import logging
 from engine import QueryProcessor
+from gold_evidence_vectordb import GoldEvidenceVectorDB
 from vectordb import ChromaDB
 from model import LLMModel
 from acc_metric import evaluate
@@ -45,6 +48,8 @@ def main(
     disable_rope: bool = False,
     use_front_bos_cache: bool = False,
     model_load_in_4bit: bool = False,
+    gold_evidence_file: Optional[str] = None,
+    prompt_format: str = "raw_chunk_first",
 ):
     use_past_cache = _coerce_bool(use_past_cache)
     use_cleaner = _coerce_bool(use_cleaner)
@@ -56,18 +61,29 @@ def main(
             f"compress_method='{compress_method}' now emits compressed text directly and is cache-off only; "
             "set use_past_cache=False."
         )
+    if use_past_cache and prompt_format != "raw_chunk_first":
+        raise ValueError(
+            "Non-default prompt formats are cache-off only until matching KV "
+            "artifacts and cache assembly are implemented"
+        )
 
     total_start = time.perf_counter()
     logging.set_verbosity_error()
     init_start = time.perf_counter()
+    vectordb = (
+        GoldEvidenceVectorDB(gold_evidence_file)
+        if gold_evidence_file
+        else ChromaDB(db_dir=db_dir)
+    )
     processor = QueryProcessor(
         query_file=query_file,
-        vectordb=ChromaDB(db_dir=db_dir),
+        vectordb=vectordb,
         model=LLMModel(
             model_name=model_name,
             disable_rope=disable_rope,
             use_front_bos_cache=use_front_bos_cache,
             load_in_4bit=model_load_in_4bit,
+            prompt_format=prompt_format,
         ),
         cache_dir=cache_dir,
         top_k=top_k,

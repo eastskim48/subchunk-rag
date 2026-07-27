@@ -1,3 +1,5 @@
+"""Small JSON and legacy asynchronous cache-I/O helpers."""
+
 import json
 
 

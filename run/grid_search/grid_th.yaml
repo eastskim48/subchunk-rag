@@ -1,10 +1,10 @@
-run_name: hotpotqa-0708-default-region-th2
+run_name: hotpotqa-0723-th
 dataset: longbench-hotpotqa
 
 dataset_prefix: /mnt/nvme1/datasets
 
 eval_script: run/eval.sh
-results_root: outputs/grid_search_lim
+results_root: outputs/grid_07
 
 fixed_env:
   EVAL_BSZ: "auto"
@@ -15,23 +15,12 @@ fixed_env:
 
 auto_eval_bsz:
   enabled: true
-  candidates:
-    - 8
-    - 12
-    - 16
-    - 20
-    - 24
-    - 28
-    - 32
-    - 36
-    - 40
-    - 44
-    - 48
-    - 52
-    - 56
-    - 60
-    - 64
-  probe_total_num: 8
+  search: binary
+  min: 4
+  max: 192
+  step: 4
+  probe_batches: 3
+  probe_total_num_max: 192
 
 eval_fixed_env:
   USE_CLEANER: "False"
@@ -41,7 +30,7 @@ preprocess_groups:
 
 eval_axes:
   DATA_SUBDIR:
-    - sent-default-512
+    - sent-default-512-splitlong180
   EVAL_USE_PAST_CACHE:
     - "False"
   COMPRESS_METHOD:
@@ -50,7 +39,7 @@ eval_axes:
     - "10"
     - "20"
   RETAIN_TOKEN_RATIO:
-    - "0.125"
+    - "0.15"
     - "0.25"
     - "0.5"
     - "0.75"

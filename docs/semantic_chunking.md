@@ -95,8 +95,8 @@ chunk is a search container; the sentence cacheable is the evidence unit.
   window.
 - Chroma `metadata`:
   - `parent_doc_id`
-  - `window_token_start`
-  - `window_token_end`
+  - `source_token_start`
+  - `source_token_end`
   - `chunk_size`
   - `token_count`
   - `cache_unit`
@@ -115,32 +115,37 @@ fields contain those candidate sentence units.
 
 ## Semantic Splitter Path
 
-`splitter=semantic` reuses the same sentence views, then groups sentence indices
-with a `SubchunkMerger`.
+`splitter=semantic` reuses the same parsed sentence units, then groups their
+indices with a `UnitGrouper`.
 
 The current semantic grouping framework is:
 
-1. Build sentence views with the sentence splitter.
-2. Pass sentence texts to a merger.
-3. The merger returns groups of sentence indices.
+1. Parse the document into `ParsedUnit` sentence units.
+2. Pass parsed units to a grouper.
+3. The grouper returns groups of unit indices.
 4. Each group is joined into one semantic subchunk.
 5. The semantic subchunk span runs from the first grouped sentence token to the
    last grouped sentence token.
 
-Current merger implementations include:
+Current grouper implementations include:
 
+- `identity`: keeps each parsed unit separate; this is used by
+  `SentenceWiseSplitter`.
 - `pronoun_dp_128`: dynamic programming merge that rewards keeping
   pronoun-starting sentences with nearby context, under a token budget.
 - `coref_pronoun_dp_128`: similar goal, but uses `fastcoref` to check whether a
   leading pronoun has an antecedent inside the candidate span.
-- `embed_sim_128`: embedding-similarity based grouping under a token budget.
 
-Important status note: `SubchunkMerger` and the semantic merger variants are
+`SentenceWiseSplitter` and `SemanticSplitter` are compatibility wrappers over
+the same `ParsedUnitSplitter` orchestration. Their existing long-unit handling
+and cacheable ID formats remain different and unchanged.
+
+Important status note: `UnitGrouper` and the semantic grouper variants are
 currently outdated relative to the main project direction. They remain in the
 codebase as experimental/prototype paths, but current documentation and paper
 framing should focus on sentence evidence units, retrieval-bounded candidate
 selection, and contextualized sentence/subchunk representations. Do not treat
-the merger variants as the active method unless they are explicitly refreshed
+the grouper variants as the active method unless they are explicitly refreshed
 and re-evaluated under the current evaluation protocol.
 
 ## Full-Dataset Sentence Length Distribution

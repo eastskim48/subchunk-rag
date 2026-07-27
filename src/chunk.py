@@ -1,3 +1,5 @@
+"""Core data objects shared by retrieval, materialization, and compression."""
+
 from __future__ import annotations
 
 from copy import deepcopy
@@ -5,6 +7,8 @@ from typing import Any, Dict, List, Optional
 
 
 class Chunk:
+    """Minimal text unit with a stable identifier and metadata."""
+
     def __init__(self, id: str, text: str, metadata: Optional[Dict[str, Any]] = None):
         self.id = id
         self.text = text
@@ -19,6 +23,8 @@ class Chunk:
 
 
 class CacheableChunk(Chunk):
+    """Fine-grained unit that can carry source spans and a materialized cache."""
+
     def __init__(
         self,
         id: str,
@@ -88,6 +94,8 @@ class CacheableChunk(Chunk):
 
 
 class RetrievableChunk(Chunk):
+    """Coarse retrieval unit containing candidate cacheable subchunks."""
+
     def __init__(
         self,
         id: str,

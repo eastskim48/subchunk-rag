@@ -13,24 +13,18 @@ elif [ -d "/mnt/nvme1/datasets/$DATASET" ]; then
 else
     export DATASET_PATH="$DATASET"
 fi
-export PROVENCE_MODEL_NAME="${PROVENCE_MODEL_NAME:-naver/provence-reranker-debertav3-v1}"
-export PROVENCE_THRESHOLD="${PROVENCE_THRESHOLD:-0.05}"
 
 export DEFAULT_MODEL_NAME="meta-llama/Llama-3.1-8B-Instruct"
 export MODEL_NAME="${MODEL_NAME:-$DEFAULT_MODEL_NAME}"
-export EXIT_MODEL_NAME="${EXIT_MODEL_NAME:-doubleyyh/exit-gemma-2b}"
-export EXIT_BASE_MODEL_NAME="${EXIT_BASE_MODEL_NAME:-google/gemma-2b-it}"
-export EXIT_THRESHOLD="${EXIT_THRESHOLD:-0.1}"
 export DATA_SUBDIR="${DATA_SUBDIR:-sent}"
 export CACHE_SUBDIR="${CACHE_SUBDIR:-cache}"
 export DB_DIR="${DB_DIR:-$DATASET_PATH/$DATA_SUBDIR/db}"
 export CACHE_DIR="${CACHE_DIR:-$DATASET_PATH/$DATA_SUBDIR/$CACHE_SUBDIR}"
 export CHROMA_EMBED_DEVICE="${CHROMA_EMBED_DEVICE:-cpu}"
-export COMPARE_EMBED_DEVICE="${COMPARE_EMBED_DEVICE:-cpu}"
-export COMPARE_EMBED_DIR="${COMPARE_EMBED_DIR:-$DATASET_PATH/$DATA_SUBDIR/compare_embed}"
 export COLBERT_WINDOW_DIR="${COLBERT_WINDOW_DIR:-$DATASET_PATH/$DATA_SUBDIR/colbert_window}"
 export COLBERT_MODEL_NAME="${COLBERT_MODEL_NAME:-colbert-ir/colbertv2.0}"
 export COLBERT_BATCH_SIZE="${COLBERT_BATCH_SIZE:-32}"
+export COLBERT_REGION_GROUP_ORDER="${COLBERT_REGION_GROUP_ORDER:-retrieval}"
 export COLBERT_REPO_PATH="${COLBERT_REPO_PATH:-$REPO_ROOT/third_party/ColBERT}"
 export EVAL_USE_PAST_CACHE="${EVAL_USE_PAST_CACHE:-False}"
 export DISABLE_ROPE="${DISABLE_ROPE:-False}"
@@ -39,41 +33,44 @@ export MODEL_LOAD_IN_4BIT="${MODEL_LOAD_IN_4BIT:-False}"
 export MEASURE_PROMPT_STATS="${MEASURE_PROMPT_STATS:-True}"
 export RETRIEVAL_INCLUDE_DOCUMENTS="${RETRIEVAL_INCLUDE_DOCUMENTS:-True}"
 export USE_CLEANER="${USE_CLEANER:-False}"
+export PROMPT_FORMAT="${PROMPT_FORMAT:-raw_chunk_first}"
 export EVAL_BSZ="${EVAL_BSZ:-4}"
 export TOP_K="${TOP_K:-20}"
 export TOTAL_NUM="${TOTAL_NUM:-200}"
 export MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-20}"
-export COMPRESS_METHOD="${COMPRESS_METHOD-dense}"
-export GLOBAL_TOP_R="${GLOBAL_TOP_R:-0.1}"
+export COMPRESS_METHOD="${COMPRESS_METHOD-colbert_sliding_region}"
 export TORCHRUN_MASTER_PORT="${TORCHRUN_MASTER_PORT:-29500}"
 
 USES_TOKEN_BUDGET=False
-USES_GLOBAL_TOP_R=False
 case "$COMPRESS_METHOD" in
-    dense)
-        USES_GLOBAL_TOP_R=True
-        ;;
-    colbert_window_budget)
+    dense|colbert_subchunk|colbert_sliding_region|rerank_and_region)
         USES_TOKEN_BUDGET=True
-        ;;
-    colbert_subchunk|colbert_sliding_region|rerank_and_region)
-        USES_TOKEN_BUDGET=True
-        if [ -z "${RETAIN_TOKEN_RATIO:-}" ] && [ -z "${COLBERT_FINAL_TOKEN_BUDGET:-}" ]; then
-            USES_GLOBAL_TOP_R=True
-        fi
         ;;
 esac
+
+if [ "$USES_TOKEN_BUDGET" = "True" ]; then
+    if { [ -n "${RETAIN_TOKEN_RATIO:-}" ] && [ -n "${FINAL_TOKEN_BUDGET:-}" ]; } || \
+       { [ -z "${RETAIN_TOKEN_RATIO:-}" ] && [ -z "${FINAL_TOKEN_BUDGET:-}" ]; }; then
+        echo "exactly one of RETAIN_TOKEN_RATIO or FINAL_TOKEN_BUDGET must be set for $COMPRESS_METHOD" >&2
+        exit 1
+    fi
+fi
 
 if [ "$EVAL_USE_PAST_CACHE" = "True" ]; then
     OUTPUT_SUFFIX="cacheon"
 else
     OUTPUT_SUFFIX="cacheoff"
 fi
+if [ "$PROMPT_FORMAT" != "raw_chunk_first" ]; then
+    PROMPT_FORMAT_TAG="${PROMPT_FORMAT//\//_}"
+    PROMPT_FORMAT_TAG="${PROMPT_FORMAT_TAG// /_}"
+    OUTPUT_SUFFIX="pf${PROMPT_FORMAT_TAG}-$OUTPUT_SUFFIX"
+fi
 if [ "$USES_TOKEN_BUDGET" = "True" ]; then
     if [ -n "${RETAIN_TOKEN_RATIO:-}" ]; then
         OUTPUT_SUFFIX="rtr${RETAIN_TOKEN_RATIO}-$OUTPUT_SUFFIX"
-    elif [ -n "${COLBERT_FINAL_TOKEN_BUDGET:-}" ]; then
-        OUTPUT_SUFFIX="cfb${COLBERT_FINAL_TOKEN_BUDGET}-$OUTPUT_SUFFIX"
+    elif [ -n "${FINAL_TOKEN_BUDGET:-}" ]; then
+        OUTPUT_SUFFIX="ftb${FINAL_TOKEN_BUDGET}-$OUTPUT_SUFFIX"
     fi
 fi
 if [ "$COMPRESS_METHOD" = "colbert_chunk_rerank" ] && [ -n "${COLBERT_CHUNK_RERANK_KEEP:-}" ]; then
@@ -81,6 +78,9 @@ if [ "$COMPRESS_METHOD" = "colbert_chunk_rerank" ] && [ -n "${COLBERT_CHUNK_RERA
 fi
 if { [ "$COMPRESS_METHOD" = "colbert_rerank" ] || [ "$COMPRESS_METHOD" = "rerank_and_region" ]; } && [ -n "${COLBERT_RERANK_KEEP:-}" ]; then
     OUTPUT_SUFFIX="crk${COLBERT_RERANK_KEEP}-$OUTPUT_SUFFIX"
+fi
+if { [ "$COMPRESS_METHOD" = "colbert_sliding_region" ] || [ "$COMPRESS_METHOD" = "rerank_and_region" ]; } && [ "$COLBERT_REGION_GROUP_ORDER" != "retrieval" ]; then
+    OUTPUT_SUFFIX="rgo${COLBERT_REGION_GROUP_ORDER}-$OUTPUT_SUFFIX"
 fi
 if [ "$MODEL_LOAD_IN_4BIT" = "True" ] || [ "$MODEL_LOAD_IN_4BIT" = "true" ] || [ "$MODEL_LOAD_IN_4BIT" = "1" ]; then
     OUTPUT_SUFFIX="llm4bit-$OUTPUT_SUFFIX"
@@ -98,15 +98,7 @@ COMPRESS_ARGS=()
 if [ -n "$COMPRESS_METHOD" ]; then
     COMPRESS_ARGS=(--compress_method "$COMPRESS_METHOD")
     METHOD_SUFFIX="$(echo "$COMPRESS_METHOD" | tr '/' '_')"
-    if [ "$COMPRESS_METHOD" = "provence" ]; then
-        METHOD_SUFFIX="${METHOD_SUFFIX}-pth${PROVENCE_THRESHOLD}"
-    elif [ "$COMPRESS_METHOD" = "exit" ]; then
-        METHOD_SUFFIX="${METHOD_SUFFIX}-eth${EXIT_THRESHOLD}"
-    fi
     OUTPUT_PATH_SUFFIX="-${METHOD_SUFFIX}-topk${TOP_K}"
-    if [ "$USES_GLOBAL_TOP_R" = "True" ]; then
-        OUTPUT_PATH_SUFFIX="${OUTPUT_PATH_SUFFIX}-gtr${GLOBAL_TOP_R}"
-    fi
     OUTPUT_PATH_SUFFIX="${OUTPUT_PATH_SUFFIX}-$OUTPUT_SUFFIX"
 else
     OUTPUT_PATH_SUFFIX="-topk${TOP_K}-$OUTPUT_SUFFIX"
@@ -124,6 +116,7 @@ torchrun --nproc_per_node 1 --master_port "$TORCHRUN_MASTER_PORT" src/entrypoint
     --disable_rope "$DISABLE_ROPE" \
     --use_front_bos_cache "$USE_FRONT_BOS_CACHE" \
     --model_load_in_4bit "$MODEL_LOAD_IN_4BIT" \
+    --prompt_format "$PROMPT_FORMAT" \
     --output_file "$OUTPUT_FILE" \
     --answer_file "$DATASET_PATH/answers/answer.jsonl" \
     --bsz "$EVAL_BSZ" \

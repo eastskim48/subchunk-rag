@@ -77,8 +77,8 @@ Each retrievable window is stored as one Chroma row:
 - Chroma `document`: retrievable window text.
 - Chroma `metadata`:
   - `parent_doc_id`
-  - `window_token_start`
-  - `window_token_end`
+  - `source_token_start`
+  - `source_token_end`
   - `chunk_size`
   - `token_count`
   - `cache_unit`
@@ -95,6 +95,13 @@ available for downstream ColBERT scoring.
 
 ColBERT embeddings are materialized by parent document, not by retrievable
 chunk.
+
+The ordered candidate units are read from each retrievable chunk's persisted
+`cacheables_json`, deduplicated by stable cacheable ID, grouped by
+`parent_doc_id`, and sorted by their source token start. Artifact construction
+does not rerun sentence parsing or long-sentence splitting. The DB build
+manifest is therefore the authority for the candidate-unit type: sentence and
+fixed-size center modes cannot be mixed.
 
 The artifact layout is:
 
@@ -206,31 +213,11 @@ candidate subchunks are already carried by the Chroma row metadata.
 ### 2. Locating ColBERT Vectors
 
 For every retrieved chunk, the compressor calls `artifact.vectors_for_doc(doc)`.
-
-The artifact loader resolves the parent document id using:
-
-1. `doc.metadata["parent_doc_id"]`, if present.
-2. otherwise `cacheable.parent_doc_id`.
-3. otherwise the prefix before `::ret_` in the retrieved chunk id.
-
-Then it loads the parent document payload:
-
-```python
-self.doc_cache[doc_id] = torch.load(path, map_location="cpu")
-```
-
-The payload is cached in memory by parent document id. Therefore, if the same
-query retrieves several chunks from the same parent document, or later queries
-touch the same parent document, that `.pt` file is loaded only once per eval
-process.
-
-Important behavior:
-
-- the whole corpus artifact is not loaded at startup.
-- the whole parent document `.pt` file is loaded when needed.
-- there is no eviction policy in the current `doc_cache`.
-- memory use can grow with the number of unique parent documents touched during
-  an eval run.
+The cacheable ids attached to that chunk are resolved through the dict loaded
+from `colbert_window/data/cacheable_rows.json`, and their token-vector ranges are
+read from the memory-mapped `vectors.fp16.bin` using `offsets.npy`. There is no
+per-document `.pt` storage
+or parent-document loading fallback.
 
 ### 3. Retrieval-Bounded Candidate Pool
 
@@ -240,29 +227,21 @@ retrieved chunks.
 For each retrieved chunk:
 
 1. collect its sentence cacheables.
-2. load the parent-document ColBERT vectors.
-3. select vectors matching the retrieved cacheable ids.
+2. look up only their stored ColBERT vector ranges.
+3. construct regions from the stored window/region metadata.
 
 The method does not score every sentence in the corpus. Coarse Chroma retrieval
 first bounds the candidate set, and ColBERT scoring only reranks evidence inside
 the retrieved chunks.
 
-### 4. Online Sliding Regions
+### 4. Artifact-Bound Sliding Regions
 
-For each retrieved chunk, the method constructs sliding regions over the
-retrieved sentence cacheables.
-
-This uses the same centered-window helper/rule as offline materialization, but
-it is applied online to the sentence cacheables attached to the retrieved chunk.
-It does not reuse the offline artifact's `window_selected_indices` as the final
-prompt regions.
-
-The online region construction is:
-
-1. choose each sentence as a center.
-2. build a local region by adding neighboring retrieved sentences within the
-   `COLBERT_SLIDING_WINDOW_TOKEN_BUDGET` or artifact window budget.
-3. skip duplicate regions with the same selected sentence-index tuple.
+For each retrieved chunk, the method reads the stored region payload
+produced from the offline document-window spans.
+The runtime cacheable-id list must exactly match the stored list, and the stored
+region budget must equal the artifact `window_token_budget`. Missing or
+mismatched metadata is an error; the runtime does not tokenize sentences or
+recompute region boundaries.
 
 Each region is represented as a synthetic `CacheableChunk`:
 
@@ -344,31 +323,40 @@ ceil(RETAIN_TOKEN_RATIO * retrieved_context_token_count)
 ```
 
 `retrieved_context_token_count` is computed over deduplicated retrieved
-sentence cacheables. In the current implementation this budget accounting uses
-`self.encoder.token_count(...)`, i.e. the ColBERT document tokenizer with its
-document-token overhead. It is therefore a ColBERT-side token budget proxy, not
-an exact LLM prompt-token budget.
+sentence cacheables using the same prompt-visible passage format that will be
+sent to the LLM:
 
-If `RETAIN_TOKEN_RATIO` is not set, the method can use
-`COLBERT_FINAL_TOKEN_BUDGET`. If neither is set, selection falls back to
-`GLOBAL_TOP_R` over ranked regions.
+```text
+sentence_text.strip() + "\n\n"
+```
 
-The runtime priority of the budget controls is:
+The text is tokenized with the evaluated `MODEL_NAME` tokenizer. New
+materialized cacheable payloads store this prompt-visible length as
+`prompt_token_count` together with `prompt_tokenizer_name`, so query-time
+selection can read an integer instead of calling the LLM tokenizer when the
+stored tokenizer name exactly matches the runtime `MODEL_NAME`. Missing stored
+counts or tokenizer mismatches fall back to runtime tokenization. This budget
+accounting must not use ColBERT artifact vector-row counts, because
+those counts can be truncated by the ColBERT document encoder and are not LLM
+prompt-token lengths.
 
-| Setting state | Final selection controller | Ignored for final selection |
-| --- | --- | --- |
-| `RETAIN_TOKEN_RATIO` is set | Per-query retained-ratio budget | `COLBERT_FINAL_TOKEN_BUDGET`, `GLOBAL_TOP_R` |
-| `RETAIN_TOKEN_RATIO` unset, `COLBERT_FINAL_TOKEN_BUDGET` set | Fixed absolute token budget | `GLOBAL_TOP_R` |
-| Neither `RETAIN_TOKEN_RATIO` nor `COLBERT_FINAL_TOKEN_BUDGET` set | Ratio keep count from `GLOBAL_TOP_R` | none |
+Alternatively, `FINAL_TOKEN_BUDGET` sets an absolute token target. Exactly one
+of `RETAIN_TOKEN_RATIO` and `FINAL_TOKEN_BUDGET` must be configured.
 
-`GLOBAL_TOP_R` is therefore not a token-budget controller when either
-`RETAIN_TOKEN_RATIO` or `COLBERT_FINAL_TOKEN_BUDGET` is active. It only controls
-the final number of selected ranked regions in the no-final-budget path.
+The runtime budget controls are:
 
-`COLBERT_SLIDING_WINDOW_TOKEN_BUDGET` is a different control. It limits the size
-of each candidate sliding region during online region construction; it does not
-set the final selected prompt budget. If unset, the online region builder uses
-the artifact `window_token_budget`, normally `180`.
+| Setting state | Final selection controller |
+| --- | --- |
+| Only `RETAIN_TOKEN_RATIO` is set | Per-query retained-ratio budget |
+| Only `FINAL_TOKEN_BUDGET` is set | Fixed absolute token budget |
+| Both or neither are set | Configuration error |
+
+Dense and `colbert_subchunk` apply the same policy over globally ranked
+subchunks. Sliding-region methods apply it over globally ranked regions.
+
+Candidate-region size is fixed by the artifact `window_token_budget`, normally
+`180`. Only final selection is controlled at runtime through
+`RETAIN_TOKEN_RATIO` or `FINAL_TOKEN_BUDGET`.
 
 ### 8. Duplicate Sentence Removal Under Budget
 
@@ -385,9 +373,10 @@ For each ranked region:
 
 1. iterate through the region's source sentence indices.
 2. skip a sentence if its id is already in `selected_sentence_ids`.
-3. estimate its token length with the ColBERT tokenizer.
-4. add it if it fits the remaining budget.
+3. estimate its token length with the prompt-visible budget tokenizer.
+4. add every novel sentence in the selected region.
 5. create a deduplicated region cacheable from the newly added sentences.
+6. stop if the accumulated token count has reached or exceeded the budget.
 
 This is important because:
 

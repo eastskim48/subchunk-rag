@@ -10,23 +10,21 @@ else
 fi
 export MATERIALIZE_CACHE="${MATERIALIZE_CACHE:-True}"
 export MATERIALIZE_DB="${MATERIALIZE_DB:-True}"
-export MATERIALIZE_COMPARE_EMBEDS="${MATERIALIZE_COMPARE_EMBEDS:-True}"
 export PREPROCESS_SUBDIR="${PREPROCESS_SUBDIR:-sent}"
 export CHROMA_EMBED_DEVICE="${CHROMA_EMBED_DEVICE:-cuda}"
-export COMPARE_EMBED_OVERWRITE="${COMPARE_EMBED_OVERWRITE:-False}"
-export COMPARE_EMBED_MODEL="${COMPARE_EMBED_MODEL:-BAAI/bge-m3}"
+export CHROMA_EMBED_BATCH_SIZE="${CHROMA_EMBED_BATCH_SIZE:-128}"
 export MODEL_NAME="${MODEL_NAME:-meta-llama/Llama-3.1-8B-Instruct}"
 export BATCH_SIZE="${BATCH_SIZE:-36}"
+export DB_BATCH_SIZE="${DB_BATCH_SIZE:-256}"
 export RESUME_FROM_CACHE="${RESUME_FROM_CACHE:-False}"
 export SPLITTER="${SPLITTER:-sentence}"
 export MERGER="${MERGER-}"
 export DEDUPLICATE_DOCUMENTS_BY_HASH="${DEDUPLICATE_DOCUMENTS_BY_HASH:-False}"
-export MAX_SUBCHUNK_TOKENS="${MAX_SUBCHUNK_TOKENS:-None}"
+export MAX_SUBCHUNK_TOKENS="${MAX_SUBCHUNK_TOKENS:-180}"
 export CACHEABLE_CHUNK_SIZE="${CACHEABLE_CHUNK_SIZE:-None}"
 export RETRIEVABLE_CHUNK_SIZE="${RETRIEVABLE_CHUNK_SIZE:-1024}"
 export CACHE_SUBDIR="${CACHE_SUBDIR:-cache}"
 export CACHE_DIR="${CACHE_DIR:-$DATASET_PATH/$PREPROCESS_SUBDIR/$CACHE_SUBDIR}"
-export COMPARE_EMBED_DIR="${COMPARE_EMBED_DIR:-$DATASET_PATH/$PREPROCESS_SUBDIR/compare_embed}"
 export DB_DIR="${DB_DIR:-$DATASET_PATH/$PREPROCESS_SUBDIR/db}"
 export TORCHRUN_MASTER_PORT="${TORCHRUN_MASTER_PORT:-29500}"
 
@@ -39,9 +37,6 @@ is_enabled() {
 
 if is_enabled "$MATERIALIZE_CACHE"; then
     mkdir -p "$CACHE_DIR"
-fi
-if is_enabled "$MATERIALIZE_COMPARE_EMBEDS"; then
-    mkdir -p "$COMPARE_EMBED_DIR"
 fi
 if is_enabled "$MATERIALIZE_DB"; then
     mkdir -p "$DB_DIR"
@@ -64,11 +59,10 @@ torchrun --nproc_per_node 1 --master_port "$TORCHRUN_MASTER_PORT" src/entrypoint
     --deduplicate_documents_by_hash "$DEDUPLICATE_DOCUMENTS_BY_HASH" \
     --max_subchunk_tokens "$MAX_SUBCHUNK_TOKENS" \
     --batch_size "$BATCH_SIZE" \
+    --db_batch_size "$DB_BATCH_SIZE" \
+    --chroma_embed_device "$CHROMA_EMBED_DEVICE" \
+    --chroma_embed_batch_size "$CHROMA_EMBED_BATCH_SIZE" \
     --materialize_cache "$MATERIALIZE_CACHE" \
     --materialize_db "$MATERIALIZE_DB" \
-    --materialize_compare_embeds "$MATERIALIZE_COMPARE_EMBEDS" \
-    --compare_embed_dir "$COMPARE_EMBED_DIR" \
-    --compare_embed_model "$COMPARE_EMBED_MODEL" \
-    --compare_embed_overwrite "$COMPARE_EMBED_OVERWRITE" \
     --resume_from_cache "$RESUME_FROM_CACHE" \
     --dummy_bos_count 4

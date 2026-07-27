@@ -1,19 +1,17 @@
+"""LLM loading and generation paths for cache-off and cache-on evaluation."""
+
 from dataclasses import dataclass
 
 import os
 import time
-from collections import defaultdict
-from typing import Dict, List, Optional
+from typing import List, Optional
 from transformers import (
-    LlamaForCausalLM,
     AutoTokenizer,
     DynamicCache,
     AutoModelForCausalLM,
-    logging,
     BitsAndBytesConfig,
 )
 import torch
-from deepspeed.ops.op_builder import GDSBuilder, AsyncIOBuilder
 from typing import Tuple
 from cache_utils import shift_rotary_cache
 from prompt import PromptProcessor
@@ -21,12 +19,16 @@ from prompt import PromptProcessor
 
 @dataclass
 class InferenceTimeLog:
+    """Measured prefill/decode time and effective model input lengths."""
+
     prefill: float
     decode: float
     model_input_lengths: Optional[List[int]] = None
 
 
 class LLMModel:
+    """Wrap a Hugging Face causal LM with project-specific prompt/cache logic."""
+
     SYSTEM_PROMPT = (
         "You answer questions using only the provided passages. "
         "Return only the shortest exact answer phrase supported by the passages. "
@@ -40,10 +42,12 @@ class LLMModel:
         disable_rope: bool = False,
         use_front_bos_cache: bool = False,
         load_in_4bit: Optional[bool] = None,
+        prompt_format: str = "raw_chunk_first",
     ):
         self.model_name = model_name
         self.disable_rope = disable_rope
         self.use_front_bos_cache = use_front_bos_cache
+        self.prompt_format = prompt_format
         if load_in_4bit is None:
             load_in_4bit = os.environ.get(
                 "MODEL_LOAD_IN_4BIT", "False"
@@ -90,6 +94,7 @@ class LLMModel:
             tokenizer=self.tokenizer,
             system_prompt=self.SYSTEM_PROMPT,
             passage_prefix=self.PASSAGE_PREFIX,
+            prompt_format=self.prompt_format,
         )
 
         print(time.perf_counter() - init_time, flush=True)
@@ -124,6 +129,8 @@ class LLMModel:
         return tuple(stacked)
 
     def _get_front_bos_cache(self):
+        """Materialize the reusable one-token BOS prefix cache on demand."""
+
         if self._front_bos_cache is not None:
             return self._front_bos_cache
 
@@ -383,6 +390,8 @@ class LLMModel:
         first_token_ids: torch.Tensor,
         max_new_tokens: int,
     ) -> List[torch.Tensor]:
+        """Greedily decode a batch whose prompt prefix is already cached."""
+
         num_requests = first_token_ids.shape[0]
         device = first_token_ids.device
         pad_token_id = self.tokenizer.pad_token_id
@@ -481,6 +490,8 @@ class LLMModel:
         past_lengths=None,
         max_new_tokens: int = 100,
     ) -> Tuple[InferenceTimeLog, List[str]]:
+        """Generate through either full-prefill or reused-cache mode."""
+
         if torch.cuda.is_available():
             torch.cuda.synchronize()
         start_prefill = time.perf_counter()
@@ -614,8 +625,6 @@ class LLMModel:
         # print(f"prefill 1 request: {unit_prefill:6f} seconds")
 
         # decode
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
         start_decode = time.perf_counter()
         with torch.no_grad():
             if not use_past_cache:

@@ -1,15 +1,15 @@
+"""End-to-end retrieval, compression, cache loading, and inference engine."""
+
 import time
 import os
 from itertools import islice
 from tqdm import tqdm
 from typing import List
-import torch
-from deepspeed.ops.op_builder import GDSBuilder, AsyncIOBuilder
 from transformers import DynamicCache
 from chunk import RetrievableChunk
 
 from vectordb import VectorDB
-from utils import parse_json_query, file_read, restore_tensor_shape
+from utils import parse_json_query
 from model import LLMModel
 from compressor.factory import compress_docs, initialize_compressor
 import json
@@ -23,6 +23,8 @@ from cache_utils import (
 
 
 class QueryProcessor:
+    """Execute batched evaluation queries and record timing/output metadata."""
+
     def __init__(
         self,
         model: LLMModel,
@@ -74,6 +76,8 @@ class QueryProcessor:
             os.remove(self.output_file)
 
     def _run_batch(self, batch_queries, batch_bsz: int, max_new_tokens: int):
+        """Run retrieval through generation for one evaluation batch."""
+
         batch_start = time.perf_counter()
         retrieval_start = time.perf_counter()
         batch_top_k_docs = self.vectordb.find_top_k_docs(
@@ -248,6 +252,8 @@ class QueryProcessor:
     def process_query(
         self, bsz: int = 1, max_new_tokens: int = 100, total_num: int = 100
     ):
+        """Evaluate input queries in batches and write reproducible records."""
+
         process_start = time.perf_counter()
         elapsed = 0.0
         retrieval_elapsed = 0.0

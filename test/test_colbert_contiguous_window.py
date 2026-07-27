@@ -8,13 +8,86 @@ SRC_ROOT = REPO_ROOT / "src"
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
-from materialize.colbert_window import (  # noqa: E402
+from materialize.colbert_materializer import (  # noqa: E402
     ColBERTWindowEncoder,
-    _centered_region_index_specs,
+    WindowSpec,
+    _build_fixed_chunk_window_spec,
 )
 
 
 class ColBERTContiguousWindowTest(unittest.TestCase):
+    def test_fixed_chunk_spec_uses_the_db_center_without_context(self):
+        spec = _build_fixed_chunk_window_spec(
+            center_unit="fixed_chunk",
+            source_tokenizer=None,
+            visible_token_overhead=2,
+            source_token_ids=[],
+            chunk_start=4,
+            chunk_end=6,
+            center_text="CENTER",
+            center_index=2,
+            window_token_budget=10,
+        )
+
+        self.assertEqual(spec.text, "CENTER")
+        self.assertEqual((spec.center_start, spec.center_end), (0, 6))
+        self.assertEqual(spec.selected_indices, [2])
+
+    def test_fixed_chunk_window_spec_preserves_center_span(self):
+        class FakeTokenizer:
+            @staticmethod
+            def decode(token_ids, skip_special_tokens=True):
+                del skip_special_tokens
+                return " ".join(str(token_id) for token_id in token_ids)
+
+        spec = _build_fixed_chunk_window_spec(
+            center_unit="fixed_chunk_window",
+            source_tokenizer=FakeTokenizer(),
+            visible_token_overhead=2,
+            source_token_ids=list(range(10)),
+            chunk_start=4,
+            chunk_end=6,
+            center_text="CENTER",
+            center_index=2,
+            window_token_budget=10,
+        )
+
+        self.assertEqual(spec.text, "1 2 3 CENTER 6 7 8")
+        self.assertEqual(
+            spec.text[spec.center_start : spec.center_end],
+            "CENTER",
+        )
+        self.assertEqual(spec.selected_indices, [2])
+
+    def test_window_encoder_delegates_text_and_center_spans(self):
+        encoder = object.__new__(ColBERTWindowEncoder)
+        captured = {}
+
+        def encode_document_spans(texts, center_spans, show_progress=False):
+            captured["texts"] = texts
+            captured["center_spans"] = center_spans
+            captured["show_progress"] = show_progress
+            return ["encoded"]
+
+        encoder.encode_document_spans = encode_document_spans
+        specs = [
+            WindowSpec(
+                text="left center right",
+                center_start=5,
+                center_end=11,
+                selected_indices=[0, 1, 2],
+                addition_order=[1, 0, 2],
+                truncated_center=False,
+            )
+        ]
+
+        result = encoder.encode_windows(specs, show_progress=True)
+
+        self.assertEqual(result, ["encoded"])
+        self.assertEqual(captured["texts"], ["left center right"])
+        self.assertEqual(captured["center_spans"], [(5, 11)])
+        self.assertTrue(captured["show_progress"])
+
     def test_encoder_window_budget_overflow_stops_expansion(self):
         encoder = object.__new__(ColBERTWindowEncoder)
         encoder.doc_maxlen = 40
@@ -25,42 +98,11 @@ class ColBERTContiguousWindowTest(unittest.TestCase):
 
         specs = encoder.build_centered_windows(
             ["10", "1000", "10", "10", "10"],
-            token_budget=40,
+            window_token_budget=40,
         )
 
         self.assertEqual(specs[2].selected_indices, [2])
         self.assertEqual(specs[2].addition_order, [2])
-
-    def test_region_spec_budget_overflow_stops_instead_of_filling_opposite_side(self):
-        specs = _centered_region_index_specs(
-            [10, 1000, 10, 10, 10],
-            token_budget=40,
-            doc_token_overhead=0,
-        )
-
-        self.assertIn((2, (2,)), specs)
-        self.assertNotIn((2, (2, 3, 4)), specs)
-
-    def test_generated_region_specs_are_contiguous(self):
-        for length in range(1, 8):
-            for token_counts in itertools.product([1, 2, 5, 20, 100], repeat=length):
-                for token_budget in [3, 5, 8, 12, 25, 40]:
-                    for doc_token_overhead in [0, 2]:
-                        with self.subTest(
-                            token_counts=token_counts,
-                            token_budget=token_budget,
-                            doc_token_overhead=doc_token_overhead,
-                        ):
-                            specs = _centered_region_index_specs(
-                                list(token_counts),
-                                token_budget=token_budget,
-                                doc_token_overhead=doc_token_overhead,
-                            )
-                            for _, selected in specs:
-                                self.assertEqual(
-                                    selected,
-                                    tuple(range(selected[0], selected[-1] + 1)),
-                                )
 
     def test_generated_encoder_windows_are_contiguous(self):
         encoder = object.__new__(ColBERTWindowEncoder)
@@ -80,7 +122,7 @@ class ColBERTContiguousWindowTest(unittest.TestCase):
                         )
                         specs = encoder.build_centered_windows(
                             sentences,
-                            token_budget=token_budget,
+                            window_token_budget=token_budget,
                         )
                         for spec in specs:
                             selected = spec.selected_indices

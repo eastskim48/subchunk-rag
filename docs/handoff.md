@@ -7885,7 +7885,7 @@ can be performed without rerunning the forward pass for these samples.
 - `thr40`: `F1 0.3167`, `1387.94 tokens`
 - `thr50`: `F1 0.2659`, `1069.61 tokens`
 
-### Open issues
+### DB build history and final status
 - Corrected `mode 3 cache-off` remains strong on some datasets, but the corresponding `cache-on` trim-based analogue is still weak.
 - This reinforces the earlier conclusion that serializer-only cache-on changes are insufficient.
 
@@ -26889,3 +26889,13548 @@ Record the current MatKV demo status and the design discussion for paper-style p
   - The current commit should be used as the rollback point if this policy hurts F1 or throughput.
 - next steps:
   - Rerun MuSiQue RAG for `top_k=10`, ratios `0.25`, `0.5`, and `0.75` with the new policy when GPU is available.
+
+## 2026-07-17 - Log actual compressed context in RAG outputs
+
+- objective:
+  - Fix RAG output JSONL `ctxs` so it records the actual context passages used for generation after compression.
+- what was changed:
+  - Updated `src/engine.py` output logging.
+  - Old behavior: `ctxs` stored `doc.text` for each retrieved document/chunk, which could be the full retrieved chunk text and not the compressed prompt context.
+  - New behavior: `ctxs` is built from `QueryProcessor._extract_passages(docs)`, the same `doc.cacheables[*].text` path used by cache-off prompt assembly.
+  - Kept `ctxs` as context-only. System prompt and query are not included in `ctxs`; if full prompt logging is needed later, it should use a separate field.
+- what was verified:
+  - `python -m py_compile src/engine.py`
+  - `black src/engine.py`
+  - `black --check src/engine.py`
+  - Ran a direct object-level check that `_ctxs_for_output()` logs selected cacheable texts and does not log `doc.text`.
+- open issues:
+  - Existing JSONL outputs are not retroactively fixed. Any post-hoc prompt/context analysis should use newly generated outputs or reconstruct selected cacheables.
+- next steps:
+  - For future RAG reruns, use the new JSONL `ctxs` directly for compressed-context inspection.
+
+## 2026-07-17 - Diagnose MuSiQue k10 r0.5 drop after monotonic selection
+
+- objective:
+  - Explain why LongBench MuSiQue `sent-default-512`, `top_k=10`, `RETAIN_TOKEN_RATIO=0.5` in `outputs/grid_07/musique-0718-2` still underperforms `r=0.25` after the add-then-stop monotonic selection patch.
+- what was changed:
+  - No evaluation or model code was changed.
+  - Wrote analysis artifacts:
+    - `outputs/analysis/musique_0718_2_r25_r50_ctx_cause_summary.json`
+    - `outputs/analysis/musique_0718_2_r25_r50_ctx_cause_summary_use_cleaner_false.json`
+- what was verified:
+  - The correct comparison setting is `USE_CLEANER=False`, matching the grid run environment. Re-evaluating the saved JSONL with `use_cleaner=False` exactly matches the summary CSV:
+    - `r=0.25`: EM `0.19`, F1 `0.25534668517756753`.
+    - `r=0.5`: EM `0.15`, F1 `0.21893722943722946`.
+    - `r=0.75`: EM `0.16`, F1 `0.2319163377472201`.
+  - `r=0.25 -> r=0.5` has 18 loss cases totaling `-11.688750954927425` F1 and 9 gain cases totaling `+4.406859806859807` F1, for a net `-7.2818911480676185` total F1 over 200 examples.
+  - Loss cases do not primarily come from losing gold evidence:
+    - Gold answer string appears in selected context for `10/18` loss cases at both `r=0.25` and `r=0.5`.
+    - Added `r=0.5` context contains gold in only `3/18` loss cases.
+  - Loss cases are more consistent with added distractor pressure:
+    - Average selected context grows from `11.0` passages / `4996.4` chars at `r=0.25` to `22.17` passages / `9758.1` chars at `r=0.5`.
+    - The normalized `r=0.5` prediction string appears in the full `r=0.5` context in `15/18` loss cases and specifically in newly added context in `9/18`.
+    - Concrete examples include `The African Queen -> Key Largo`, `24:00 -> 02:00`, `Tanzania -> Kenya`, and `continental treble -> 15`, where added passages introduce plausible answer-type-compatible distractors.
+  - Exact passage-text nesting is almost preserved in saved `ctxs`: only ID 91 has one `r=0.25` passage absent from `r=0.5`. The missing passage is an irrelevant `Bâton à feu` paragraph; the observed answer change is driven by added Black Death mortality passages containing the `60% of fiscal hearths` distractor.
+- open issues:
+  - `r=0.5` is not a pure evidence-recall failure. Evidence recall increases from `72/200` to `83/200` by exact gold-string containment, but answer accuracy drops because additional context also introduces more plausible wrong entities/numbers.
+  - The current result should be described as a precision/noise tradeoff in answer generation, not as a region-selection monotonicity bug.
+  - Follow-up correction: exact `ctxs` passage-text nesting across separately launched `r=0.25` and `r=0.5` JSONL files is not a valid source-id monotonicity check. For ID 91, saved JSONL has one `r=0.25` passage absent from `r=0.5`, but rerunning compression only on the same DB/artifact with CPU-only ColBERT gives source sentence-id nesting with zero missing IDs for `0.25 -> 0.5`, `0.5 -> 0.75`, and `0.25 -> 0.75`.
+  - The saved `musique-0718-2` r=0.5 output differs from current CPU-only recompression for ID 91: current recompression selects the `Bâton à feu` region at all three ratios, while the saved r=0.5 `ctxs` lacks that passage. The grid log shows the original run used the CUDA ColBERT path despite `COLBERT_DEVICE=cpu`, because third-party ColBERT sets `DEVICE` from `torch.cuda.is_available()`. The saved run did not log retrieved chunk IDs or selected sentence IDs, so the exact historical cause cannot be reconstructed from the JSONL alone.
+- next steps:
+  - If this needs a method-level fix rather than explanation, test a secondary precision mechanism such as stricter ratio, reranking selected regions by answer support, or prompt ordering that places the most relevant compact evidence before broader supporting context.
+  - For future monotonicity/debug claims, log selected `sentence_ids` or run all ratios from one fixed `(retrieved chunks, scored regions)` object. Do not infer source-id monotonicity from exact `ctxs` passage strings across separate end-to-end runs.
+
+## 2026-07-17 - Compare MuSiQue latest principled selection results
+
+- objective:
+  - Interpret the completed MuSiQue `musique-0718-2` results relative to earlier runs after source-order/all-or-nothing and add-then-stop style fixes.
+- what was changed:
+  - No code was changed.
+- what was verified:
+  - `outputs/grid_07/musique-0718-2/summary-longbench-musique-summary2.csv` now contains both `top_k=10` and `top_k=20` rows for ratios `0.125`, `0.25`, `0.5`, and `0.75`.
+  - Relative to `musique-0718`, `musique-0718-2` increases input length for every matched setting by roughly `+72` to `+135` tokens.
+  - F1 changes from `musique-0718` to `musique-0718-2`:
+    - `k=10,r=0.125`: `0.1894 -> 0.1947` (`+0.0053`)
+    - `k=10,r=0.25`: `0.2586 -> 0.2553` (`-0.0032`)
+    - `k=10,r=0.5`: `0.2130 -> 0.2189` (`+0.0059`)
+    - `k=10,r=0.75`: `0.2360 -> 0.2319` (`-0.0041`)
+    - `k=20,r=0.125`: `0.2271 -> 0.2370` (`+0.0100`)
+    - `k=20,r=0.25`: `0.2526 -> 0.2488` (`-0.0039`)
+    - `k=20,r=0.5`: `0.2419 -> 0.2264` (`-0.0155`)
+    - `k=20,r=0.75`: `0.2342 -> 0.2247` (`-0.0095`)
+  - Relative to the older `musique-0710-bsz1`, the largest degradation remains `k=10,r=0.5`: `0.2713 -> 0.2189` (`-0.0524`), while `k=10,r=0.25` improves: `0.2401 -> 0.2553` (`+0.0153`).
+- open issues:
+  - The more principled/nested selection policy does not monotonically improve MuSiQue answer F1. It often preserves or adds more context, but that extra context can introduce answer-type-compatible distractors.
+  - Correctness fixes such as source-order output and all-or-nothing contiguous region inclusion should not be rolled back for F1. The add-then-stop monotonic budget policy is a design choice and should be reported separately if it is kept.
+- next steps:
+  - For paper results on MuSiQue, prefer treating `r=0.25` as the stable operating point rather than optimizing around the older `k=10,r=0.5` outlier.
+  - If needed, add an ablation table separating correctness fixes from budget policy changes, because their F1 effects differ.
+
+## 2026-07-17 - Check whether window construction can create non-contiguous windows
+
+- objective:
+  - Answer whether the current 180-token centered window construction can select non-contiguous subchunks.
+- what was changed:
+  - No code was changed.
+- what was verified:
+  - `ColBERTWindowEncoder.build_centered_windows()` can create non-contiguous offline windows. It advances the left/right pointer before checking the token budget; if a candidate would exceed the budget, that candidate is skipped but later candidates can still be considered. This can yield selected indices such as `[1, 2, 3, 4, 5, 6, 10, 11]`.
+  - Existing source artifacts contain many non-contiguous offline windows:
+    - MuSiQue `sent-default-512`: `48,958 / 71,794` windows (`68.19%`).
+    - HotpotQA `sent-default-512`: `49,338 / 73,321` windows (`67.29%`).
+    - 2Wiki `sent-default-512`: `24,778 / 39,740` windows (`62.35%`).
+  - Compact prompt region specs currently generated with `region_spec_reuse_mode=document_window_bound` are contiguous:
+    - MuSiQue: `0 / 40,715` non-contiguous region specs.
+    - HotpotQA: `0 / 41,506`.
+    - 2Wiki: `0 / 21,193`.
+- open issues:
+  - Current artifacts do not support a clean claim that offline contextualization windows and online prompt regions are exactly the same unit. Prompt regions are contiguous, but the stored center embeddings may have been contextualized with non-contiguous document windows.
+  - If the paper adopts "window as region" as the conceptual principle, `build_centered_windows()` should be changed so window expansion is contiguous, and ColBERT window artifacts should be regenerated.
+- next steps:
+  - Decide whether to preserve the current historical artifacts/results, or patch window construction to stop a direction when the adjacent candidate exceeds the budget and rerun preprocessing/evaluation.
+
+## 2026-07-17 - Enforce contiguous ColBERT window expansion
+
+- objective:
+  - Change ColBERT centered window construction so a budget overflow stops the whole window expansion for that center, preserving contiguous windows.
+- what was changed:
+  - Updated `ColBERTWindowEncoder.build_centered_windows()` in `src/materialize/colbert_window.py`.
+    - Old behavior: if the next candidate exceeded the window budget, skip that candidate and keep trying later candidates.
+    - New behavior: if the next candidate exceeds the window budget, mark that center window inactive and stop expansion.
+  - Updated `_centered_region_index_specs()` in `src/materialize/colbert_window.py`.
+    - Old behavior: if one side exceeded budget, stop only that direction.
+    - New behavior: stop both directions for that center window.
+  - Added `test/test_colbert_contiguous_window.py` to verify both encoder windows and region specs remain contiguous.
+- what was verified:
+  - `python test/test_colbert_contiguous_window.py`
+  - `python test/test_colbert_region_specs.py`
+  - `python -m py_compile src/materialize/colbert_window.py test/test_colbert_contiguous_window.py`
+  - `black --check src/materialize/colbert_window.py test/test_colbert_contiguous_window.py`
+- open issues:
+  - Existing ColBERT window artifacts were not regenerated. Old artifacts can still contain non-contiguous windows until preprocessing is rerun.
+  - Existing MuSiQue/HotpotQA/2Wiki RAG results are not directly representative of the new contiguous-window artifact policy.
+- next steps:
+  - Regenerate ColBERT window/compact artifacts before rerunning main RAG experiments with the contiguous-window policy.
+
+## 2026-07-17 - Switch ColBERT preprocessing to compact-only artifacts
+
+- objective:
+  - Remove the preprocessing path that materialized document-wise `docs/*.pt` ColBERT payloads, and use only the read-optimized compact artifact layout for new ColBERT window artifacts.
+- what was changed:
+  - Updated `build_colbert_window_artifact()` in `src/materialize/colbert_window.py`.
+    - Old behavior: encode document windows, save per-document `docs/*.pt`, then build `compact/` as a second copy.
+    - New behavior: encode document windows and directly stream center-token ColBERT vectors into `compact/vectors.fp16.bin`, with `offsets.npy`, `token_counts.npy`, `id_to_row`, and `window_ids_by_row`.
+    - The top-level `index.json` now records `storage_layout=compact_only`; no `docs/*.pt` files are produced by the new preprocessing path.
+  - Updated `add_region_specs_to_compact_colbert_artifact()` to build document-window-bounded region specs from compact metadata (`id_to_row` and `window_ids_by_row`) instead of loading `docs/*.pt`.
+  - Updated `validate_colbert_window_artifact_against_db()` to validate compact-only artifacts against DB cacheable IDs. Text mismatch validation is skipped for compact-only artifacts because text is no longer duplicated inside the ColBERT artifact.
+  - Updated both ColBERT preprocessing entry points:
+    - `src/entrypoint/preprocess_colbert_window.py`
+    - `src/entrypoint/preprocess.py`
+    - Both now attach compact region specs immediately after compact-only artifact creation.
+  - Added a regression test in `test/test_colbert_region_specs.py` asserting that compact-only region spec generation does not call `torch.load()` on `.pt` payloads.
+- what was verified:
+  - Formatting and static checks:
+    - `black --check src/materialize/colbert_window.py src/entrypoint/preprocess_colbert_window.py src/entrypoint/preprocess.py test/test_colbert_region_specs.py`
+    - `python -m py_compile src/materialize/colbert_window.py src/entrypoint/preprocess_colbert_window.py src/entrypoint/preprocess.py test/test_colbert_region_specs.py`
+  - Unit tests:
+    - `python test/test_colbert_region_specs.py` (`16` tests passed)
+    - `python test/test_colbert_contiguous_window.py` (`4` tests passed)
+  - Regenerated MuSiQue only at the original path:
+    - `/mnt/nvme1/datasets/longbench-musique/sent-default-512/colbert_window`
+    - DB path was not modified.
+  - MuSiQue regenerated artifact validation:
+    - `storage_layout=compact_only`
+    - `num_cacheables=71794`
+    - `num_center_tokens=2045575`
+    - `region_spec_reuse_mode=document_window_bound`
+    - `region_spec_count=40715`
+    - DB validation passed with `missing_in_artifact_count=0`, `extra_in_artifact_count=0`.
+    - `text_validation=skipped_compact_only` because compact-only no longer stores duplicate cacheable text.
+    - `.pt` file count under the MuSiQue artifact path is `0`.
+    - Compact window id rows are contiguous: `0 / 71794` non-contiguous.
+    - Compact region specs are contiguous: `0 / 40715` non-contiguous.
+    - Artifact size is now `523M`.
+- open issues:
+  - Existing HotpotQA, 2Wiki, and Qasper ColBERT artifacts have not yet been regenerated with the compact-only path.
+  - Existing RAG/evidence results remain tied to whichever artifact was used when they were produced; MuSiQue results should be rerun before comparing against compact-only regenerated artifacts.
+  - Legacy `build_compact_colbert_window_artifact()` remains in the code for old `.pt` artifacts, but the main preprocessing path no longer creates `.pt` payloads.
+- next steps:
+  - Rerun MuSiQue retrieval/RAG experiments with the regenerated compact-only artifact if new numbers are needed.
+  - Regenerate the other datasets before running main grid experiments under the compact-only artifact policy.
+
+## 2026-07-18 - Audit ColBERT sliding-region scoring memoization
+
+- objective:
+  - Check whether ColBERT sliding-region scoring, score memoization, and related cache keys have an obvious correctness bug.
+- what was changed:
+  - Stopped the in-progress 2Wiki window=120 grid run because the result was no longer useful for the current decision.
+  - Added `test_sliding_region_spec_cache_key_includes_cacheable_ids` in `test/test_colbert_region_specs.py`.
+    - This verifies that region spec memoization does not reuse stale specs when the same retrieved chunk id is paired with a different cacheable-id list.
+  - Fixed a non-functional type annotation in `src/compressor/colbert_window_compressor.py`.
+    - `sentence_index_by_key` is keyed by tuples, not strings.
+- what was verified:
+  - Scoring path:
+    - `_score_sliding_regions_vectorized()` deduplicates sentence scoring by `(id(source_vectors), local_index, cacheable_id)` when cacheable ids exist.
+    - This avoids collisions between duplicate cacheable ids that come from different loaded vector lists.
+    - Region score is computed as the per-query-token max across all selected sentence representations, then summed; existing tests verify this equals scoring the concatenated region vectors with `score_maxsim`.
+  - Region spec cache:
+    - `_sliding_region_spec_cache` is keyed by `(doc.id, region_token_budget, cacheable_id_tuple)`.
+    - Compact sidecar specs are used only if the sidecar payload cacheable id list exactly matches the current retrieved chunk cacheables.
+  - Vector load cache:
+    - `retrievable_vectors_cache` is keyed by `(retrieved_doc_id, cacheable_id_tuple)` for retrieved chunks.
+    - `clear_inter_batch_cache()` clears this cache and the sliding region spec cache between batches.
+  - Duplicate-id text consistency check on current DBs:
+    - HotpotQA `sent-default-512`: `refs=77349`, `unique_ids=73321`, `text_conflict_ids=0`.
+    - 2Wiki `sent-default-512`: `refs=41569`, `unique_ids=39740`, `text_conflict_ids=0`.
+    - MuSiQue `sent-default-512`: `refs=75732`, `unique_ids=71794`, `text_conflict_ids=0`.
+    - Qasper `sent-original-512`: `refs=33412`, `unique_ids=31639`, `text_conflict_ids=0`.
+  - Commands run:
+    - `python test/test_colbert_window_optimizations.py` (`16` tests passed)
+    - `python test/test_colbert_region_specs.py` (`17` tests passed)
+    - `python test/test_colbert_contiguous_window.py` (`4` tests passed)
+    - `python -m py_compile src/compressor/colbert_window_compressor.py src/materialize/colbert_window.py test/test_colbert_window_optimizations.py test/test_colbert_region_specs.py test/test_colbert_contiguous_window.py`
+    - `black --check src/compressor/colbert_window_compressor.py test/test_colbert_region_specs.py`
+- open issues:
+  - This audit did not prove end-to-end answer F1 monotonicity; it only checked local scoring/memoization/cache-key correctness.
+  - Existing historical experiment outputs remain tied to the exact artifact and code state that produced them.
+- next steps:
+  - If another suspicious setting appears, compare selected `sentence_ids` from a fixed retrieved-chunk input before comparing answer F1, because F1 can change due to added distractor context even when evidence recall is unchanged.
+
+## 2026-07-18 - Refresh F1/input-length paper figures from updated subchunk.xlsx
+
+- objective:
+  - Regenerate paper F1/input-length figures after `docs/paper/subchunk.xlsx` was updated.
+- what was changed:
+  - Re-parsed the `HotpotQA-bsz1`, `2wiki-bsz1`, and `Musique-bsz1` sheets from `docs/paper/subchunk.xlsx`.
+  - Updated F1 plot data files under `docs/paper/figures/`:
+    - `hotpotqa_f1_by_input_len_*.dat`
+    - `2wiki_f1_by_input_len_*.dat`
+    - `musique_f1_by_input_len_*.dat`
+  - Regenerated rendered figure artifacts:
+    - `hotpotqa_f1_by_input_len.{pdf,png}`
+    - `2wiki_f1_by_input_len.{pdf,png}`
+    - `musique_f1_by_input_len.{pdf,png}`
+    - `f1_by_input_len_panels.{pdf,png}`
+  - Regenerated matching `.gp` files so the plots remain reproducible in a gnuplot environment.
+- what was verified:
+  - Kept the existing plot policy: subchunk curves include retention ratios `0.25`, `0.5`, and `0.75`; `0.125` remains excluded from the paper figure.
+  - Confirmed the regenerated panel PNG renders correctly.
+  - Current subchunk values used in the figure:
+    - HotpotQA `k=10`: `(1248.56, 0.4858)`, `(2375.27, 0.4914)`, `(3530.585, 0.4837)`.
+    - HotpotQA `k=20`: `(2367.385, 0.5218)`, `(4620.105, 0.5405)`, `(6879.695, 0.5249)`.
+    - 2Wiki `k=10`: `(1016.205, 0.3858)`, `(1886.225, 0.4102)`, `(2780.065, 0.3679)`.
+    - 2Wiki `k=20`: `(1942.66, 0.4178)`, `(3753.525, 0.3979)`, `(5566.525, 0.3638)`.
+    - MuSiQue `k=10`: `(1168.4, 0.2504)`, `(2198.325, 0.2193)`, `(3227.955, 0.2359)`.
+    - MuSiQue `k=20`: `(2192.71, 0.2406)`, `(4245.02, 0.2358)`, `(6328.535, 0.2374)`.
+- open issues:
+  - ROUGE/retrieval figures were not regenerated in this step because the user request referred to the `-bsz1` result sheets.
+  - The environment still does not have gnuplot available; the PDFs/PNGs were rendered with matplotlib using the same data and visual encoding.
+- next steps:
+  - If retrieval sheets were also changed, regenerate the `*_rouge_by_context_tokens.*` figures separately from the retrieval sheets.
+
+## 2026-07-18 - Tighten F1/input-length figure y-axis ranges
+
+- objective:
+  - Reduce excessive blank space in the refreshed 2Wiki and MuSiQue F1/input-length panels.
+- what was changed:
+  - Updated y-axis ranges in the F1 plot scripts and rendered assets:
+    - 2Wiki: `0.32-0.45` -> `0.33-0.43`.
+    - MuSiQue: `0.16-0.28` -> `0.18-0.26`.
+  - Regenerated:
+    - `2wiki_f1_by_input_len.{gp,pdf,png}`
+    - `musique_f1_by_input_len.{gp,pdf,png}`
+    - `f1_by_input_len_panels.{pdf,png}`
+- what was verified:
+  - Opened the regenerated panel PNG and confirmed the plots use space more effectively without clipping points.
+- open issues:
+  - None for this figure adjustment.
+- next steps:
+  - If the final paper style requires shared y-axis scales across datasets, revisit this choice; current panels use dataset-specific y-ranges for readability.
+
+## 2026-07-18 - Check grid2/grid3/grid4 ColBERT artifact contiguity
+
+- objective:
+  - Verify whether the ColBERT artifacts used by `grid2.yaml`, `grid3.yaml`, and `grid4.yaml` were built under the current contiguous-window policy.
+- what was changed:
+  - No code was changed.
+- what was verified:
+  - The configs do not set `COLBERT_WINDOW_DIR`, so they use the default artifact paths:
+    - `grid2.yaml`: `/mnt/nvme1/datasets/longbench-2wiki/sent-default-512/colbert_window`
+    - `grid3.yaml`: `/mnt/nvme1/datasets/longbench-musique/sent-default-512/colbert_window`
+    - `grid4.yaml`: `/mnt/nvme1/datasets/longbench-qasper/sent-original-512/colbert_window`
+  - Artifact metadata:
+    - 2Wiki: `window_token_budget=180`, `region_spec_reuse_mode=document_window_bound`, `storage_layout=None`.
+    - MuSiQue: `window_token_budget=180`, `region_spec_reuse_mode=document_window_bound`, `storage_layout=compact_only`.
+    - Qasper: `window_token_budget=180`, `region_spec_reuse_mode=document_window_bound`, `storage_layout=None`.
+  - Compact `window_ids_by_row` contiguity check:
+    - HotpotQA default `sent-default-512`: `49,338 / 73,321` window rows are non-contiguous.
+    - 2Wiki: `24,778 / 39,740` window rows are non-contiguous.
+    - MuSiQue: `0 / 71,794` window rows are non-contiguous.
+    - Qasper: `23,011 / 31,639` window rows are non-contiguous.
+  - Compact prompt region specs are contiguous for all three:
+    - HotpotQA default `sent-default-512`: `0 / 41,506` non-contiguous region specs.
+    - 2Wiki: `0 / 21,193` non-contiguous region specs.
+    - MuSiQue: `0 / 40,715` non-contiguous region specs.
+    - Qasper: `0 / 19,561` non-contiguous region specs.
+  - `run/preprocess_colbert_window.sh` defaults `COLBERT_WINDOW_OVERWRITE=False`, so grid preprocess will not automatically rebuild existing artifacts.
+- open issues:
+  - HotpotQA default `sent-default-512`, `grid2.yaml`, and `grid4.yaml` currently point to artifacts whose offline ColBERT encoding windows were built with the old non-contiguous-window behavior.
+  - Their prompt regions are contiguous, but the stored center representations can have been contextualized by non-contiguous document windows.
+- next steps:
+  - Regenerate HotpotQA, 2Wiki, and Qasper ColBERT artifacts with `COLBERT_WINDOW_OVERWRITE=True` before treating their results as results under the current contiguous-window method.
+
+## 2026-07-18 - Regenerate HotpotQA/2Wiki/Qasper ColBERT artifacts and audit contiguity
+
+- objective:
+  - Replace the old non-contiguous-window ColBERT artifacts in-place for HotpotQA, 2Wiki, and Qasper.
+  - Verify that all main default artifacts now satisfy the current contiguous-window method.
+- what was changed:
+  - Regenerated the following artifact directories in their original paths with `COLBERT_WINDOW_OVERWRITE=True`, `COLBERT_WINDOW_TOKEN_BUDGET=180`, and `COLBERT_WINDOW_CENTER_UNIT=sentence`:
+    - `/mnt/nvme1/datasets/longbench-hotpotqa/sent-default-512/colbert_window`
+    - `/mnt/nvme1/datasets/longbench-2wiki/sent-default-512/colbert_window`
+    - `/mnt/nvme1/datasets/longbench-qasper/sent-original-512/colbert_window`
+  - Did not create alternate artifact paths or add per-run `COLBERT_WINDOW_DIR` overrides.
+- correction:
+  - Previous wording that old artifacts had contiguous regions because the window-bound operation itself guaranteed contiguity was wrong.
+  - On the old Qasper artifact, raw `window_ids_by_row ∩ retrieved_chunk` candidates had `12,395 / 33,412` non-contiguous cases.
+  - The final old sidecar region specs had `0` non-contiguous cases because the downstream duplicate/subset filtering removed those raw bad candidates; that is not the method-level guarantee needed for the paper.
+  - The correct guarantee requires document-wise windows themselves to be contiguous. Then the chunk-bound region is the intersection of two contiguous intervals and is contiguous by construction.
+- what was verified:
+  - Preprocess DB validation passed for regenerated artifacts:
+    - HotpotQA: `missing_in_artifact_count=0`, `extra_in_artifact_count=0`, `text_validation=skipped_compact_only`.
+    - 2Wiki: `missing_in_artifact_count=0`, `extra_in_artifact_count=0`, `text_validation=skipped_compact_only`.
+    - Qasper: `missing_in_artifact_count=0`, `extra_in_artifact_count=0`, `text_validation=skipped_compact_only`.
+  - Full JSON-level artifact audit across HotpotQA, 2Wiki, MuSiQue, and Qasper:
+    - All have `storage_layout=compact_only`, `window_token_budget=180`, `center_unit=sentence`, and `region_spec_reuse_mode=document_window_bound`.
+    - HotpotQA: `bad_window_count=0`, `raw_bound_region_bad_noncontiguous=0`, `final_region_bad_noncontiguous=0`.
+    - 2Wiki: `bad_window_count=0`, `raw_bound_region_bad_noncontiguous=0`, `final_region_bad_noncontiguous=0`.
+    - MuSiQue: `bad_window_count=0`, `raw_bound_region_bad_noncontiguous=0`, `final_region_bad_noncontiguous=0`.
+    - Qasper: `bad_window_count=0`, `raw_bound_region_bad_noncontiguous=0`, `final_region_bad_noncontiguous=0`.
+    - DB/artifact cacheable id sets match for all four; duplicate id text conflicts are `0` for all four.
+  - Runtime `ColBERTWindowArtifact` API audit across all DB chunks:
+    - `vectors_for_doc()` returns the expected number of non-empty vectors for every chunk.
+    - `window_cacheable_ids_for_doc()` has no chunk-bound non-contiguous windows.
+    - `region_specs_for_doc(doc, 180)` returns sidecar specs for every chunk and every returned spec is contiguous and in range.
+  - File layout:
+    - `.pt` file count under the four artifact directories is `0`, confirming compact-only artifacts.
+    - Artifact sizes:
+      - HotpotQA: `527M`
+      - 2Wiki: `285M`
+      - MuSiQue: `523M`
+      - Qasper: `228M`
+  - Tests/checks:
+    - `python test/test_colbert_contiguous_window.py` (`4` tests passed)
+    - `python test/test_colbert_region_specs.py` (`17` tests passed)
+    - `python test/test_colbert_window_optimizations.py` (`16` tests passed)
+    - `python -m py_compile src/materialize/colbert_window.py src/compressor/colbert_window_compressor.py src/entrypoint/preprocess_colbert_window.py test/test_colbert_contiguous_window.py test/test_colbert_region_specs.py test/test_colbert_window_optimizations.py`
+    - `black --check src/materialize/colbert_window.py src/compressor/colbert_window_compressor.py src/entrypoint/preprocess_colbert_window.py test/test_colbert_contiguous_window.py test/test_colbert_region_specs.py test/test_colbert_window_optimizations.py`
+  - Grid path check:
+    - `grid.yaml`, `grid2.yaml`, `grid3.yaml`, and `grid4.yaml` do not set `COLBERT_WINDOW_DIR`, so they use the default artifact paths that were just verified.
+- open issues:
+  - Existing experiment results produced before this regeneration are stale relative to the current contiguous-window method.
+  - F1/input-length figures currently reflect the spreadsheet values, not reruns from these freshly regenerated artifacts unless the sheet has already been updated with such reruns.
+- next steps:
+  - Rerun any paper-facing RAG/retrieval grids that must be reported under the current contiguous-window artifact policy.
+
+## 2026-07-18 - Diagnose 2wiki-0718-4 topk20 r0.5 dip
+
+- objective:
+  - Inspect why `outputs/grid_07/2wiki-0718-4` has a local F1 dip at `top_k=20`, `RETAIN_TOKEN_RATIO=0.5`.
+- what was changed:
+  - No code was changed.
+- what was verified:
+  - `summary-longbench-2wiki-summary2.csv` reports:
+    - `k=20,r=0.25`: `input_len=1862.61`, `EM=0.35`, `F1=0.4148819462128286`.
+    - `k=20,r=0.5`: `input_len=3613.205`, `EM=0.305`, `F1=0.3760460557960558`.
+    - `k=20,r=0.75`: `input_len=5472.57`, `EM=0.32`, `F1=0.38546200096200095`.
+  - Recomputed per-example scores from the saved prediction JSONL with the local evaluator:
+    - `k=20,r=0.25`: `F1=0.4273353775853776`.
+    - `k=20,r=0.5`: `F1=0.37922787397787394`.
+    - `k=20,r=0.75`: `F1=0.38546200096200095`.
+    - The small mismatch from the CSV is due to cleaner/evaluator settings; the qualitative dip remains.
+  - Exact passage multiset nesting:
+    - `k=20,r=0.25` passages missing from `k=20,r=0.5`: `0 / 200` queries.
+    - Therefore the `r=0.5` dip is not caused by dropping passages selected at `r=0.25`.
+  - Per-example transition at `k=20`:
+    - `r=0.25 -> r=0.5`: `10` improved, `19` worsened, `171` unchanged; `16` examples worsened by at least `0.5` F1.
+    - Large-drop examples include comparative/entity-choice questions where the smaller context answered correctly and the larger context selected another surface-plausible entity.
+  - `k=10 -> k=20` at `r=0.5`:
+    - `10` improved, `21` worsened, `169` unchanged; `17` examples worsened by at least `0.5` F1.
+    - This supports that the dip is tied to the larger retrieved candidate pool plus larger retained context, not to loss of the lower-ratio context.
+  - Duplicate text in selected context is present:
+    - `k=20,r=0.5`: `136 / 200` queries have exact duplicate output passages; `1008` duplicate passage instances out of `6769`.
+    - A direct DB/compressor diagnostic for query id `16` showed retrieved cacheables are unique by id (`247 / 247`) but heavily duplicated by text (`123` unique texts, `124` duplicate text instances).
+    - The selected context for the same query has `109` selected sentence refs with `109` unique sentence ids, but only `73` unique sentence texts.
+    - Thus current selection deduplicates by cacheable id, not by normalized text. Different DB docs can contain identical sentence text with distinct ids, so duplicate text can still enter the prompt.
+- open issues:
+  - The F1 dip is best explained by added context/distractor sensitivity rather than by selected lower-ratio evidence being removed.
+  - Text-level duplicate removal across retrieved chunks/docs is a separate optimization/correctness question; it would change evaluation behavior and should not be silently patched without an explicit decision.
+- next steps:
+  - If changing behavior is acceptable, test a text-normalized dedup policy after selection and compare F1/input length, especially for 2Wiki `top_k=20,r=0.5`.
+
+## 2026-07-18 - Verify source of LongBench 2Wiki duplicate passages
+
+- objective:
+  - Determine whether duplicate 2Wiki passages were introduced by the local LongBench-to-documents conversion or already present in the official LongBench `2wikimqa` records.
+- what was changed:
+  - No code was changed.
+- what was verified:
+  - Public LongBench documentation describes each v1 sample as a record with `input`, one long `context` string, `answers`, `length`, `dataset`, `language`, `all_classes`, and `_id`; it does not define a deduplicated global retrieval corpus.
+  - Loaded the cached `THUDM/LongBench` `2wikimqa` test split locally:
+    - rows: `200`
+    - columns: `['input', 'context', 'answers', 'length', 'dataset', 'language', 'all_classes', '_id']`
+  - Parsed official `context` strings by `Passage N:` markers:
+    - official passages: `1986`
+    - local `/mnt/nvme1/datasets/longbench-2wiki/documents/doc_*.txt`: `1986`
+    - sequence mismatches between parsed official passages and local documents: `0`
+  - Duplicate passage statistics on official parsed passages:
+    - duplicate passage groups: `175`
+    - duplicate passage instances: `582`
+    - max duplicate group size: `30`
+  - Therefore the duplicate passages are already present in the official LongBench `2wikimqa` test contexts. The local conversion preserved them one-to-one as distinct `doc_N.txt` files; it did not create new text duplicates beyond the official per-example context format.
+- open issues:
+  - Treating LongBench `context` passages as a global retrieval corpus without text-level dedup can retrieve repeated passages under distinct local ids. This is a corpus-construction/evaluation-design artifact of adapting LongBench long-context data to retrieval experiments, not a bug in the local passage extraction.
+- next steps:
+  - If needed, run a clearly labeled ablation with text-level document dedup before indexing. Do not mix those results with the current non-deduplicated LongBench-derived retrieval corpus results without documenting the corpus change.
+
+## 2026-07-18 - Check duplicate-passage issue across LongBench datasets
+
+- objective:
+  - Check whether the LongBench-derived global retrieval corpus duplicate issue appears in HotpotQA, MuSiQue, and Qasper, not only 2Wiki.
+- what was changed:
+  - No code was changed.
+- what was verified:
+  - Local `documents/` exact duplicate document statistics:
+    - HotpotQA: `1722` documents, `1710` unique texts, `12` duplicate groups, `12` duplicate instances, max group `2`.
+    - 2Wiki: `1986` documents, `1404` unique texts, `175` duplicate groups, `582` duplicate instances, max group `30`.
+    - MuSiQue: `1831` documents, `1827` unique texts, `4` duplicate groups, `4` duplicate instances, max group `2`.
+    - Qasper: `200` documents, `148` unique texts, `43` duplicate groups, `52` duplicate instances, max group `3`.
+  - Official LongBench context parsing vs local documents:
+    - HotpotQA: official parsed passages `1722`, local docs `1722`, sequence mismatches `0`; official duplicates match local duplicates.
+    - 2Wiki: official parsed passages `1986`, local docs `1986`, sequence mismatches `0`; official duplicates match local duplicates.
+    - MuSiQue: official parsed passages `2218`, local docs `1831`; official duplicate instances `391`, local duplicate instances `4`, and `local_minus_official_instances=0`, indicating the local MuSiQue corpus has already removed most exact duplicate passage occurrences.
+    - Qasper: official rows `200`, local docs `200`, sequence mismatches `0`; official duplicate full-context documents match local duplicates.
+  - Latest saved selected-context JSONL duplicate text at `top_k=20,r=0.5`:
+    - HotpotQA: `9305` selected passages, `15/200` queries with duplicates, `92` duplicate passage instances, duplicate fraction `0.0099`, max same text per query `2`.
+    - 2Wiki: `6769` selected passages, `136/200` queries with duplicates, `1010` duplicate passage instances, duplicate fraction `0.1492`, max same text per query `17`.
+    - MuSiQue: `8684` selected passages, `27/200` queries with duplicates, `189` duplicate passage instances, duplicate fraction `0.0218`, max same text per query `2`.
+    - Qasper: `12946` selected passages, `188/200` queries with duplicates, `3064` duplicate passage instances, duplicate fraction `0.2367`, max same text per query `3`.
+- conclusion:
+  - The duplicate-passage artifact is severe for 2Wiki and Qasper under the current LongBench-derived global retrieval setup.
+  - It is minor for HotpotQA.
+  - MuSiQue official LongBench contexts contain many repeated passage occurrences, but the current local corpus is mostly text-deduplicated, so the runtime prompt duplicate effect is much smaller than 2Wiki/Qasper.
+- next steps:
+  - Treat LongBench-derived global retrieval results as adapted retrieval-compression experiments, not as canonical open-corpus RAG results.
+  - If text-level dedup is tested, document it as a corpus construction change and rerun all affected baselines.
+
+## 2026-07-18 - Rebuild 2Wiki sent-default-512 DB with document-text dedup
+
+- objective:
+  - Keep local `documents/` unchanged, but rebuild the `longbench-2wiki/sent-default-512` vector DB with exact duplicate documents removed by normalized full-text hash.
+- what was changed:
+  - Added `DEDUPLICATE_DOCUMENTS_BY_HASH` preprocessing support.
+    - When enabled, preprocessing reads each source document, hashes `" ".join(text.split())`, and skips later documents with the same hash.
+    - For reproducibility, dedup-enabled preprocessing processes `doc_N.txt` files in numeric `N` order so the retained representative is deterministic.
+  - Added DB-aware ColBERT-window artifact construction.
+    - When `db_dir` is supplied to `preprocess_colbert_window`, the artifact builder derives the parent document ids present in the DB and materializes only those documents.
+    - No extra runtime environment variable is required; this follows the existing `db_dir` argument.
+  - Updated `docs/eval_protocol.md` to state that deduplicated DBs are a different corpus condition and require matching ColBERT-window artifacts.
+  - Deleted and rebuilt:
+    - `/mnt/nvme1/datasets/longbench-2wiki/sent-default-512/db`
+    - `/mnt/nvme1/datasets/longbench-2wiki/sent-default-512/colbert_window`
+- what was verified:
+  - DB preprocessing command:
+    - `DATASET=longbench-2wiki PREPROCESS_SUBDIR=sent-default-512 SPLITTER=sentence CACHEABLE_CHUNK_SIZE=None RETRIEVABLE_CHUNK_SIZE=512 MATERIALIZE_CACHE=False MATERIALIZE_DB=True MATERIALIZE_COMPARE_EMBEDS=False MATERIALIZE_COLBERT_WINDOW=False DEDUPLICATE_DOCUMENTS_BY_HASH=True CHROMA_EMBED_DEVICE=cpu bash run/preprocess.sh`
+  - DB preprocessing output:
+    - input documents: `1986`
+    - skipped duplicate documents: `582`
+    - retained documents: `1404`
+    - Chroma collection count: `2831` retrievable chunks
+    - DB size after rebuild: `85M`
+  - First ColBERT artifact rebuild from all `documents/` failed validation, as expected for a deduplicated DB:
+    - DB cacheables: `30017`
+    - artifact cacheables: `39740`
+    - extra artifact cacheables: `9723`
+    - missing artifact cacheables: `0`
+    - text mismatches: `0`
+  - After DB-aware artifact rebuild:
+    - artifact input documents: `1404`
+    - artifact cacheables: `30017`
+    - DB cacheables: `30017`
+    - missing artifact cacheables: `0`
+    - extra artifact cacheables: `0`
+    - text mismatches: `0`
+    - region spec chunk count: `2831`
+    - region spec count: `16070`
+    - region spec reuse mode: `document_window_bound`
+  - Tests/checks:
+    - `python -m py_compile src/materialize/materialize.py src/entrypoint/preprocess.py test/test_document_preprocessor_dedup.py`
+    - `python test/test_document_preprocessor_dedup.py` (`3` tests passed)
+    - `python test/test_retrievable_overlap_mapping.py` (`4` tests passed)
+    - `python -m py_compile src/materialize/colbert_window.py src/entrypoint/preprocess_colbert_window.py`
+    - `python test/test_colbert_window_db_doc_filter.py` (`3` tests passed)
+    - `black --check src/materialize/colbert_window.py src/entrypoint/preprocess_colbert_window.py test/test_colbert_window_db_doc_filter.py src/materialize/materialize.py src/entrypoint/preprocess.py test/test_document_preprocessor_dedup.py`
+- open issues:
+  - Results from this deduplicated 2Wiki DB are not directly comparable to older non-deduplicated 2Wiki retrieval/RAG results because the retrieval corpus changed.
+  - Current baseline DBs/artifacts for other datasets were not rebuilt in this session.
+- next steps:
+  - Rerun any paper-facing 2Wiki RAG/retrieval grids that should use the deduplicated corpus condition.
+  - If using dedup as a main setting, rebuild the matching vanilla/baseline DB condition explicitly rather than mixing dedup and non-dedup corpora.
+
+## 2026-07-18 - Rebuild 2Wiki MatKV default DBs with document-text dedup
+
+- objective:
+  - Rebuild the `longbench-2wiki` MatKV/vanilla comparison DBs under the same normalized full-text document dedup condition used for `sent-default-512`.
+- what was changed:
+  - Updated `test/rebuild_fixed_matkv_default_dbs.py`:
+    - Added `--deduplicate-documents-by-hash`.
+    - Dedup hash is `sha256(" ".join(text.split()))`.
+    - Document traversal is deterministic by numeric `doc_N.txt` order.
+    - `--overwrite` now deletes only the target `db/` directory, not the whole `matkv-default-*` directory, so existing `colbert_fixed_chunk*` artifact directories are not silently removed.
+  - Rebuilt only the DB directories:
+    - `/mnt/nvme1/datasets/longbench-2wiki/matkv-default-128/db`
+    - `/mnt/nvme1/datasets/longbench-2wiki/matkv-default-256/db`
+    - `/mnt/nvme1/datasets/longbench-2wiki/matkv-default-512/db`
+- what was verified:
+  - Command:
+    - `python test/rebuild_fixed_matkv_default_dbs.py --datasets longbench-2wiki --chunk-sizes 128 256 512 --overwrite --deduplicate-documents-by-hash`
+  - Builder output:
+    - `matkv-default-128`: rows `8991`, token_count min/max `1/127`, skipped duplicate documents `582`, retained documents `1404`.
+    - `matkv-default-256`: rows `4854`, token_count min/max `1/255`, skipped duplicate documents `582`, retained documents `1404`.
+    - `matkv-default-512`: rows `2831`, token_count min/max `2/511`, skipped duplicate documents `582`, retained documents `1404`.
+  - Independent SQLite row counts:
+    - `128`: `8991`
+    - `256`: `4854`
+    - `512`: `2831`
+  - Chroma API collection counts:
+    - `128`: `8991`
+    - `256`: `4854`
+    - `512`: `2831`
+  - DB sizes after rebuild:
+    - `matkv-default-128/db`: `67M`
+    - `matkv-default-256/db`: `76M`
+    - `matkv-default-512/db`: `62M`
+  - Existing `colbert_fixed_chunk` and `colbert_fixed_chunk_docmax512` directories under the three `matkv-default-*` directories were preserved.
+  - Tests/checks:
+    - `python -m py_compile test/rebuild_fixed_matkv_default_dbs.py`
+    - `black --check test/rebuild_fixed_matkv_default_dbs.py`
+- open issues:
+  - These deduplicated MatKV DBs are a different corpus condition from older non-deduplicated MatKV results.
+  - Existing fixed-chunk ColBERT reranking artifacts under `matkv-default-*` were not rebuilt in this step. They may contain rows for duplicate documents that are no longer in the DB; vanilla MatKV evaluation does not use them, but reranking experiments should be checked or regenerated before use.
+- next steps:
+  - Rerun 2Wiki vanilla/MatKV comparison grids against these deduplicated DBs if dedup is the intended comparison condition.
+  - If fixed-chunk ColBERT reranking is also reported under dedup, validate or rebuild the matching `colbert_fixed_chunk_docmax512` artifacts.
+
+## 2026-07-18 - Rebuild HotpotQA/Qasper/MuSiQue dedup DBs and artifacts
+
+- objective:
+  - Rebuild `longbench-hotpotqa`, `longbench-qasper`, and `longbench-musique` under the same duplicate-removed corpus condition used for `longbench-2wiki`.
+  - Build sentence subchunk DBs, ColBERT window compact artifacts, and MatKV default DBs.
+  - Avoid loading a full LLM when preprocessing only needs tokenization and `MATERIALIZE_CACHE=False`.
+- what was changed:
+  - Updated `src/entrypoint/preprocess.py`:
+    - Added `TokenizerOnlyModel`, which loads only `AutoTokenizer`.
+    - Uses `LLMModel` only when `materialize_cache=True`; otherwise uses `TokenizerOnlyModel`.
+    - This keeps DB/tokenization preprocessing usable without materializing KV cache or loading the full model.
+  - Updated `test/rebuild_fixed_matkv_default_dbs.py`:
+    - Added `longbench-qasper` to the MatKV default rebuild dataset registry.
+  - Rebuilt sentence DBs:
+    - `/mnt/nvme1/datasets/longbench-hotpotqa/sent-default-512/db`
+    - `/mnt/nvme1/datasets/longbench-qasper/sent-default-512/db`
+    - `/mnt/nvme1/datasets/longbench-musique/sent-default-512/db`
+  - Rebuilt ColBERT window compact artifacts:
+    - `/mnt/nvme1/datasets/longbench-hotpotqa/sent-default-512/colbert_window/compact`
+    - `/mnt/nvme1/datasets/longbench-qasper/sent-default-512/colbert_window/compact`
+    - `/mnt/nvme1/datasets/longbench-musique/sent-default-512/colbert_window/compact`
+  - Rebuilt MatKV default DBs for chunk sizes `128`, `256`, and `512`:
+    - `/mnt/nvme1/datasets/longbench-hotpotqa/matkv-default-{128,256,512}/db`
+    - `/mnt/nvme1/datasets/longbench-qasper/matkv-default-{128,256,512}/db`
+    - `/mnt/nvme1/datasets/longbench-musique/matkv-default-{128,256,512}/db`
+- what was verified:
+  - Duplicate removal counts:
+    - HotpotQA: input `1722`, retained `1710`, duplicates `12`.
+    - Qasper: input `200`, retained `148`, duplicates `52`.
+    - MuSiQue: input `1831`, retained `1827`, duplicates `4`.
+  - Sentence DB preprocessing completed:
+    - HotpotQA: average document length `1473.18` tokens, average chunks per document `42.39`, max chunk length `1891`.
+    - Qasper: average document length `5062.66` tokens, average chunks per document `162.26`, max chunk length `364`.
+    - MuSiQue: average document length `1357.22` tokens, average chunks per document `38.69`, max chunk length `2563`.
+  - MatKV default DB rebuild summaries:
+    - HotpotQA rows: `128=20678`, `256=10722`, `512=5818`.
+    - Qasper rows: `128=5974`, `256=3015`, `512=1538`.
+    - MuSiQue rows: `128=20420`, `256=10654`, `512=5834`.
+  - ColBERT window artifact validation against DB passed:
+    - HotpotQA: `num_docs=1710`, artifact/DB cacheables `72494`, missing/extra/text mismatch `0/0/0`.
+    - Qasper: `num_docs=148`, artifact/DB cacheables `24014`, missing/extra/text mismatch `0/0/0`.
+    - MuSiQue: `num_docs=1827`, artifact/DB cacheables `70679`, missing/extra/text mismatch `0/0/0`.
+  - CUDA was unavailable in this session:
+    - `nvidia-smi` could not communicate with the NVIDIA driver.
+    - PyTorch reported `torch.cuda.is_available() == False` and `device_count == 0`.
+    - ColBERT window artifacts were therefore built on CPU.
+  - Tests/checks:
+    - `python -m py_compile src/entrypoint/preprocess.py test/rebuild_fixed_matkv_default_dbs.py`
+    - `black --check src/entrypoint/preprocess.py test/rebuild_fixed_matkv_default_dbs.py`
+    - Smoke-tested `TokenizerOnlyModel("meta-llama/Llama-3.1-8B-Instruct")`.
+- open issues:
+  - These deduplicated DBs/artifacts are a different corpus condition from older non-deduplicated results, so old and new retrieval/RAG numbers are not directly comparable.
+  - GPU was unavailable in the current runtime; future ColBERT builds can use CUDA once the driver/runtime is fixed.
+- next steps:
+  - Run downstream retrieval/RAG evaluations against the deduplicated HotpotQA/Qasper/MuSiQue DBs if this is the intended comparison condition.
+  - If reporting fixed-chunk ColBERT reranking for MatKV DBs, separately validate or rebuild the matching fixed-chunk ColBERT artifacts under the deduplicated corpus condition.
+
+## 2026-07-18 - Audit dedup grid configs and remove stale Qasper sent-original dirs
+
+- objective:
+  - Ensure the main HotpotQA/MuSiQue/Qasper RAG and MatKV grid configs point at the newly rebuilt deduplicated DB/artifact paths.
+  - Remove stale `longbench-qasper/sent-original-*` directories that could be confused with the new dedup DB condition.
+- what was changed:
+  - Updated `run/grid_search/grid_matkv3.yaml`:
+    - Changed `run_name` from `musique-0719` to `musique-0719-matkv` so MuSiQue MatKV results do not share the sliding-region results directory.
+  - Deleted stale directories:
+    - `/mnt/nvme1/datasets/longbench-qasper/sent-original-128`
+    - `/mnt/nvme1/datasets/longbench-qasper/sent-original-256`
+    - `/mnt/nvme1/datasets/longbench-qasper/sent-original-512`
+    - `/mnt/nvme1/datasets/longbench-qasper/sent-original-1024`
+- what was verified:
+  - Checked these grid configs:
+    - `run/grid_search/grid.yaml`
+    - `run/grid_search/grid3.yaml`
+    - `run/grid_search/grid4.yaml`
+    - `run/grid_search/grid_matkv.yaml`
+    - `run/grid_search/grid_matkv3.yaml`
+    - `run/grid_search/grid_matkv4.yaml`
+  - All three sliding-region grids now use `DATA_SUBDIR=sent-default-512`.
+  - All three MatKV grids use `DATA_SUBDIR=matkv-default-{128,256,512}`.
+  - No `sent-original` references remain in the six main grid configs.
+  - All referenced DB directories exist.
+  - `find /mnt/nvme1/datasets/longbench-qasper -maxdepth 1 -type d -name 'sent-original*'` returns no directories.
+- open issues:
+  - `sent-original-*` is still referenced by separate `*-lb200-original` retrieval-evidence configs and their corresponding dataset directories still exist. Those are a separate dataset condition and were not removed.
+- next steps:
+  - Run the six main grids against the deduplicated DB/artifact paths.
+
+## 2026-07-19 - Audit 1B SLLM grid configs before launch
+
+- objective:
+  - Check whether the 1B RAG grids can be launched for sliding-region subchunk and MatKV/vanilla baselines.
+  - Verify YAML settings, referenced DB/artifact paths, and output directory collisions without changing evaluation logic.
+- what was changed:
+  - No code or config changes were made.
+- what was verified:
+  - Checked these configs:
+    - `run/grid_search/grid.yaml`
+    - `run/grid_search/grid2.yaml`
+    - `run/grid_search/grid3.yaml`
+    - `run/grid_search/grid4.yaml`
+    - `run/grid_search/grid_matkv.yaml`
+    - `run/grid_search/grid_matkv2.yaml`
+    - `run/grid_search/grid_matkv3.yaml`
+    - `run/grid_search/grid_matkv4.yaml`
+  - All eight configs use `MODEL_NAME=meta-llama/Llama-3.2-1B-Instruct` and `EVAL_BSZ=1`.
+  - Sliding-region configs use `DATA_SUBDIR=sent-default-512`, `COMPRESS_METHOD=colbert_sliding_region`, `TOP_K={10,20}`, and `RETAIN_TOKEN_RATIO={0.15,0.25,0.5,0.75}`.
+  - MatKV/vanilla configs use `DATA_SUBDIR={matkv-default-128,matkv-default-256,matkv-default-512}`, `TOP_K={10,20}`, and `COMPRESS_METHOD=""` through the `default_vanilla` preprocess group.
+  - `run/eval.sh` defaults apply where YAML omits them, including `TOTAL_NUM=200` and `COLBERT_WINDOW_DIR=$DATASET_PATH/$DATA_SUBDIR/colbert_window`.
+  - Sliding-region DB row counts match compact artifact chunk counts:
+    - HotpotQA: DB `5807`, artifact chunks `5807`, cacheables `72494`, mode `document_window_bound`, region budget `180`.
+    - 2Wiki: DB `2831`, artifact chunks `2831`, cacheables `30017`, mode `document_window_bound`, region budget `180`.
+    - MuSiQue: DB `5823`, artifact chunks `5823`, cacheables `70679`, mode `document_window_bound`, region budget `180`.
+    - Qasper: DB `1531`, artifact chunks `1531`, cacheables `24014`, mode `document_window_bound`, region budget `180`.
+  - MatKV DB row counts exist:
+    - HotpotQA: `128=20678`, `256=10722`, `512=5818`.
+    - 2Wiki: `128=8991`, `256=4854`, `512=2831`.
+    - MuSiQue: `128=20420`, `256=10654`, `512=5834`.
+    - Qasper: `128=5974`, `256=3015`, `512=1538`.
+  - Output directories for the new `*-0719-*-sllm` run names do not yet exist under `outputs/grid_07`, so these runs should not mix with earlier `0719` non-`sllm` outputs.
+  - `python -m py_compile` passed for the touched eval/compressor/materialization entrypoints involved in these paths.
+- open issues:
+  - These grids run on the deduplicated DB/artifact condition and are not directly comparable to older non-deduplicated results.
+  - Actual launch still depends on CUDA availability and GPU lock/exclusive-process state.
+- next steps:
+  - Launch with `run/run_grid.sh --wait-gpu --wait-lock <grid-yaml>` when GPU is available.
+
+## 2026-07-19 - Audit throughput grid configs
+
+- objective:
+  - Check `grid_th.yaml`, `grid_th2.yaml`, and `grid_th3.yaml` before launch.
+- what was changed:
+  - No code or config changes were made.
+- what was verified:
+  - `run/grid_search/grid_th.yaml` targets `longbench-hotpotqa`, run name `hotpotqa-0719-th`.
+  - `run/grid_search/grid_th2.yaml` targets `longbench-2wiki`, run name `2wiki-0719-th`.
+  - `run/grid_search/grid_th3.yaml` targets `longbench-musique`, run name `musique-0719-th`.
+  - All three use `DATA_SUBDIR=sent-default-512`, `COMPRESS_METHOD=colbert_sliding_region`, `TOP_K={10,20}`, and `EVAL_USE_PAST_CACHE=False`.
+  - All three use `COLBERT_FINAL_TOKEN_BUDGET` axes rather than `RETAIN_TOKEN_RATIO`.
+  - All three use `MODEL_NAME=meta-llama/Llama-3.1-8B-Instruct` and `EVAL_BSZ=auto`, so they are throughput grids for the 8B model, not 1B bsz1 grids.
+  - Output directories for `hotpotqa-0719-th`, `2wiki-0719-th`, and `musique-0719-th` do not yet exist under `outputs/grid_07`.
+- open issues:
+  - Do not launch these configs as-is if the intended run is specifically the 1B model.
+  - There is no `grid_th4.yaml` in this checked set, so Qasper throughput is not covered by these three files.
+- next steps:
+  - If 1B throughput runs are desired, either create separate `*-sllm-th` configs or explicitly change model/run names to avoid mixing them with 8B throughput results.
+
+## 2026-07-19 - Verify throughput grids use latest sliding-region semantics
+
+- objective:
+  - Confirm that `grid_th.yaml`, `grid_th2.yaml`, and `grid_th3.yaml` use the latest sliding-region artifact and selection behavior for the intended 8B throughput runs.
+- what was changed:
+  - No code or config changes were made.
+- what was verified:
+  - The three throughput configs are intentionally 8B configs:
+    - `MODEL_NAME=meta-llama/Llama-3.1-8B-Instruct`
+    - `EVAL_BSZ=auto`
+  - They use `DATA_SUBDIR=sent-default-512`; no old `sent-original` path is referenced.
+  - Runtime `COLBERT_WINDOW_DIR` resolves through `run/eval.sh` to `$DATASET_PATH/$DATA_SUBDIR/colbert_window`.
+  - The compact artifacts for HotpotQA, 2Wiki, and MuSiQue all have `region_spec_reuse_mode=document_window_bound` and `region_token_budget=180`:
+    - HotpotQA: chunks `5807`, specs `41037`.
+    - 2Wiki: chunks `2831`, specs `16070`.
+    - MuSiQue: chunks `5823`, specs `40058`.
+  - `SlidingRegionColBERTWindowSummarizer._cached_sliding_region_specs()` uses materialized sidecar specs when present; with these artifacts it does not rebuild chunk-local regions at query time.
+  - `SlidingRegionColBERTWindowSummarizer._select_sliding_regions()` with `COLBERT_FINAL_TOKEN_BUDGET` adds a selected region's novel subchunks first and stops only after `used_tokens >= final_token_budget`, so it does not reject a high-scoring region solely because adding it would cross the budget.
+  - Artifact region specs were checked for invariants:
+    - center index is inside the selected range.
+    - selected indices are contiguous source-order ranges.
+    - no empty specs were found.
+  - `python test/test_colbert_region_specs.py` passed: `17` tests.
+- open issues:
+  - Monotonic context inclusion holds for the same retrieved chunks and same scored-region order across different `COLBERT_FINAL_TOKEN_BUDGET` values; it is not a claim across different retrieval results or different model/scoring settings.
+- next steps:
+  - Run `grid_th.yaml`, `grid_th2.yaml`, and `grid_th3.yaml` as 8B throughput grids when GPU resources are available.
+
+## 2026-07-19 - Fix ColBERT sliding-region final budget accounting
+
+- objective:
+  - Correct two evaluation-path bugs in `colbert_sliding_region` final prompt budget handling before launching 1B/8B grids.
+- what was changed:
+  - Updated `src/compressor/colbert_window_compressor.py`:
+    - Final budget tokenization now requires and uses `MODEL_NAME`, i.e. the evaluated LLM tokenizer.
+    - Removed the separate `COLBERT_BUDGET_TOKENIZER` / artifact-tokenizer fallback from final budget accounting.
+    - In the main `SlidingRegionColBERTWindowSummarizer._select_sliding_regions()` fixed-budget path, removed per-subchunk pre-checks that skipped novel subchunks before adding a selected region.
+    - The main sliding-region path now adds the selected region's novel subchunks first and stops after `used_tokens >= final_token_budget`.
+  - Updated `docs/eval_protocol.md` to state that ColBERT final budget accounting uses the evaluated `MODEL_NAME` tokenizer.
+  - Updated `test/test_colbert_region_specs.py` with tests for:
+    - `MODEL_NAME`-based budget tokenizer resolution.
+    - failure when `MODEL_NAME` is absent.
+    - adding a selected sliding region before stopping on budget overflow.
+- what was verified:
+  - `python test/test_colbert_region_specs.py` passed: `20` tests.
+  - `python -m py_compile src/compressor/colbert_window_compressor.py test/test_colbert_region_specs.py` passed.
+  - `black --check src/compressor/colbert_window_compressor.py test/test_colbert_region_specs.py` passed after formatting the test file.
+  - Direct line check confirmed the main `colbert_sliding_region` selection loop no longer contains `token_len > final_token_budget` or `used_tokens + novel_token_count + token_len > final_token_budget` pre-checks.
+- open issues:
+  - Other compressor variants still contain their own pre-check semantics:
+    - `BudgetColBERTWindowSummarizer`
+    - `FixedRegionColBERTSummarizer`
+    - `SupportPrunedSlidingRegionColBERTWindowSummarizer`
+    - `SupportCleanupSlidingRegionColBERTWindowSummarizer`
+  - These are not the main `colbert_sliding_region` path used by `grid.yaml`, `grid2.yaml`, `grid3.yaml`, `grid4.yaml`, `grid_th.yaml`, `grid_th2.yaml`, or `grid_th3.yaml`.
+- next steps:
+  - Treat results produced before this fix as not directly comparable to results produced after this fix.
+  - Re-run the relevant RAG grids after this fix if they depend on `RETAIN_TOKEN_RATIO` or `COLBERT_FINAL_TOKEN_BUDGET`.
+
+## 2026-07-19 - Audit post-fix sliding-region eval path
+
+- objective:
+  - Check the remaining risk areas after the final-budget fixes:
+    - ColBERT variant budget semantics.
+    - retrieval, prompt serialization, metrics, batching, and cache policy for target grids.
+    - dataset duplicate/boundary/fragmentation edge cases.
+    - feasible dynamic tests in the current runtime.
+- what was changed:
+  - Updated `docs/eval_protocol.md` to explicitly document `colbert_sliding_region` soft-cap semantics:
+    - selected regions are added whole.
+    - the selector stops after accumulated prompt-visible tokens reach or exceed the budget.
+    - selected context may exceed the configured/derived budget by the final selected region.
+  - Added a unit test that prompt-visible token lengths are cached by `cacheable_id` after the LLM tokenizer is called once for missing cacheables.
+- what was verified:
+  - ColBERT budget semantics:
+    - Main `colbert_sliding_region` uses `MODEL_NAME` for final budget tokenization.
+    - Main `colbert_sliding_region` no longer has per-subchunk budget pre-checks in `_select_sliding_regions()`.
+    - `colbert_sliding_region_rerank_pre_filter`, `colbert_sliding_region_rerank_post_filter`, `colbert_sliding_region_boundary_expansion`, and `colbert_sliding_region_pruned` reuse the main sliding-region selector.
+    - `colbert_sliding_region_support_cleanup` and `colbert_sliding_region_support_pruned` have separate selectors and do not currently share the same region-level soft-cap semantics. They are not used by the checked main grids.
+  - Tokenizer efficiency:
+    - Final budget token lengths are computed by the evaluated LLM tokenizer, but cached in `_token_len_cache` by `cacheable_id`.
+    - `clear_inter_batch_cache()` clears retrieved-vector/spec caches, not `_token_len_cache`.
+  - Target eval path:
+    - `EVAL_USE_PAST_CACHE=False` grids run Chroma retrieval -> compressor -> full visible prompt -> HF generation -> `acc_metric.evaluate`.
+    - Prompt serialization uses `PromptProcessor.format_passage_chunk()`, i.e. `text.strip() + "\n\n"` with the configured passage prefix, matching final-budget accounting format.
+    - Output `ctxs` are generated from the post-compression cacheables used to build the prompt.
+    - Metrics are dataset-selected in `src/acc_metric.py`; HotpotQA/2Wiki/MuSiQue use Hotpot-style EM/F1, Qasper uses LongBench QA alias-aware EM/F1.
+  - Artifact/data edge cases:
+    - Compact artifact region specs for HotpotQA, 2Wiki, MuSiQue, and Qasper have no empty specs and no non-contiguous selected-index ranges.
+    - No duplicate cacheable IDs were found inside retrieved chunks.
+    - Duplicate sentence text exists inside some chunks, but with distinct cacheable IDs:
+      - HotpotQA: `54` chunks, `99` duplicate text items.
+      - 2Wiki: `18` chunks, `30` duplicate text items.
+      - MuSiQue: `38` chunks, `71` duplicate text items.
+      - Qasper: `8` chunks, `12` duplicate text items.
+    - DB chunk token counts exist for all checked chunks; max token count is `512`.
+  - Current grid file state:
+    - `grid.yaml`, `grid2.yaml`, `grid3.yaml`, and `grid4.yaml` currently use 8B run names `*-0720`, not the earlier `*-0719-sllm` 1B names.
+    - `grid_matkv*.yaml` still use 1B `*-0719-matkv-sllm` names.
+    - `grid_th*.yaml` use 8B `*-0720-th` names.
+  - Output directory state:
+    - Existing output dirs were found for:
+      - `outputs/grid_07/hotpotqa-0720` with `3` completed result rows.
+      - all four `outputs/grid_07/*-0719-matkv-sllm` dirs with `6` completed result rows each.
+    - Running those same configs as-is can skip completed cases or mix old and new post-fix results in the same run directory.
+  - Tests/checks:
+    - `python test/test_colbert_region_specs.py` passed: `21` tests.
+    - `python -m py_compile src/compressor/colbert_window_compressor.py test/test_colbert_region_specs.py src/engine.py src/entrypoint/eval.py src/vectordb.py src/acc_metric.py` passed.
+    - `black --check src/compressor/colbert_window_compressor.py test/test_colbert_region_specs.py` passed.
+- open issues:
+  - End-to-end LLM smoke was not run because `nvidia-smi` failed to communicate with the NVIDIA driver in this runtime.
+  - Existing `*-0720` and `*-0719-matkv-sllm` output directories contain pre-existing results. Use fresh run names or explicitly clean/archive those output directories before post-fix evaluation.
+  - Duplicate sentence text with distinct IDs remains a dataset/chunk-content property, not an ID collision. It can still create repeated prompt text when selected from different positions.
+- next steps:
+  - Before launching post-fix grids, choose fresh run names or remove/archive stale output directories.
+  - When GPU is available, run a small `TOTAL_NUM` smoke for one ratio grid and one fixed-budget throughput grid before full launch.
+
+## 2026-07-19 - Remove unsupported support-pruning ColBERT variants
+
+- objective:
+  - Remove ColBERT sliding-region variants whose selection semantics diverged from the main region-level soft-budget path and are not part of the target experiments.
+- what was changed:
+  - Removed `SupportPrunedSlidingRegionColBERTWindowSummarizer` from `src/compressor/colbert_window_compressor.py`.
+  - Removed `SupportCleanupSlidingRegionColBERTWindowSummarizer` from `src/compressor/colbert_window_compressor.py`.
+  - Removed factory imports and method registrations:
+    - `colbert_sliding_region_support_pruned`
+    - `colbert_sliding_region_support_cleanup`
+  - Removed the optimization unit test that depended on the deleted support-cleanup variant.
+  - Updated existing optimization tests to assert the current `colbert_sliding_region` soft-budget behavior and `MODEL_NAME` tokenizer policy.
+- what was verified:
+  - No remaining references to the removed classes or method strings were found under `src`, `run`, `test`, or `docs`.
+  - `python test/test_colbert_window_optimizations.py` passed: `23` tests.
+  - `python test/test_colbert_region_specs.py` passed: `21` tests.
+  - `python -m py_compile src/compressor/colbert_window_compressor.py src/compressor/factory.py test/test_colbert_window_optimizations.py test/test_colbert_region_specs.py` passed.
+  - `black --check src/compressor/colbert_window_compressor.py src/compressor/factory.py test/test_colbert_window_optimizations.py test/test_colbert_region_specs.py` passed.
+- open issues:
+  - Final-budget prompt-visible token lengths are currently computed by the evaluated `MODEL_NAME` tokenizer at runtime for cacheables not yet in `_token_len_cache`.
+  - This is correct but not the final optimized design. The optimized design is to store prompt-visible LLM token counts per cacheable during offline DB/materialization and read them at query time.
+  - Existing DB cacheable payloads do not currently contain that per-cacheable prompt-visible token count, so moving this offline requires a DB/artifact protocol change and DB rebuild.
+- next steps:
+  - Decide whether to add a per-cacheable `prompt_token_count` field to `CacheableChunk` payloads and rebuild the sentence DBs before full post-fix evaluation.
+
+## 2026-07-19 - Move final-budget token lengths to cacheable payloads
+
+- objective:
+  - Avoid repeated query-time LLM tokenizer calls for ColBERT final-budget accounting.
+  - Store per-cacheable prompt-visible token lengths during DB/materialization.
+- what was changed:
+  - Updated `src/chunk.py`:
+    - Added optional `CacheableChunk.prompt_token_count`.
+    - Included `prompt_token_count` in clone, payload serialization, and payload deserialization.
+  - Updated `src/materialize/splitter/base.py`:
+    - Added `_prompt_visible_token_count(text)`, using the materialization model tokenizer over `text.strip() + "\n\n"` with `add_special_tokens=False`.
+    - Populates `prompt_token_count` for fixed-size, sentence, resolved-sentence, PN-mapped sentence, and semantic cacheables.
+  - Updated `src/compressor/colbert_window_compressor.py`:
+    - `_cacheable_token_len()` and `_cacheable_token_lens()` now use `cacheable.prompt_token_count` when present.
+    - Runtime `MODEL_NAME` tokenizer fallback remains only for legacy payloads without `prompt_token_count`.
+  - Updated docs:
+    - `docs/eval_protocol.md`
+    - `docs/method.md`
+  - Updated tests:
+    - `test/test_cacheable_payload.py`
+    - `test/test_colbert_region_specs.py`
+- what was verified:
+  - Payload tests were run manually because `pytest` is not installed:
+    - `test_cacheable_from_payload_ignores_legacy_runtime_unused_fields`
+    - `test_cacheable_payload_omits_runtime_unused_fields`
+    - `test_cacheable_payload_round_trips_prompt_token_count`
+    - `test_splitter_prompt_visible_token_count_matches_budget_format`
+  - `python test/test_colbert_region_specs.py` passed: `22` tests.
+  - `python test/test_colbert_window_optimizations.py` passed: `23` tests.
+  - `python -m py_compile src/chunk.py src/materialize/splitter/base.py src/compressor/colbert_window_compressor.py src/compressor/factory.py test/test_cacheable_payload.py test/test_colbert_region_specs.py test/test_colbert_window_optimizations.py` passed.
+  - `black --check src/chunk.py src/materialize/splitter/base.py src/compressor/colbert_window_compressor.py src/compressor/factory.py test/test_cacheable_payload.py test/test_colbert_region_specs.py test/test_colbert_window_optimizations.py` passed.
+  - Existing DB samples under `sent-default-512` do not contain `prompt_token_count`:
+    - HotpotQA sample: `0/1329`.
+    - 2Wiki sample: `0/1099`.
+    - MuSiQue sample: `0/1330`.
+    - Qasper sample: `0/1626`.
+- open issues:
+  - Existing DBs remain usable but will fall back to runtime `MODEL_NAME` tokenization for final-budget lengths.
+  - To get the optimized no-tokenizer-query-time path, sentence DBs must be rebuilt so `cacheables_json` includes `prompt_token_count`.
+  - Directly updating existing Chroma SQLite metadata in place is possible in principle but not recommended here. It requires rewriting `cacheables_json` inside Chroma's internal metadata tables and risks corrupting or partially updating the persisted DB. A clean DB rebuild is safer and reproducible.
+- next steps:
+  - Rebuild the relevant `sent-default-512/db` directories before full post-fix ColBERT sliding-region evaluation.
+  - Rebuild matching ColBERT compact artifacts after DB rebuild so DB/artifact cacheable IDs and chunk mappings stay aligned.
+
+## 2026-07-19 - Investigate lower auto throughput batch sizes in 0719 grids
+
+- objective:
+  - Explain why `grid_th.yaml`, `grid_th2.yaml`, and `grid_th3.yaml` selected smaller auto `EVAL_BSZ` values than earlier throughput runs.
+- what was changed:
+  - No code or config changes were made.
+- what was verified:
+  - Compared 0719 throughput results against earlier 0708 throughput runs under `outputs/grid_07`.
+  - Auto-bsz probing settings are effectively the same between 0708 and 0719 sliding-region throughput runs:
+    - `search=binary`
+    - `step=4`
+    - `probe_batches=3`
+    - `probe_total_num_max=192`
+    - HotpotQA max candidate `128`; 2Wiki/MuSiQue 0719 max candidate `192` versus 0708 max candidate `128`.
+  - 0719 selected smaller `EVAL_BSZ` mainly where actual model input length increased:
+    - 2Wiki `TOP_K=10`, budget `600`: 0708 `bsz=128`, avg input `647.63`; 0719 `bsz=68`, avg input `904.76`.
+    - MuSiQue `TOP_K=10`, budget `1200` in 0708 had `bsz=72`, avg input `1212.145`; 0719 uses budget `800` and still has avg input `1127.285` with `bsz=36`.
+    - HotpotQA 0719 starts at budget `800`, so it should not be directly compared to the 0708 budget `600` row.
+  - The likely semantic cause is the 2026-07-17 monotonic sliding-region budget change (`ab74f9a`):
+    - Previous selection skipped individual novel sentences/regions when adding them would cross `COLBERT_FINAL_TOKEN_BUDGET`.
+    - Current selection adds all novel selected indices from a scored region, then stops once `used_tokens >= final_token_budget`.
+    - This preserves monotonic inclusion but allows final selected context to overshoot the nominal token budget by a region's novel token count.
+  - `probe_batches=3` means each candidate probes `candidate * 3` examples, capped by `probe_total_num_max=192`.
+    - It affects stability because only the prefix of the eval set is probed.
+    - However, in these results the probe-selected bsz and full-run avg input lengths are consistent, so it is not the primary explanation for the lower selected bsz.
+  - Follow-up check after comparing against 0710 rows with avg input around 900:
+    - The summary only records average valid input length, not batch-padded/max input length.
+    - In no-cache generation, `PromptProcessor.tokenize_full_prompts()` uses left padding, so memory is driven by batch size times the longest prompt in each batch.
+    - Recomputed prompt lengths from successful 0719 probe outputs:
+      - 2Wiki `TOP_K=10`, budget `600`, `bsz=68`: avg `905.44`, max `1395`, batch maxima `[1278, 1391, 1395]`, padded tokens/query about `1352.15`.
+      - MuSiQue `TOP_K=10`, budget `800`, `bsz=36`: avg `1138.26`, max `2538`, batch maxima `[2410, 2538, 2269]`, padded tokens/query about `2405.67`.
+    - Therefore a row that appears to be "900 input tokens" can have a much larger effective padded sequence length during batched generation.
+  - Root cause of `budget=800` producing a 2538-token prompt was isolated:
+    - Problem sample: MuSiQue question `The all time top goal scorer in premier league in one season is a member of what team?`
+    - One selected ctx is DB cacheable `doc_501.txt::sent_8`.
+    - DB text length for `doc_501.txt::sent_8`: 4296 chars, Llama prompt-token length `1270`.
+    - Compact ColBERT artifact row for the same id: `token_counts.npy=133`, vector length `133`.
+    - Neighboring examples show the same pattern:
+      - `doc_501.txt::sent_7`: Llama `198`, sidecar/vector `129`.
+      - `doc_501.txt::sent_8`: Llama `1270`, sidecar/vector `133`.
+      - `doc_501.txt::sent_9`: Llama `422`, sidecar/vector `145`.
+    - The sliding-region budget path uses `_cacheable_token_len()`, which returns `artifact.token_count_for_cacheable_id()` when sidecar token counts are enabled.
+    - Therefore final budget accounting charged `doc_501.txt::sent_8` as `133` tokens, while the no-cache prompt inserted the raw 1270-token text.
+    - The bug is not just region-level overshoot; it is a budget-token mismatch between ColBERT center-vector/token-count length and Llama prompt-visible text length.
+- open issues:
+  - 0708 and 0719 throughput results are not directly comparable as identical budget semantics, because current sliding-region final-budget handling can produce longer prompts.
+  - Auto-bsz probing still depends on the first probed examples and can miss later longer prompts; this is a throughput-probing risk, not an evaluation metric change.
+  - Throughput summaries should ideally include max/p95 input length and average padded no-cache input length; currently only the average valid length is summarized for no-cache runs.
+  - Existing unit tests covered region-spec invariants and monotonic selection, but did not assert that selected prompt-visible Llama token length respects `COLBERT_FINAL_TOKEN_BUDGET`.
+- next steps:
+  - For apples-to-apples throughput comparison, either rerun old settings with the current monotonic semantics, or run a fixed-bsz case grid using the 0719 selected batch sizes.
+  - If conservative OOM avoidance is more important than probe cost, increase `probe_batches` or probe a deterministic longer-prefix/stress subset before full runs.
+  - Consider adding no-cache `max_model_input_len`, `p95_model_input_len`, and `avg_padded_model_input_len` logging before interpreting auto-bsz results by prompt length.
+  - Fix budget accounting by using the same tokenizer/format as the prompt-visible text for selection budgets, then add a regression test with a long cacheable whose ColBERT vector length is much smaller than its Llama prompt length.
+
+## 2026-07-19 - Quantify sliding-region budget-count mismatch impact
+
+- objective:
+  - Quantify how broadly the ColBERT sidecar token-count bug affects datasets and saved outputs.
+- what was changed:
+  - No code changes were made.
+  - `docs/handoff.md` was updated with the audit results.
+- what was verified:
+  - Root cause was confirmed with direct values for `longbench-musique/sent-default-512` cacheable `doc_501.txt::sent_8`:
+    - Llama prompt chunk tokens: `1270`.
+    - ColBERT tokenizer raw tokens: `1025` without specials, `1027` with specials.
+    - ColBERT tensorized input after truncation: `180`.
+    - ColBERT `doc_mask` true count: `136`.
+    - selected center positions/vector rows: `133`.
+    - compact artifact `token_counts.npy`: `133`.
+    - Therefore the budget counter used representation-row count, not prompt-visible token count.
+  - Full DB/artifact audit for deduplicated `sent-default-512` corpora, unique cacheable ids:
+    - HotpotQA: `72494` unique ids; `70123` (`96.73%`) have Llama prompt tokens > sidecar tokens; total Llama/sidecar token ratio `1.2412`; `47` ids have Llama > `512` while sidecar <= `180`; max undercount `1736`.
+    - 2Wiki: `30017` unique ids; `29223` (`97.35%`) undercounted; total ratio `1.2619`; `24` ids with Llama > `512` and sidecar <= `180`; max undercount `650`.
+    - MuSiQue: `70679` unique ids; `68145` (`96.41%`) undercounted; total ratio `1.2321`; `36` ids with Llama > `512` and sidecar <= `180`; max undercount `2431`.
+    - Qasper: `24014` unique ids; `18228` (`75.91%`) undercounted; total ratio `1.1101`; `0` ids with Llama > `512` and sidecar <= `180`; max undercount `265`.
+  - Full DB/artifact audit for `*-lb200-original/sent-original-512` corpora:
+    - HotpotQA original: total Llama/sidecar ratio `0.9607`; undercounted ids `21.99%`; no Llama > `512` and sidecar <= `180` cases.
+    - 2Wiki original: ratio `0.9942`; undercounted ids `31.04%`; no Llama > `512` and sidecar <= `180` cases.
+    - MuSiQue original: ratio `0.9658`; undercounted ids `21.45%`; no Llama > `512` and sidecar <= `180` cases.
+    - Qasper original: ratio `0.8624`; undercounted ids `1.04%`; no Llama > `512` and sidecar <= `180` cases.
+  - Direct per-sample recomputation from preserved 0719 `bsz_probe_outputs` using Llama tokenization of output `ctxs`:
+    - `2wiki-0719-th`: `936` samples across selected successful probes; `96.58%` exceeded nominal absolute budget; `83.87%` exceeded budget + `180`; worst prompt passage tokens `6427`.
+    - `hotpotqa-0719-th`: `960` samples; `97.19%` exceeded nominal budget; `91.04%` exceeded budget + `180`; worst `7056`.
+    - `musique-0719-th`: `564` samples; `92.91%` exceeded nominal budget; `82.27%` exceeded budget + `180`; worst `7348`.
+  - Older 0708/0710 probe `ctxs` did not consistently match summary `avg_nocache_model_input_len`, so old per-sample `ctxs`-based damage numbers were treated as unreliable for final attribution.
+  - Ratio output files cannot reconstruct the true target ratio because the original retrieved full context is not stored in the output, but selected prompt-visible lengths are large and therefore ratio experiments are also affected by the same token-count mismatch.
+- open issues:
+  - Absolute-budget and ratio-budget sliding-region results using the affected compact artifacts should be treated as invalid for token-budget and throughput claims until rerun after fixing budget accounting.
+  - Old full output files under `outputs/eval-*.jsonl` may have been overwritten by later runs because they are global paths, so run-specific attribution should prefer grid summaries/logs and `bsz_probe_outputs`.
+- next steps:
+  - Patch budget accounting to use prompt-visible token lengths, not ColBERT representation-row counts.
+  - Add regression tests for long cacheables where ColBERT vector length is much smaller than Llama prompt length.
+  - Rerun affected absolute-budget and ratio-budget sliding-region grids after the fix.
+
+## 2026-07-19 - Estimate F1 exposure from sliding-region budget-count bug
+
+- objective:
+  - Estimate how much the current saved F1 results are exposed to the severe ColBERT sidecar token-count bug.
+- what was changed:
+  - No code changes were made.
+  - `docs/handoff.md` was updated with this analysis note.
+- what was verified:
+  - Severe cacheable definition used for this F1 exposure analysis:
+    - ColBERT raw document token count with specials/marker > `180`.
+    - Compact sidecar `token_counts.npy` <= `180`.
+    - This isolates cacheables whose budget count came from a truncated ColBERT representation.
+  - A stricter catastrophic subset was also tracked:
+    - Same severe condition, plus Llama prompt-visible cacheable length > `512`.
+  - Severe unique cacheable counts in current `sent-default-512` artifacts:
+    - HotpotQA: `317` severe, `47` with Llama > `512`.
+    - 2Wiki: `169` severe, `24` with Llama > `512`.
+    - MuSiQue: `290` severe, `36` with Llama > `512`.
+    - Qasper: `46` severe, `0` with Llama > `512`.
+  - Re-scored `80` current saved `outputs/eval-longbench-*-sent-default-512-colbert_sliding_region-topk*-gtr0.1-llmfp16-*-cacheoff.jsonl` files with the repo evaluator and `use_cleaner=False`.
+  - Exposure was detected by checking whether each prediction record's selected `ctxs` exactly matched or contained any severe cacheable text.
+  - Dataset-level sample-run pair results:
+    - HotpotQA: overall F1 `48.302`; severe-exposed `824/4400` (`18.73%`) with F1 `41.863`; unexposed F1 `49.786`; catastrophic Llama > `512` exposed `150/4400` (`3.41%`) with F1 `35.277`, unexposed F1 `48.762`.
+    - 2Wiki: overall F1 `38.919`; severe-exposed `1479/4800` (`30.81%`) with F1 `44.734`; unexposed F1 `36.330`; catastrophic exposed `314/4800` (`6.54%`) with F1 `40.052`, unexposed F1 `38.840`.
+    - MuSiQue: overall F1 `23.303`; severe-exposed `1260/5200` (`24.23%`) with F1 `19.884`; unexposed F1 `24.397`; catastrophic exposed `218/5200` (`4.19%`) with F1 `30.689`, unexposed F1 `22.980`.
+    - Qasper: overall F1 `17.909`; severe-exposed `47/1600` (`2.94%`) with F1 `18.428`; unexposed F1 `17.893`; no catastrophic Llama > `512` exposures.
+  - Mode-level sample-run pair results:
+    - HotpotQA cfb: severe exposure `23.5%`, severe F1 `40.32` vs unexposed `50.36`; catastrophic exposure `4.4%`, catastrophic F1 `33.32` vs unexposed `48.68`.
+    - HotpotQA rtr: severe exposure `13.1%`, severe F1 `45.19` vs unexposed `49.18`; catastrophic exposure `2.2%`, catastrophic F1 `39.85` vs unexposed `48.86`.
+    - 2Wiki cfb: severe exposure `34.4%`, severe F1 `44.35` vs unexposed `35.99`; catastrophic exposure `7.1%`, catastrophic F1 `38.90` vs unexposed `38.86`.
+    - 2Wiki rtr: severe exposure `25.9%`, severe F1 `45.45` vs unexposed `36.75`; catastrophic exposure `5.8%`, catastrophic F1 `42.01` vs unexposed `38.82`.
+    - MuSiQue cfb: severe exposure `29.5%`, severe F1 `19.94` vs unexposed `25.08`; catastrophic exposure `4.2%`, catastrophic F1 `28.94` vs unexposed `23.33`.
+    - MuSiQue rtr: severe exposure `15.8%`, severe F1 `19.71` vs unexposed `23.48`; catastrophic exposure `4.2%`, catastrophic F1 `33.53` vs unexposed `22.43`.
+    - Qasper rtr: severe exposure `2.9%`, severe F1 `18.43` vs unexposed `17.89`; catastrophic exposure `0%`.
+  - `cfb800` rows:
+    - HotpotQA topk10: F1 `46.54`; severe exposure `8/200`; catastrophic exposure `0/200`.
+    - HotpotQA topk20: F1 `46.88`; severe exposure `8/200`; catastrophic exposure `0/200`.
+    - MuSiQue topk10: F1 `23.70`; severe exposure `18/200`; catastrophic exposure `5/200`.
+    - MuSiQue topk20: F1 `25.34`; severe exposure `14/200`; catastrophic exposure `6/200`.
+  - Maximum catastrophic exposure in any current saved run:
+    - HotpotQA: `27/200` (`13.5%`) in topk10 `cfb4800`.
+    - 2Wiki: `47/200` (`23.5%`) in topk10 `cfb3600`.
+    - MuSiQue: `22/200` (`11.0%`) in topk20 `cfb4800`.
+    - Qasper: `0/200`.
+- open issues:
+  - These are exposure/association numbers, not a causal F1 delta. Exact F1 impact requires patching budget accounting and rerunning the same experiment grid.
+  - Positive exposed-vs-unexposed F1 differences in 2Wiki and some MuSiQue catastrophic rows mean the exposed examples are not a randomized group; they can be easier or contain useful evidence. They should not be interpreted as the bug improving F1.
+- next steps:
+  - After patching prompt-visible budget accounting, rerun the same grid and compare old vs fixed F1 with identical seeds and output naming.
+  - Preserve this exposure table as the pre-fix contamination estimate.
+
+## 2026-07-19 - Patch ColBERT final budget accounting bug
+
+- objective:
+  - Fix the ColBERT budget-count bug where final budget and retained-ratio budget could use compact sidecar/vector-row counts instead of prompt-visible token lengths.
+- what was changed:
+  - `src/compressor/colbert_window_compressor.py`:
+    - Removed `COLBERT_USE_SIDECAR_TOKEN_COUNTS` from budget accounting.
+    - Added `COLBERT_BUDGET_TOKENIZER`, defaulting to the ColBERT-window artifact `source_tokenizer_name`, then `meta-llama/Llama-3.1-8B-Instruct`.
+    - `_cacheable_token_len()` and `_cacheable_token_lens()` now count `passage_prefix + cacheable.text.strip() + "\n\n"` with `add_special_tokens=False` and `truncation=False`.
+    - Removed unused/dangerous `COLBERT_LENGTH_PENALTY`, `_candidate_token_len()`, and `_apply_length_penalty()` code paths.
+    - Final-budget selection paths now skip any individual cacheable whose prompt-visible token length exceeds the resolved final budget. Existing region-level overshoot behavior for multiple individually-valid cacheables is preserved.
+  - `test/test_colbert_window_optimizations.py`:
+    - Added a regression test proving budget token length does not call sidecar token counts.
+    - Added a regression test proving an individually over-budget cacheable is skipped even when it has the top region score.
+  - `docs/eval_protocol.md`:
+    - Documented the new ColBERT budget accounting semantics and comparability break.
+- what was verified:
+  - `python -m black src/compressor/colbert_window_compressor.py test/test_colbert_window_optimizations.py`
+  - `python -m py_compile src/compressor/colbert_window_compressor.py test/test_colbert_window_optimizations.py test/test_colbert_region_specs.py`
+  - `PYTHONPATH=src python test/test_colbert_window_optimizations.py`: `18` tests passed.
+  - `PYTHONPATH=src python test/test_colbert_region_specs.py`: `17` tests passed.
+  - Dead-code search over `src/` and `test/` found no remaining `COLBERT_LENGTH_PENALTY`, `COLBERT_USE_SIDECAR_TOKEN_COUNTS`, `_candidate_token_len`, or `_apply_length_penalty` references.
+  - Direct sanity check for `longbench-musique` `doc_501.txt::sent_8`:
+    - direct Llama prompt-visible tokens: `1270`.
+    - patched summarizer budget tokens: `1270`.
+  - `git diff --check -- src/compressor/colbert_window_compressor.py test/test_colbert_window_optimizations.py docs/eval_protocol.md` passed.
+- open issues:
+  - Existing pre-fix `colbert_window_budget`, `colbert_sliding_region`, support-pruned, and support-cleanup budgeted results remain contaminated and are not directly comparable to reruns after this patch.
+  - Compact artifact `token_counts.npy` still stores ColBERT representation counts; it is no longer used for final budget accounting, but the artifact format has not been rebuilt or migrated.
+- next steps:
+  - Rerun affected budgeted ColBERT grids after the patch.
+  - Include prompt length summaries (`avg`, `p95`, `max`, and padded batch max where available) when comparing throughput after reruns.
+
+## 2026-07-19 - Paper-grounded follow-up test plan for ColBERT budget fix
+
+- objective:
+  - Read the current paper/method description and identify additional unit tests needed to protect the main CASS invariants after the ColBERT budget-accounting bug.
+- what was changed:
+  - No source code changes were made in this step.
+  - This handoff note records the test plan.
+- what was verified:
+  - Read `docs/paper/0. Abstract.tex`, `1. Introduction.tex`, `2. Motivation and Opportunities.tex`, `3. Challenges in Subchunking.tex`, `4. Contextualized Subchunk Selection.tex`, plus `docs/method.md`, `docs/research_goal.md`, and `docs/project_context.md`.
+  - Main invariant from the paper: retrieval uses coarse chunks, scoring uses contextualized ColBERT subchunk vectors, and final prompt construction must apply the budget to the token count that actually enters the LLM prompt after deduplication/region merging.
+- open issues:
+  - `docs/method.md` still contains older wording saying budget accounting uses the ColBERT tokenizer proxy. It should be updated to match the patched prompt-visible budget semantics.
+- next recommended tests:
+  - End-to-end fake sliding-region compression test: run `compress_batch_top_k_docs()` with fake query vectors/artifact and assert the final selected prompt-visible token sum is bounded for absolute budgets.
+  - Retained-ratio budget test: construct duplicate retrieved cacheables across two retrievable chunks, assert the ratio denominator deduplicates by cacheable id and uses prompt-visible tokenizer lengths.
+  - Region dedup/merge budget test: select overlapping high-score regions and assert duplicate source sentence ids are charged once and appear once in output prompt units.
+  - Cross-boundary retrieval test: same sentence attached to adjacent retrievable chunks must not duplicate prompt text or double-charge budget.
+  - Tokenizer fallback test: `COLBERT_BUDGET_TOKENIZER` override wins; otherwise artifact `source_tokenizer_name` is used; if missing, default Llama tokenizer name is used.
+  - Prompt-format parity test: `_format_budget_cacheable_text()` must match `PromptProcessor.format_passage_chunk()` for the configured passage prefix.
+  - Compact artifact sidecar guard test: budget selection must not call `token_count_for_cacheable_id()` in budgeted ColBERT paths, including ratio budget.
+  - ColBERT scoring equivalence regression: vectorized overlapping-region score must remain equal to concatenated MaxSim after budget changes.
+  - Monotonic budget test with oversized singleton: increasing final budget should produce nested selections among individually valid cacheables, while cacheables longer than the budget remain excluded until the budget reaches their prompt-visible length.
+  - Prompt stats integration test: after compression, measured selected context tokens from the same tokenizer should match the budget accounting for a synthetic batch.
+
+## 2026-07-19 - Implement paper-grounded ColBERT budget tests and DB contamination audit
+
+- objective:
+  - Update the method documentation to match the patched prompt-visible budget semantics.
+  - Add and run the paper-grounded regression tests.
+  - Check whether current DB/artifact directories show signs of mixed or partially overwritten state.
+- what was changed:
+  - `docs/method.md`:
+    - Replaced the outdated statement that retained-ratio budget accounting uses the ColBERT tokenizer proxy.
+    - Documented prompt-visible budget accounting: `passage_prefix + sentence_text.strip() + "\n\n"`, tokenized by `COLBERT_BUDGET_TOKENIZER`, artifact `source_tokenizer_name`, or default Llama tokenizer.
+    - Updated duplicate-removal selection wording so budget fit is defined over merged prompt-visible tokens.
+  - `src/compressor/colbert_window_compressor.py`:
+    - Tightened sliding-region budget selection so sentence additions inside a selected region are skipped when they would make `used_tokens + novel_token_count` exceed the resolved final budget.
+    - This makes final selected prompt-visible budget strict for the tested sliding-region path rather than allowing a region-level overshoot.
+  - `test/test_colbert_window_optimizations.py`:
+    - Added fake tokenizer/query encoder fixtures.
+    - Added end-to-end fake `compress_batch_top_k_docs()` test for strict absolute prompt budget.
+    - Added retained-ratio denominator test with duplicate retrieved cacheables.
+    - Added overlapping-region dedup/text/budget test.
+    - Added cross-boundary duplicate sentence test.
+    - Added budget tokenizer resolution-order test.
+    - Added budget text vs `PromptProcessor.format_passage_chunk()` parity test.
+    - Updated the old crossing-region test to assert strict prompt-visible budget.
+- what was verified:
+  - `python -m black src/compressor/colbert_window_compressor.py test/test_colbert_window_optimizations.py`
+  - `python -m py_compile src/compressor/colbert_window_compressor.py test/test_colbert_window_optimizations.py test/test_colbert_region_specs.py`
+  - `PYTHONPATH=src python test/test_colbert_window_optimizations.py`: `24` tests passed.
+  - `PYTHONPATH=src python test/test_colbert_region_specs.py`: `17` tests passed.
+  - `PYTHONPATH=src python -m unittest discover -s test -p 'test_*.py'`: `66` tests passed.
+  - `git diff --check -- src/compressor/colbert_window_compressor.py test/test_colbert_window_optimizations.py docs/eval_protocol.md docs/method.md docs/handoff.md` passed.
+  - Search over `docs/method.md`, `src/`, and `test/` found no remaining current-code/method references to the removed ColBERT budget proxy or removed length-penalty knobs.
+- DB/artifact contamination audit:
+  - Checked these roots:
+    - `/mnt/nvme1/datasets/longbench-hotpotqa/sent-default-512`
+    - `/mnt/nvme1/datasets/longbench-2wiki/sent-default-512`
+    - `/mnt/nvme1/datasets/longbench-musique/sent-default-512`
+    - `/mnt/nvme1/datasets/longbench-qasper/sent-default-512`
+    - `/mnt/nvme1/datasets/hotpotqa-lb200-original/sent-original-512`
+    - `/mnt/nvme1/datasets/2wiki-lb200-original/sent-original-512`
+    - `/mnt/nvme1/datasets/musique-lb200-original/sent-original-512`
+    - `/mnt/nvme1/datasets/qasper-lb200-original/sent-original-512`
+  - For every checked root:
+    - DB `cacheables_json` parsed with no JSON errors.
+    - No conflicting text for the same cacheable id.
+    - No parent id metadata mismatch.
+    - No bad retrieval window metadata detected.
+    - DB cacheable id set exactly matched compact artifact `id_to_row` id set.
+    - Compact `num_cacheables`, `id_to_row`, `token_counts.npy`, and `offsets.npy` lengths were internally consistent.
+    - Compact `window_ids_by_row` was present and had no missing-center/unknown-id rows.
+    - Compact `region_specs_by_chunk` had no malformed, out-of-range, non-contiguous, or center-missing specs.
+    - Chroma had one collection and one vector segment directory; no orphan UUID vector dirs and no vector segment missing its directory.
+    - DB parent ids matched artifact `docs` ids exactly.
+  - Default deduplicated `sent-default-512` datasets had extra files in `documents/` not present in DB/artifact, but all were verified as expected normalized-text-hash duplicates:
+    - HotpotQA: `12` expected duplicate skips, no unexpected missing docs.
+    - 2Wiki: `582` expected duplicate skips, no unexpected missing docs.
+    - MuSiQue: `4` expected duplicate skips, no unexpected missing docs.
+    - Qasper: `52` expected duplicate skips, no unexpected missing docs.
+  - Original `sent-original-512` roots had exact `documents/`, DB parent, and artifact doc-set matches.
+- open issues:
+  - This audit checks structural/id/text consistency of current DB/artifact directories. It cannot prove that old output JSONL files were generated from a specific historical DB state unless those runs stored immutable DB/artifact fingerprints.
+  - Pre-fix budgeted output files remain invalid for budget-controlled claims and should be rerun.
+- next steps:
+  - Add DB/artifact fingerprint fields to future run outputs or summaries so overwritten DB/artifact state can be tied to each result.
+  - Rerun budgeted ColBERT experiments after this patch.
+
+## 2026-07-19 - Check requested 0720 grid launch command
+
+- objective:
+  - Determine whether this command is safe to run after the ColBERT budget fix:
+    - `./run/run_grid.sh --wait-gpu --interval 15 --wait-lock ./run/grid_search/grid.yaml ./run/grid_search/grid2.yaml ./run/grid_search/grid3.yaml ./run/grid_search/grid4.yaml ./run/grid_search/grid_th.yaml ./run/grid_search/grid_th2.yaml ./run/grid_search/grid_th3.yaml`
+- what was changed:
+  - Fixed `run/grid_search/grid.yaml` model typo from `meta-llama/Llama-3.1=9B-Instruct` to `meta-llama/Llama-3.1-8B-Instruct`.
+  - Updated `run/grid_search/eval.py` so full eval runs default `OUTPUT_FILE` to `outputs/grid_07/<run_name>/eval_outputs/<log_prefix>.jsonl` when the grid/env does not explicitly provide `OUTPUT_FILE`.
+  - Added `OUTPUT_FILE` to `results.jsonl` rows and retrieval-evidence summary CSV fields for raw-output traceability.
+- what was verified:
+  - `python -m black run/grid_search/eval.py`
+  - `python -m py_compile run/grid_search/eval.py`
+  - YAML parse/model-name check for all requested grid files:
+    - `run/grid_search/grid.yaml`
+    - `run/grid_search/grid2.yaml`
+    - `run/grid_search/grid3.yaml`
+    - `run/grid_search/grid4.yaml`
+    - `run/grid_search/grid_th.yaml`
+    - `run/grid_search/grid_th2.yaml`
+    - `run/grid_search/grid_th3.yaml`
+  - Fake `GridRunner` execution confirmed full eval receives an isolated `OUTPUT_FILE` under the run's `eval_outputs/` directory and records that path in `results.jsonl`.
+  - `git diff --check -- run/grid_search/eval.py run/grid_search/grid.yaml` passed.
+  - `find outputs/grid_07 -maxdepth 1 -type d -name '*0720*' -print` returned no existing 0720 result directories before launch.
+- open issues:
+  - The command still must be launched from the current patched checkout.
+  - Pre-fix budgeted ColBERT results remain not directly comparable with rerun results.
+  - Auto-bsz grids still use `probe_batches: 3`; this affects selected throughput batch size stability, not budget correctness.
+- next steps:
+  - Run the requested grid command from the patched checkout.
+  - After completion, inspect `outputs/grid_07/*0720*/results.jsonl`, `failures.jsonl`, and `logs/` for failures or auto-bsz retries.
+
+## 2026-07-19 - Add 0720 SLLM ratio grid files
+
+- objective:
+  - Create SLLM variants of the four non-th 0720 ratio grid files.
+- what was changed:
+  - Added `run/grid_search/grid_sllm.yaml` from `grid.yaml` settings:
+    - `run_name: hotpotqa-0720-sllm`
+    - `MODEL_NAME: meta-llama/Llama-3.2-1B-Instruct`
+  - Added `run/grid_search/grid_sllm2.yaml` from `grid2.yaml` settings:
+    - `run_name: 2wiki-0720-sllm`
+    - `MODEL_NAME: meta-llama/Llama-3.2-1B-Instruct`
+  - Added `run/grid_search/grid_sllm3.yaml` from `grid3.yaml` settings:
+    - `run_name: musique-0720-sllm`
+    - `MODEL_NAME: meta-llama/Llama-3.2-1B-Instruct`
+  - Added `run/grid_search/grid_sllm4.yaml` from `grid4.yaml` settings:
+    - `run_name: qasper-0720-sllm`
+    - `MODEL_NAME: meta-llama/Llama-3.2-1B-Instruct`
+- what was verified:
+  - YAML parse and assertions for all four new files:
+    - expected `run_name`
+    - expected dataset
+    - `fixed_env.MODEL_NAME == meta-llama/Llama-3.2-1B-Instruct`
+    - `fixed_env.EVAL_BSZ == "1"`
+    - retained-ratio axis `["0.15", "0.25", "0.5", "0.75"]`
+  - `git diff --check -- run/grid_search/grid_sllm.yaml run/grid_search/grid_sllm2.yaml run/grid_search/grid_sllm3.yaml run/grid_search/grid_sllm4.yaml` passed.
+- open issues:
+  - These are ratio-budget SLLM grids only; no `grid_th*` SLLM variants were created in this step.
+- next steps:
+  - Launch with `./run/run_grid.sh --wait-gpu --interval 15 --wait-lock ./run/grid_search/grid_sllm.yaml ./run/grid_search/grid_sllm2.yaml ./run/grid_search/grid_sllm3.yaml ./run/grid_search/grid_sllm4.yaml` when ready.
+
+## 2026-07-19 - Final preflight for combined 0720 grid launch
+
+- objective:
+  - Check the combined launch command covering 8B ratio grids, 8B threshold grids, and 1B SLLM ratio grids.
+- what was verified:
+  - All 11 requested grid files exist and parse as YAML.
+  - `run_name` values are unique:
+    - `hotpotqa-0720`, `2wiki-0720`, `musique-0720`, `qasper-0720`
+    - `hotpotqa-0720-th`, `2wiki-0720-th`, `musique-0720-th`
+    - `hotpotqa-0720-sllm`, `2wiki-0720-sllm`, `musique-0720-sllm`, `qasper-0720-sllm`
+  - 8B grids use `meta-llama/Llama-3.1-8B-Instruct`.
+  - SLLM grids use `meta-llama/Llama-3.2-1B-Instruct`.
+  - All grids use `results_root: outputs/grid_07` and `eval_script: run/eval.sh`.
+  - `outputs/grid_07/*0720*` had no existing result directories before launch.
+  - `python -m py_compile run/grid_search/eval.py` passed.
+  - `git diff --check` passed for the runner and all requested grid files.
+  - Temporary `GridRunner` initialization succeeded for all 11 configs and created `manifest.json`, `logs/`, `bsz_probe_outputs/`, and `eval_outputs/` under an isolated temp results root.
+- open issues:
+  - Runtime failures such as Hugging Face model access, CUDA driver/device errors, or genuine OOM can only be ruled out by launching the jobs.
+  - Pre-fix budgeted ColBERT results remain not directly comparable with these reruns.
+- next steps:
+  - Launch the combined command from the current patched checkout.
+
+## 2026-07-19 - Rebuild sent-default-512 DBs with prompt-token metadata
+
+- objective:
+  - Rebuild the four `sent-default-512/db` Chroma DBs so sentence cacheable payloads include offline prompt-visible token lengths.
+  - Prevent stored token lengths from being used with the wrong LLM tokenizer.
+- what was changed:
+  - Added `CacheableChunk.prompt_tokenizer_name` alongside `prompt_token_count` in clone/payload serialization/deserialization.
+  - `DocumentSplitter` now records the materialization tokenizer name from `model.model_name` or tokenizer `name_or_path`.
+  - `TokenizerOnlyModel` in `src/entrypoint/preprocess.py` now stores `model_name`, so DB-only preprocess writes a tokenizer identity.
+  - ColBERT sliding-region budget accounting now uses stored `prompt_token_count` only when:
+    - `prompt_token_count` is present,
+    - no `COLBERT_BUDGET_PASSAGE_PREFIX` is configured,
+    - `prompt_tokenizer_name` exactly matches runtime `MODEL_NAME`.
+  - Updated `docs/eval_protocol.md` and `docs/method.md` to document the tokenizer-name guard and legacy fallback.
+  - Rebuilt these DBs in place after moving previous DB directories to timestamped backups:
+    - `/mnt/nvme1/datasets/longbench-hotpotqa/sent-default-512/db`
+    - `/mnt/nvme1/datasets/longbench-2wiki/sent-default-512/db`
+    - `/mnt/nvme1/datasets/longbench-musique/sent-default-512/db`
+    - `/mnt/nvme1/datasets/longbench-qasper/sent-default-512/db`
+  - Rebuild command settings:
+    - `MODEL_NAME=meta-llama/Llama-3.1-8B-Instruct`
+    - `SPLITTER=sentence`
+    - `CACHEABLE_CHUNK_SIZE=None`
+    - `RETRIEVABLE_CHUNK_SIZE=512`
+    - `MATERIALIZE_CACHE=False`
+    - `MATERIALIZE_DB=True`
+    - `MATERIALIZE_COMPARE_EMBEDS=False`
+    - `MATERIALIZE_COLBERT_WINDOW=False`
+    - `DEDUPLICATE_DOCUMENTS_BY_HASH=True`
+    - `CHROMA_EMBED_DEVICE=cpu`
+- what was verified:
+  - Focused code checks:
+    - `black --check src/chunk.py src/materialize/splitter/base.py src/entrypoint/preprocess.py src/compressor/colbert_window_compressor.py test/test_cacheable_payload.py test/test_colbert_region_specs.py`
+    - `python -m py_compile src/chunk.py src/materialize/splitter/base.py src/entrypoint/preprocess.py src/compressor/colbert_window_compressor.py test/test_cacheable_payload.py test/test_colbert_region_specs.py`
+    - `python test/test_colbert_region_specs.py` passed 23 tests.
+    - `python test/test_colbert_window_optimizations.py` passed 23 tests.
+    - Manual import/call of all `test/test_cacheable_payload.py` test functions passed.
+  - Rebuild logs are under `outputs/db_rebuild/20260719-191045/`.
+  - Backup directories:
+    - `/mnt/nvme1/datasets/longbench-hotpotqa/sent-default-512/db.backup-pre-prompt-tokenizer-name.20260719-191045`
+    - `/mnt/nvme1/datasets/longbench-2wiki/sent-default-512/db.backup-pre-prompt-tokenizer-name.20260719-191045`
+    - `/mnt/nvme1/datasets/longbench-musique/sent-default-512/db.backup-pre-prompt-tokenizer-name.20260719-191045`
+    - `/mnt/nvme1/datasets/longbench-qasper/sent-default-512/db.backup-pre-prompt-tokenizer-name.20260719-191045`
+  - New DB row counts:
+    - HotpotQA: 5807 embeddings, 5807 `cacheables_json` rows, 76475 cacheable refs.
+    - 2Wiki: 2831 embeddings, 2831 `cacheables_json` rows, 31410 cacheable refs.
+    - MuSiQue: 5823 embeddings, 5823 `cacheables_json` rows, 74548 cacheable refs.
+    - Qasper: 1531 embeddings, 1531 `cacheables_json` rows, 25360 cacheable refs.
+  - For all four DBs:
+    - missing `prompt_token_count`: 0
+    - invalid `prompt_token_count`: 0
+    - missing `prompt_tokenizer_name`: 0
+    - wrong `prompt_tokenizer_name`: 0
+  - Existing compact ColBERT artifacts remain id-aligned with the rebuilt DBs:
+    - DB retrieval chunk ids exactly match compact `region_specs_by_chunk` keys for all four datasets.
+    - DB unique cacheable ids exactly match compact artifact `id_to_row` keys for all four datasets.
+    - compact artifacts report `region_spec_reuse_mode=document_window_bound` and `region_token_budget=180`.
+- open issues:
+  - The rebuilt DBs store prompt token counts for `meta-llama/Llama-3.1-8B-Instruct`. SLLM runs with `meta-llama/Llama-3.2-1B-Instruct` will intentionally fall back to runtime tokenization unless separate SLLM-tokenizer DBs are built or the tokenizer identity policy is changed.
+  - End-to-end RAG grids were not rerun in this session.
+- next steps:
+  - Use the rebuilt DBs for 8B ColBERT sliding-region runs.
+  - If SLLM query-time tokenization overhead matters, decide explicitly whether to build separate 1B-tokenizer DBs or to add a documented tokenizer-compatibility rule.
+
+## 2026-07-20 - Iterative ColBERT budget/region bug audit
+
+- objective:
+  - Re-audit the current ColBERT sliding-region eval path for likely bug classes before launching new experiments.
+  - Focus on token-budget accounting, tokenizer identity, source-order assembly, region contiguity, scoring memoization, DB/artifact alignment, and stale option references.
+- what was changed:
+  - Fixed `test/test_retrievable_overlap_mapping.py`'s `DummyTokenizer.__call__` mock to accept extra HuggingFace-style tokenizer keyword arguments. The production tokenizer already accepts these; the failure was in the test double after prompt-visible token counting added `truncation=False`.
+  - Added `test_budget_token_lengths_ignore_stored_count_when_prefix_is_configured` to ensure stored `prompt_token_count` is not used when `COLBERT_BUDGET_PASSAGE_PREFIX` changes the prompt-visible text.
+  - Renamed the old misleading ColBERT budget test from strict-budget wording to soft-budget wording.
+  - Added `test_colbert_budget_selection_exhaustive_small_region_invariants`, which checks small ranked-region cases for:
+    - no duplicate selected sentence ids,
+    - contiguous selected runs,
+    - prompt text matching selected source sentences,
+    - source-order restoration after score-order selection,
+    - soft-budget termination: selected tokens reach the budget or all available unique tokens are exhausted.
+  - Renamed the budget-tokenizer test to make clear that legacy `COLBERT_BUDGET_TOKENIZER` overrides are ignored and runtime `MODEL_NAME` is used.
+- what was verified:
+  - Focused tests:
+    - `PYTHONPATH=src python test/test_colbert_region_specs.py`: 24 tests passed.
+    - `PYTHONPATH=src python test/test_colbert_window_optimizations.py`: 24 tests passed.
+    - `PYTHONPATH=src python test/test_retrievable_overlap_mapping.py`: 4 tests passed.
+    - `PYTHONPATH=src python test/test_colbert_contiguous_window.py`: 4 tests passed.
+    - `PYTHONPATH=src python test/test_colbert_window_db_doc_filter.py`: 3 tests passed.
+    - `PYTHONPATH=src python test/test_document_preprocessor_dedup.py`: 3 tests passed.
+    - `PYTHONPATH=src python test/test_bm25_compressor.py`: 11 tests passed.
+  - Full unittest discovery:
+    - `PYTHONPATH=src python -m unittest discover -s test -p 'test_*.py'`: 73 tests passed.
+  - Pytest-style payload tests:
+    - Manual import/call of all `test/test_cacheable_payload.py` test functions passed.
+  - Static checks:
+    - `black --check` on the touched source/test files passed.
+    - `python -m py_compile $(rg --files src test -g '*.py')` passed.
+    - `git diff --check` on touched source/test/docs files passed.
+    - `compressor.factory` import smoke passed and verified key ColBERT compressor names remain registered.
+  - Current rebuilt dataset artifacts:
+    - For HotpotQA, 2Wiki, MuSiQue, and Qasper `sent-default-512`:
+      - DB retrieval chunk ids exactly match compact `region_specs_by_chunk` keys.
+      - DB cacheable ids exactly match compact `id_to_row` keys.
+      - `prompt_token_count` / `prompt_tokenizer_name` metadata errors are all zero.
+      - compact artifacts have `region_spec_reuse_mode=document_window_bound` and `region_token_budget=180`.
+    - Region-spec invariant scan over all four compact artifacts:
+      - HotpotQA: 5807 chunks, 41037 specs, 0 bad specs.
+      - 2Wiki: 2831 chunks, 16070 specs, 0 bad specs.
+      - MuSiQue: 5823 chunks, 40058 specs, 0 bad specs.
+      - Qasper: 1531 chunks, 14867 specs, 0 bad specs.
+      - Bad spec means out-of-range center/index, empty selection, center missing, duplicate/unsorted indices, non-contiguous selection, or duplicate selected tuple within a chunk.
+  - Grid static sanity:
+    - 8B ratio grids and threshold grids point to existing `sent-default-512` DBs and compact artifacts.
+    - SLLM ratio grids also point to existing DB/artifact paths; because rebuilt DB token metadata is for `meta-llama/Llama-3.1-8B-Instruct`, 1B SLLM runs intentionally fall back to runtime tokenization instead of reusing stored 8B counts.
+  - Stale current-code option search:
+    - No current `src/` references found for removed support-pruning variants.
+    - No current `src/` references found for removed length penalty or sidecar budget-token-count options.
+- open issues:
+  - This audit cannot prove absence of all bugs. It rules out the tested classes and current structural DB/artifact inconsistencies.
+  - Dense sliding-region ablation still uses its own strict pre-check budget semantics. This was not changed because the documented soft-cap guarantee is for `colbert_sliding_region`, and changing dense ablation semantics would be an evaluation-logic change requiring an explicit decision.
+  - End-to-end RAG generation grids were not run in this audit.
+- next steps:
+  - Launch the intended 0720 grids only from this patched checkout.
+  - Treat any pre-audit budgeted results as not directly comparable unless the run output can be tied to this exact code/DB/artifact state.
+
+## 2026-07-20 - Long-subchunk split principle
+
+- objective:
+  - Record the intended semantics before implementing the exact long-subchunk split variant.
+  - Record the implementation discipline for this line of work.
+- what was decided:
+  - The user is trying to revise the core rule/principle of subchunk segmentation, not add exception handling. Future implementation should prefer one coherent rule that can be stated in the paper.
+  - Do not introduce special cases, fallback paths, heuristic repairs, split-specific ids, or downstream compensating logic without asking the user first. If an exception seems necessary, stop and explain why the main rule is insufficient before implementing it.
+  - The split must be implemented at the subchunk construction layer, not as a query-time heuristic, prompt-time truncation, altered retrieval matching rule, or special-case patch in region selection.
+  - Existing retrieval attachment semantics should remain span-based: after subchunks are constructed, retrievable chunks attach cacheables by their token spans.
+  - If a sentence-level subchunk exceeds the configured maximum length, it should be split into multiple normal subchunks before retrieval-chunk attachment. After splitting, these are just regular subchunks with regular token spans; downstream code should not need to know that they came from the same original sentence.
+  - The split rule should depend on the subchunk length limit only. Do not mix retrieval chunk boundary handling into subchunk segmentation. The normal span-matching path will attach the resulting subchunks to retrieval chunks exactly as it does for all other subchunks.
+  - Do not add downstream heuristics that reinterpret selected regions, rewrite retrieval results, or hide boundary problems.
+  - This variant changes preprocessing/artifact materialization and is not comparable to old DB/artifact outputs unless DB, ColBERT representations, region specs, and eval outputs are rebuilt under a clearly named variant subdir.
+- what was verified:
+  - Current `DocumentSplitter._build_retrievable_chunks()` attaches cacheables to retrieval chunks by token-span overlap after cacheable subchunks have already been constructed.
+- open issues:
+  - The earlier partial `_split_long_sentence_views()` design that introduced split-specific identity (`part_idx`) was rejected. The intended design is max-length-only normal subchunk segmentation.
+- next steps:
+  - Implement the split only in subchunk construction as normal sentence/subchunk splitting, add unit tests for split spans and retrieval attachment, then rebuild a separate DB/artifact variant for exact analysis.
+
+## 2026-07-20 - splitlong512 DB/artifact/eval run
+
+- objective:
+  - Evaluate the exact long-subchunk split variant with `max_subchunk_tokens=512` while keeping existing `sent-default-512` outputs intact.
+  - Compare splitlong512 against the current `sent-default-512` 0720 8B bsz1 ColBERT sliding-region results.
+- what was changed:
+  - Added splitlong512 grid configs:
+    - `run/grid_search/grid_splitlong512_hotpotqa.yaml`
+    - `run/grid_search/grid_splitlong512_2wiki.yaml`
+    - `run/grid_search/grid_splitlong512_musique.yaml`
+    - `run/grid_search/grid_splitlong512_qasper.yaml`
+  - These configs use the same eval axes as the existing 0720 grids but set `DATA_SUBDIR=sent-default-512-splitlong512` and write to separate run names under `outputs/grid_07/*-splitlong512-0720`.
+- what was materialized:
+  - Built new DBs under:
+    - `/mnt/nvme1/datasets/longbench-hotpotqa/sent-default-512-splitlong512/db`
+    - `/mnt/nvme1/datasets/longbench-2wiki/sent-default-512-splitlong512/db`
+    - `/mnt/nvme1/datasets/longbench-musique/sent-default-512-splitlong512/db`
+    - `/mnt/nvme1/datasets/longbench-qasper/sent-default-512-splitlong512/db`
+  - Built matching ColBERT window artifacts under each `sent-default-512-splitlong512/colbert_window`.
+  - Artifact validation passed for all four datasets with `missing_in_artifact_count=0`, `extra_in_artifact_count=0`, and `text_mismatch_count=0`.
+- what was verified:
+  - DB unique cacheable span validation:
+    - HotpotQA: `unique_cacheables=72555`, `max_span=512`, `over512=0`.
+    - 2Wiki: `unique_cacheables=30041`, `max_span=512`, `over512=0`.
+    - MuSiQue: `unique_cacheables=70732`, `max_span=512`, `over512=0`.
+    - Qasper: `unique_cacheables=24014`, `max_span=364`, `over512=0`.
+  - Compact artifact summary:
+    - HotpotQA: `artifact_cacheables=72555`, `region_specs=41090`, `region_spec_reuse_mode=document_window_bound`.
+    - 2Wiki: `artifact_cacheables=30041`, `region_specs=16085`, `region_spec_reuse_mode=document_window_bound`.
+    - MuSiQue: `artifact_cacheables=70732`, `region_specs=40102`, `region_spec_reuse_mode=document_window_bound`.
+    - Qasper: `artifact_cacheables=24014`, `region_specs=14867`, `region_spec_reuse_mode=document_window_bound`.
+- eval results:
+  - Ran HotpotQA, 2Wiki, and MuSiQue splitlong512 bsz1 8B ColBERT sliding-region grids. Qasper eval was intentionally skipped after the user asked not to run it.
+  - HotpotQA splitlong512 F1:
+    - `k=10`: r0.15 `0.4130`, r0.25 `0.4747`, r0.5 `0.4842`, r0.75 `0.4805`.
+    - `k=20`: r0.15 `0.4847`, r0.25 `0.5262`, r0.5 `0.5523`, r0.75 `0.5197`.
+  - 2Wiki splitlong512 F1:
+    - `k=10`: r0.15 `0.3095`, r0.25 `0.3584`, r0.5 `0.4163`, r0.75 `0.4057`.
+    - `k=20`: r0.15 `0.3905`, r0.25 `0.4446`, r0.5 `0.4216`, r0.75 `0.4208`.
+  - MuSiQue splitlong512 F1:
+    - `k=10`: r0.15 `0.2221`, r0.25 `0.2388`, r0.5 `0.2262`, r0.75 `0.2377`.
+    - `k=20`: r0.15 `0.2437`, r0.25 `0.2398`, r0.5 `0.2496`, r0.75 `0.2108`.
+- comparison against `sent-default-512` 0720:
+  - HotpotQA: average F1 delta `+0.0018`; max `+0.0100` at `k=20,r=0.5`; min `-0.0031` at `k=10,r=0.15`.
+  - 2Wiki: average F1 delta `+0.0028`; max `+0.0108` at `k=10,r=0.5`; min `-0.0104` at `k=20,r=0.15`.
+  - MuSiQue: average F1 delta `+0.0028`; max `+0.0164` at `k=20,r=0.5`; min `-0.0141` at `k=20,r=0.75`.
+  - Splitlong512 consistently reduced measured input length slightly across all compared conditions; reductions were largest at higher retention ratios.
+- open issues:
+  - splitlong512 does not produce a large consistent F1 gain; it is mostly neutral to mildly positive on average, with isolated drops.
+  - Qasper DB/artifact exists, but Qasper splitlong512 RAG eval was not run.
+  - A later attempt to start splitlong180 DB materialization was rejected at the permission prompt, so no splitlong180 DBs were created in this session.
+- next steps:
+  - If desired, run splitlong180 DB-only materialization under a separate `sent-default-512-splitlong180` subdir after a single approval for the full dataset loop.
+  - If splitlong512 is discussed in the paper, present it as a preprocessing sanity/robustness variant rather than as a primary contribution unless follow-up evidence shows stronger gains.
+
+## 2026-07-20 - splitlong180 DB/artifact materialization
+
+- objective:
+  - Materialize the exact long-subchunk split variant with `max_subchunk_tokens=180`, keeping it separate from `sent-default-512` and `sent-default-512-splitlong512`.
+  - Prepare DB/artifact inputs for later queued RAG evaluation.
+- what was changed:
+  - Added splitlong180 grid configs:
+    - `run/grid_search/grid_splitlong180_hotpotqa.yaml`
+    - `run/grid_search/grid_splitlong180_2wiki.yaml`
+    - `run/grid_search/grid_splitlong180_musique.yaml`
+    - `run/grid_search/grid_splitlong180_qasper.yaml`
+  - These configs point to `DATA_SUBDIR=sent-default-512-splitlong180` and keep the experiment output isolated.
+- what was materialized:
+  - Built new DBs under:
+    - `/mnt/nvme1/datasets/longbench-hotpotqa/sent-default-512-splitlong180/db`
+    - `/mnt/nvme1/datasets/longbench-2wiki/sent-default-512-splitlong180/db`
+    - `/mnt/nvme1/datasets/longbench-musique/sent-default-512-splitlong180/db`
+    - `/mnt/nvme1/datasets/longbench-qasper/sent-default-512-splitlong180/db`
+  - Built matching ColBERT window artifacts under each `sent-default-512-splitlong180/colbert_window`.
+  - Artifact build used `COLBERT_WINDOW_DEVICE=cpu`, `COLBERT_WINDOW_TOKEN_BUDGET=180`, `MAX_SUBCHUNK_TOKENS=180`, and `COLBERT_WINDOW_OVERWRITE=True`.
+- what was verified:
+  - DB unique cacheable span validation:
+    - HotpotQA: `unique_cacheables=73085`, `max_span=180`, `over180=0`.
+    - 2Wiki: `unique_cacheables=30309`, `max_span=180`, `over180=0`.
+    - MuSiQue: `unique_cacheables=71203`, `max_span=180`, `over180=0`.
+    - Qasper: `unique_cacheables=24036`, `max_span=180`, `over180=0`.
+  - Compact artifact summary:
+    - HotpotQA: `artifact_cacheables=73085`, `region_specs=41455`, `region_spec_reuse_mode=document_window_bound`, `failed_docs=0`.
+    - 2Wiki: `artifact_cacheables=30309`, `region_specs=16277`, `region_spec_reuse_mode=document_window_bound`, `failed_docs=0`.
+    - MuSiQue: `artifact_cacheables=71203`, `region_specs=40423`, `region_spec_reuse_mode=document_window_bound`, `failed_docs=0`.
+    - Qasper: `artifact_cacheables=24036`, `region_specs=14881`, `region_spec_reuse_mode=document_window_bound`, `failed_docs=0`.
+  - DB/artifact cacheable counts matched for all four datasets.
+  - `validate_colbert_window_artifact_against_db()` passed for all four datasets with `missing_in_artifact_count=0`, `extra_in_artifact_count=0`, and `text_mismatch_count=0`.
+- open issues:
+  - RAG eval has not been run for splitlong180 yet.
+  - The artifact was generated on CPU to avoid using the busy GPU; this affects build time only, not the stored representation semantics.
+- next steps:
+  - Queue splitlong180 RAG grids with `wait_gpu` when GPU capacity is available.
+  - Compare splitlong180 against splitlong512 and the current `sent-default-512` baseline using input length versus F1, especially at `r=0.25` and `r=0.5`.
+
+## 2026-07-22 - splitlong180 versus splitlong512 MatKV-relative result audit
+
+- objective:
+  - Choose between splitlong180 and splitlong512 using F1 improvement over the fixed-chunk MatKV/vanilla baselines as the primary criterion, with paper-message consistency as the secondary criterion.
+- what was changed:
+  - No code, evaluation protocol, artifacts, or result files were changed.
+  - Recorded this read-only comparison and its matching rule.
+- what was verified:
+  - Compared the common HotpotQA, 2Wiki, and MuSiQue results for Llama-3.1-8B-Instruct and Llama-3.2-1B-Instruct, all at bsz1 and 200 examples.
+  - Used the approximately input-length-matched primary comparisons within the same dataset and top-k: `r=0.25` versus `matkv-default-128`, and `r=0.5` versus `matkv-default-256`.
+  - Across the 24 primary comparisons, splitlong180 had mean F1 gain `+0.0255` over MatKV and won 19/24 cases; splitlong512 had mean F1 gain `+0.0243` and also won 19/24 cases.
+  - For 8B alone, splitlong512 was stronger: mean gain `+0.0340`, 12/12 wins, versus splitlong180 `+0.0299`, 10/12 wins.
+  - For 1B alone, splitlong180 was stronger: mean gain `+0.0212`, 9/12 wins, versus splitlong512 `+0.0147`, 7/12 wins.
+  - splitlong180 used about 88 fewer input tokens than its matched MatKV points on average; splitlong512 used about 54 fewer.
+  - Qasper was excluded from the direct variant comparison because splitlong512 Qasper generation results do not exist.
+- open issues:
+  - The matching is close but not exact in input length. A strict quality-at-equal-token-budget comparison would require interpolation or new fixed-budget runs.
+  - The aggregate advantage of splitlong180 is small; the main distinction is stronger 1B behavior and smaller/more controlled evidence units, while splitlong512 has the cleaner 8B win record.
+- next steps:
+  - Prefer splitlong180 if one preprocessing variant must support the paper's cross-model claim; report the 8B/1B split transparently.
+  - Prefer splitlong512 only if the paper explicitly makes 8B the sole primary quality criterion.
+
+## 2026-07-22 - splitlong compression-latency discrepancy diagnosis
+
+- objective:
+  - Diagnose why splitlong180 appears slower than splitlong512 in some latency-versus-F1 results and can lose ground to no-compression MatKV baselines.
+- what was changed:
+  - No code, protocol, artifacts, or result files were changed.
+- what was verified:
+  - splitlong180 does create more fine-grained units, which structurally adds candidate/region bookkeeping. Relative to splitlong512, artifact cacheable and region-spec counts increase by roughly 0.7-1.2% on HotpotQA, 2Wiki, and MuSiQue.
+  - The online path loads vectors per cacheable, builds one region object per spec, computes unique-cacheable MaxSim scores, sorts regions, and performs token-budget selection. More cacheables/specs can therefore add real overhead.
+  - This small structural increase does not explain the observed multi-fold timing differences.
+  - Timing direction reverses across runs: splitlong180 is substantially slower in several 8B runs, while splitlong512 is slower in several 1B runs, especially MuSiQue.
+  - Query-encoder warmup, which is independent of the split granularity, shows the same environmental reversal. Example: 8B HotpotQA `r=0.25` warmup was 0.4898 s for splitlong180 versus 0.3164 s for splitlong512; 1B MuSiQue `k=20,r=0.25` was 0.3215 s for splitlong180 versus 0.4867 s for splitlong512.
+  - The compared grids ran at different dates/times, so GPU load, clocks, CPU/NVMe page-cache state, and other system contention were not controlled as a paired timing experiment.
+  - `compress_time` is one wall-clock interval around the whole compressor and the saved summaries do not contain its internal `last_profile` breakdown, despite the compressor tracking query encoding, artifact lookup, region construction/scoring, sorting, and selection internally.
+- open issues:
+  - Existing compress-time values are valid observations of their respective runs but are not sufficient evidence that splitlong180 is intrinsically much slower than splitlong512.
+  - For a small LLM, even a genuine 20-30 ms compression cost is a large fraction of prefill latency, while MatKV/vanilla pays zero compression cost; this can move the latency-F1 frontier against the proposed method.
+- next steps:
+  - Before using latency to choose the split variant, rerun paired 180/512 timing trials in alternating order under the same GPU lock and idle-GPU condition, with repeated seeds/order and internal compressor profile fields exported.
+  - Compare medians after warmup and separately report query encoding, artifact/vector lookup, MaxSim/region scoring, and selection time.
+
+## 2026-07-22 - splitlong intrinsic compressor-work audit
+
+- objective:
+  - Quantify whether the additional splitlong180 units can plausibly explain the observed large compression-latency gap against splitlong512, and check for split-specific online code paths.
+- what was changed:
+  - No code, protocol, artifacts, or result files were changed.
+- what was verified:
+  - Compact artifact work-size increases from splitlong512 to splitlong180 are small:
+    - HotpotQA: cacheables `72555 -> 73085` (+0.73%), stored ColBERT vectors `2038556 -> 2068142` tokens (+1.45%), region specs `41090 -> 41455` (+0.89%).
+    - 2Wiki: cacheables `30041 -> 30309` (+0.89%), vectors `838261 -> 852592` (+1.71%), region specs `16085 -> 16277` (+1.19%).
+    - MuSiQue: cacheables `70732 -> 71203` (+0.67%), vectors `2020506 -> 2047680` (+1.34%), region specs `40102 -> 40423` (+0.80%).
+  - The active `colbert_sliding_region` online implementation has no branch keyed by `MAX_SUBCHUNK_TOKENS`, splitlong180, or splitlong512. Both variants use the same query encoding, compact artifact lookup, sidecar region-spec path, vectorized MaxSim/region scoring, sorting, and budget selection code.
+  - Both variants clear retrievable-vector and region-spec caches between measured batches under `COLBERT_CLEAR_INTER_BATCH_CACHE=True`; this can expose CPU/NVMe page-cache variability but applies equally to both configurations.
+  - One model-dependent path exists: DB prompt token counts were built with the 8B tokenizer. The 1B runs therefore perform runtime budget tokenization, and splitlong180 has slightly more cacheables to tokenize. This predicts a small extra 180 cost in 1B, not the observed reversal where 512 is often slower.
+- open issues:
+  - Query-specific work inflation may be somewhat larger than corpus-wide averages if retrieved chunks disproportionately contain long sentences, but there is no evidence or code mechanism supporting a multi-fold intrinsic increase.
+  - Exact attribution still requires paired reruns with exported internal compressor profiles.
+- next steps:
+  - Treat only a low-single-digit intrinsic overhead for splitlong180 as currently supported by artifact structure; treat the much larger observed gaps as uncontrolled timing variation until paired profiling confirms otherwise.
+
+## 2026-07-22 - splitlong180 8B path, DB, and phase-timing audit
+
+- objective:
+  - Check whether splitlong180 8B latency is disadvantaged by different storage paths, DB contents, runtime configuration, sidecar settings, or another split-specific bug.
+- what was changed:
+  - No code, protocol, DB, artifact, or result files were changed.
+- what was verified:
+  - splitlong180 and splitlong512 DBs/artifacts are sibling directories under the same `/mnt/nvme1` ext4 filesystem and the same `/dev/nvme1n1` device.
+  - Their 8B manifests are identical except for `DATA_SUBDIR`; model, bsz, backend, cache-clearing, warmup, cleaner, cache mode, method, top-k, and retention axes match.
+  - Each dataset has the same number of retrieval embeddings in both DBs, and the ordered `(retrieval_chunk_id, retrieval_chunk_text)` hashes are exactly identical:
+    - HotpotQA: 5807 rows.
+    - 2Wiki: 2831 rows.
+    - MuSiQue: 5823 rows.
+  - Chroma HNSW file sizes, headers, and id/label mappings match in structure. The independently built binary indexes are not byte-identical, but this cannot explain timing changes across ratio cases that use the same DB/index.
+  - Compact artifacts in both variants use embedding dimension 128, region token budget 180, and `document_window_bound` region-spec reuse. Prior DB/artifact validation passed.
+  - The large 8B slowdown is not isolated to compression. Mean splitlong180-minus-splitlong512 retrieval-query deltas were HotpotQA `+77.9 ms`, 2Wiki `+33.6 ms`, and MuSiQue `+39.1 ms`; cacheable deserialization differences were only about `0.1-0.4 ms`.
+  - Prefill did not show the same slowdown and was slightly faster for splitlong180 on average, consistent with its slightly shorter inputs.
+  - Timing changes occur in run phases where the algorithmic workload should be stable:
+    - HotpotQA splitlong180 `k=20` retrieval was about 0.304 s at r=0.15/0.25 but fell to 0.212/0.191 s at r=0.5/0.75; compression simultaneously fell from about 0.129/0.100 s to 0.029/0.024 s.
+    - MuSiQue splitlong180 k=10 compression stayed around 0.018 s, while the later k=20 phase rose to about 0.063-0.088 s and retrieval also rose.
+  - Retrieval is independent of retention ratio, and ColBERT scoring evaluates the same retrieved candidates before ratio-based selection. These phase shifts therefore cannot be caused by split granularity, DB location, or retention-ratio logic alone.
+- open issues:
+  - A separately materialized HNSW index can have different graph internals, but it does not explain within-index phase shifts and is not the primary suspect for the observed multi-fold gaps.
+  - GPU locking does not control CPU frequency/affinity, Chroma query-embedding threads, NVMe/page-cache pressure, or unrelated host work. The exact host-level cause was not recorded in the existing logs.
+- next steps:
+  - For the eventual timing rerun, interleave 180/512 cases rather than running full grids serially, record host load/CPU frequency/GPU clocks, and export compressor internal profiles.
+  - Consider using one shared retrieval DB for both split variants if the experimental design permits attaching variant-specific cacheable metadata separately; otherwise report retrieval and compression timing separately.
+
+## 2026-07-22 - current-path dead-code and refactor-candidate audit
+
+- objective:
+  - Identify dead code and removal candidates for the intended path: configurable maximum subchunk length, configurable offline contextualization window, reuse of offline window spans as online regions, CUDA-only artifact encoding, and CPU-only runtime ColBERT query encoding.
+- what was changed:
+  - No implementation or evaluation behavior was changed; this was a read-only static audit.
+- what was verified:
+  - The required main path is `SentenceWiseSplitter(max_subchunk_tokens)` -> compact-only ColBERT window artifact built with `window_token_budget` -> DB-bound `region_specs_by_chunk` derived from offline `window_ids_by_row` -> `SlidingRegionColBERTWindowSummarizer`.
+  - Runtime `COLBERT_DEVICE` remains configurable in both the sliding-region base and fixed-chunk reranker even though the intended runtime policy is CPU-only. Offline `COLBERT_WINDOW_DEVICE` is separate and should remain CUDA-configurable/default-CUDA.
+  - `COLBERT_SLIDING_WINDOW_TOKEN_BUDGET` can override the artifact window at runtime. A mismatch makes the sidecar lookup return `None` and silently falls back to `_centered_region_index_specs()`, which recomputes different region semantics online. Both the override and fallback conflict with mandatory offline-window span reuse.
+  - New artifacts are `storage_layout=compact_only`, but `ColBERTWindowArtifact` still contains legacy per-document `torch.load` fallbacks and environment switches `COLBERT_USE_COMPACT_ARTIFACT`/`COLBERT_COMPACT_WINDOW_DIR`.
+  - Current main budget accounting no longer calls `token_count_for_cacheable_id`; the compact ColBERT `token_counts.npy` runtime accessor is dead on the main path after switching to LLM prompt-token counts.
+  - `add_region_specs_to_compact_colbert_artifact()` loads a CPU ColBERT encoder mainly to recover document overhead and legacy token counts, although current window-bounded region construction uses stored window ids rather than rescoring or rebuilding windows.
+  - Registered ColBERT classes with no run/grid/test/doc call sites outside their definitions/factory are: `FixedRegionColBERTSummarizer`, `PrunedSlidingRegionColBERTWindowSummarizer`, `FullWindowRegionColBERTSummarizer`, `PairGainColBERTWindowSummarizer`, `RegionPairGainColBERTWindowSummarizer`, `RegionFirstColBERTWindowSummarizer`, `ParentAwareColBERTWindowSummarizer`, and `ParentPriorColBERTWindowSummarizer`.
+  - `FullWindowRegionColBERTSummarizer` performs document-window encoding online and directly violates the intended offline-only document encoding policy.
+  - `BoundaryExpansionSlidingRegionColBERTWindowSummarizer` depends on legacy per-document artifact payloads (`docs[doc_id][file]`) that current compact-only artifacts do not produce; it is incompatible unless rewritten.
+  - Historical but still referenced ablation paths include fixed-chunk rerank, window-budget selection, boundary expansion, and rerank pre/post filters. These are removal candidates rather than strict dead code because grid files and prior outputs refer to them.
+  - `_infer_configured_retrieval_chunk_size()` does not parse splitlong variant names: `sent-default-512-splitlong180` and `sent-default-512-splitlong512` both return `None` because the final digits are not immediately preceded by `-`. The earlier audit statement that splitlong180 was interpreted as retrieval chunk size 180 was incorrect and is superseded by the correction below. The heuristic remains a refactor candidate because it silently skips the safety check for suffixed variant names; it did not change retrieval or compression behavior in the completed experiments.
+- open issues:
+  - The working tree already contains extensive user changes and untracked historical grid files. Any deletion must preserve those changes and explicitly decide whether historical ablation replay remains supported.
+  - Baseline compressors outside the ColBERT main path are not automatically dead; paper baseline requirements must be decided before pruning `comparison_compressor.py`, `bm25_compressor.py`, or `ml_compressor.py`.
+- next steps:
+  - First make runtime semantics strict: CPU query encoder, compact artifact required, artifact window/span required, no runtime region recomputation, and no `DATA_SUBDIR` numeric inference.
+  - Then remove unreferenced ColBERT selector classes and their factory registrations.
+  - Finally decide whether to retain historical ablations in an archive or delete their classes/configs after preserving the experiment record in handoff/results.
+
+## 2026-07-22 - correction to retrieval-chunk-size inference audit
+
+- objective:
+  - Verify whether `_infer_configured_retrieval_chunk_size()` invalidated the splitlong180 experiments or explained their longer retrieval/compression times.
+- what was changed:
+  - Corrected the erroneous statement in the preceding handoff entry; no implementation or result file was changed.
+- what was verified:
+  - The exact regex is `r"-(\d+)$"`.
+  - `sent-default-512` resolves to 512.
+  - `sent-default-512-splitlong180` and `sent-default-512-splitlong512` both resolve to `None`.
+  - Only a name ending in a hyphen-number form such as `sent-default-512-splitlong-180` would resolve to 180.
+  - The inferred value is used only by an initialization-time safety check comparing retrieval chunk size with region budget. It does not configure Chroma retrieval, alter top-k documents, change cacheables, or change compression work.
+  - Therefore the completed splitlong180 quality, input-length, retrieval, and compression results were not invalidated by this helper and its timing behavior is not explained by it.
+- open issues:
+  - The helper silently skips its intended safety validation for variant subdirectory names, so explicit retrieval-chunk metadata or an explicit argument is still preferable during refactoring.
+- next steps:
+  - Preserve the existing experiment results and continue treating the large timing gap as a measurement/runtime-state issue pending paired profiling.
+
+## 2026-07-22 - DB build manifest generation and splitlong backfill
+
+- objective:
+  - Stop deriving coarse retrieval chunk size from variant directory names.
+  - Record DB preprocessing semantics at build time and backfill manifests for the existing splitlong180/splitlong512 DBs.
+- what was changed:
+  - Added `src/materialize/db_manifest.py` with versioned manifest construction, validation, atomic writing, and reading.
+  - `src/entrypoint/preprocess.py` now writes `db/build_manifest.json` after successful DB materialization.
+  - The manifest records splitter/merger, cacheable and retrievable chunk sizes, maximum subchunk length, tokenizer identity, dummy BOS count, sentence cache token format, document-hash deduplication, and embedding backend.
+  - Replaced the trailing-number `DATA_SUBDIR` heuristic in `src/compressor/colbert_window_compressor.py` with manifest lookup through `DB_DIR` or `DATASET_PATH`/`DATA_SUBDIR`.
+  - `RETRIEVAL_CHUNK_SIZE` remains an explicit legacy fallback; when both it and a manifest value exist, disagreement now raises an error.
+  - Backfilled `build_manifest.json` in all eight existing DB directories for HotpotQA, 2Wiki, MuSiQue, and Qasper across splitlong180 and splitlong512.
+  - Added focused manifest tests and documented the manifest contract in `docs/codebase_guide.md`.
+- what was verified:
+  - Confirmed document-hash deduplication from source/artifact counts for both variants: HotpotQA `1710`, 2Wiki `1404`, MuSiQue `1827`, and Qasper `148` unique documents.
+  - Validated all eight backfilled JSON files against the exact expected schema: `retrievable_chunk_size=512`, variant-specific `max_subchunk_tokens=180` or `512`, sentence splitting, 8B tokenizer, dedup enabled, and default Chroma embedding backend.
+  - Confirmed the compressor resolves both splitlong variants to retrieval chunk size `512` and rejects an explicit conflicting value of `180`.
+  - Black, `py_compile`, manual manifest round-trip checks, and `git diff --check` passed. `pytest` was not available in the current environment, so the focused test module could not be run through pytest.
+  - This changes configuration validation only; dataset handling, retrieval, prompts, metrics, scoring, and output formats are unchanged, so existing and future evaluation results remain directly comparable.
+- open issues:
+  - Older DBs without `build_manifest.json` use only an explicit `RETRIEVAL_CHUNK_SIZE` for this safety check; they are no longer interpreted from directory suffixes.
+- next steps:
+  - Backfill manifests for any older DB family before relying on manifest-only validation there.
+
+## 2026-07-22 - Strict ColBERT artifact-to-DB manifest binding
+
+- objective:
+  - Make the DB build manifest the only source of truth for tokenizer and maximum subchunk length used by ColBERT window artifact construction.
+  - Remove legacy ColBERT window artifact compatibility after migrating the active splitlong artifacts.
+- what was changed:
+  - ColBERT window artifact format is now `matkv_official_colbert_doc_window_v2`.
+  - `colbert_window/index.json` stores only a relative DB manifest path and SHA-256 under `db_manifest`; duplicate `source_tokenizer_name` and `max_subchunk_tokens` fields were removed.
+  - ColBERT artifact construction now requires `db_dir` and reads tokenizer/max-subchunk settings exclusively from `db/build_manifest.json`.
+  - Removed the redundant ColBERT source-tokenizer and max-subchunk CLI/environment options from the artifact-only preprocessing path. `MAX_SUBCHUNK_TOKENS` remains a DB preprocessing option.
+  - Artifact build and runtime validate both the resolved DB manifest path and exact file hash. This prevents a different dataset DB with an identical configuration manifest from being accepted merely because the hashes are equal.
+  - Removed v1 format constants, reader branches, and migration code after completing the one-time migration. Fixed-chunk ColBERT rerank artifacts use a separate format and were not changed.
+  - Migrated the eight active HotpotQA/2Wiki/MuSiQue/Qasper splitlong180/splitlong512 outer `colbert_window/index.json` files to v2. Embeddings, offsets, token counts, and compact region sidecars were not modified.
+  - Preserved each prior outer index as `index.json.backup-pre-db-manifest-ref` beside the migrated file.
+- what was verified:
+  - Before migration, all eight artifact/DB cacheable validations passed with exact counts and no missing, extra, or text-mismatched cacheables.
+  - After removing compatibility, all eight v2 artifacts loaded and passed active DB manifest path+SHA-256 validation.
+  - Unit coverage explicitly confirms that v1 window artifacts are rejected and that a same-content manifest at a different DB path is rejected.
+  - `python test/test_colbert_window_optimizations.py` passed 25 tests; focused manifest tests passed manually because pytest is unavailable.
+  - Black, `py_compile`, shell syntax checks for both preprocess scripts, and `git diff --check` passed.
+  - Vanilla MatKV grids use `COMPRESS_METHOD=""` and do not load `ColBERTWindowArtifact`; fixed-chunk rerank uses its own artifact class/format. These paths are unaffected.
+  - No retrieval, prompt, scoring, metric, or output semantics changed, so evaluation comparability is unchanged.
+- open issues:
+  - DB manifests currently describe preprocessing configuration rather than corpus contents. Exact resolved-path validation binds the active local DB; a future portable content fingerprint would be needed to identify independently copied DB contents.
+- next steps:
+  - Use only v2 ColBERT window artifacts with a colocated/referenced DB manifest in subsequent experiments.
+
+## 2026-07-22 - Remove non-data ColBERT storage and compact naming
+
+- objective:
+  - Keep exactly one ColBERT window embedding storage format.
+  - Remove the historical per-document `.pt` path, compact conversion path, storage-selection environment variables, and misleading `compact/` directory name.
+- what was changed:
+  - Bumped the outer artifact format to `matkv_official_colbert_doc_window_v3` and renamed the sole binary store format to `matkv_official_colbert_doc_window_data_v1`.
+  - New and existing artifacts now use `colbert_window/data/` containing `index.json`, `vectors.fp16.bin`, `offsets.npy`, and `token_counts.npy`.
+  - Removed `COLBERT_USE_COMPACT_ARTIFACT` and `COLBERT_COMPACT_WINDOW_DIR` from loaders, run scripts, profiling options, and grid configs.
+  - Removed all per-document `.pt` loading, parent-document caches, fallback vector/window lookup paths, and the compact-conversion builder/script.
+  - Renamed the remaining runtime class/function/API from compact terminology to `ColBERTWindowData` and `add_region_specs_to_colbert_window_data`.
+  - Removed the boundary-expansion compressor and factory registration because it depended exclusively on the deleted per-document payload path.
+  - Removed the three obsolete boundary-expansion grid files and the ignored paired-compact comparison utility that depended on the deleted storage override.
+  - Updated `docs/method.md`, `docs/eval_protocol.md`, and `docs/codebase_guide.md` for the data-only layout and removed the boundary-ablation protocol section.
+- what was verified:
+  - Before migration, all eight splitlong artifact vector-file sizes, offset/token-count array lengths, id/window row counts, and region sidecars were validated.
+  - Migrated all eight HotpotQA/2Wiki/MuSiQue/Qasper splitlong180/splitlong512 artifacts from `compact/` to `data/`; no `compact/` directory remains in those artifacts.
+  - Post-migration DB/artifact ID validation passed for all eight artifacts with zero missing/extra ids.
+  - A live lookup against HotpotQA splitlong180 successfully loaded vectors and stored region specs from `data/` for a real DB chunk.
+  - `python test/test_colbert_window_optimizations.py` passed 25 tests and `python test/test_colbert_region_specs.py` passed 24 tests.
+  - Black, `py_compile`, shell syntax checks, dead-reference searches, and `git diff --check` passed.
+  - Main sliding-region selection, retrieval, prompt construction, scoring, metrics, and output formats were not changed. Existing main-method and MatKV results remain comparable.
+- open issues:
+  - Historical boundary-expansion runs remain documented in old handoff/results but the method can no longer be rerun from the current code.
+  - The deleted boundary grid and paired-comparison files were untracked/ignored, so they are not recoverable through git without reconstructing them from prior session context.
+- next steps:
+  - Use `colbert_window/data/` as the only ColBERT window storage layout in all subsequent builds and runs.
+
+## 2026-07-22 - Rename the active MatKV baseline vocabulary to vanilla
+
+- objective:
+  - Stop using `matkv` as an overloaded name for the no-subchunking baseline.
+  - Use `vanilla` consistently for the baseline that prompts retrieved chunks
+    directly, while keeping cache-on/cache-off as an independent evaluation
+    axis.
+  - Remove compatibility aliases rather than carrying the former name into the
+    active code and artifact formats.
+- what was changed:
+  - Renamed the runtime timing type `MatKVTimeLog` to `InferenceTimeLog` and
+    removed the unused `MatKVDenseEmbeddingFunction` class.
+  - Removed the `matkv_bge_m3` Chroma embedding-backend alias. Supported values
+    are now `default`, `chroma_default`, and `bge_m3` only.
+  - Renamed the active preprocessing/evaluation scripts and vanilla grid files,
+    their environment variables, run names, data subdirectories, and future
+    output names from `matkv` to `vanilla`.
+  - Updated active source, test helpers, run configs, paper text, glossary, and
+    protocol documentation to use `vanilla`. Historical analysis helper CLI and
+    result-field labels were renamed as well; the current code intentionally
+    does not preserve their former CLI/output-label compatibility.
+  - Deleted the obsolete `lost_in_middle_matkv.yaml` grid and old compiled test
+    cache files carrying the former filename.
+  - Renamed 14 active fixed-chunk DB directories from
+    `matkv-default-{size}` to `vanilla-default-{size}` across 2Wiki, HotpotQA,
+    MuSiQue, and Qasper. No compatibility symlinks were created.
+  - Updated the 18 fixed-chunk ColBERT index paths and three Qasper auxiliary
+    manifests that stored absolute or relative versions of the old DB name.
+  - Replaced the active splitlong ColBERT outer/data format identifiers with
+    neutral storage names: `colbert_window_artifact_v1` and
+    `colbert_window_data_v1`. The eight data indexes' `source_format` labels were
+    updated to the neutral outer format. Vectors, offsets, token counts, region
+    specs, and DB contents were not modified.
+- what was verified:
+  - All 14 renamed Chroma DBs open through the actual `ChromaDB` runtime path.
+    Their collection counts exactly match the pre-rename values: 2Wiki
+    `2624/8991/4854/2831`, HotpotQA `3475/20678/10722/5818`, MuSiQue
+    `20420/10654/5834`, and Qasper `5974/3015/1538` for their available chunk
+    sizes.
+  - All fixed-chunk ColBERT metadata now resolves to an existing vanilla DB.
+    Active vanilla JSON and Chroma SQLite metadata contain no former-name
+    strings.
+  - All eight splitlong180/splitlong512 ColBERT artifacts load under the new
+    strict formats, pass referenced DB-manifest path and SHA-256 validation, and
+    have exact DB/artifact cacheable-ID agreement. Artifact cacheable counts are
+    2Wiki `30309/30041`, HotpotQA `73085/72555`, MuSiQue `71203/70732`, and
+    Qasper `24036/24014` for 180/512.
+  - `test_colbert_window_optimizations.py` passed 25 tests and
+    `test_colbert_region_specs.py` passed 24 tests. Black checks, Python compile
+    checks, shell syntax checks, and parsing of all 64 run-grid YAML files
+    passed. The existing read-only NumPy-to-PyTorch warning remains non-fatal.
+  - Exhaustive no-ignore scans found zero former-name occurrences and zero
+    former-name filenames under active `src/`, `test/`, `run/`, and current docs
+    excluding this historical handoff.
+  - Retrieval, prompt construction, compression scoring, metrics, and primary
+    evaluation output structure did not change. Results remain directly
+    comparable; only names and metadata labels changed.
+- open issues:
+  - Historical evidence is intentionally unchanged: prior `outputs/` files and
+    paths, earlier handoff entries, 21 legacy `matkv_*` dataset directories, git
+    history, and eight `index.json.backup-pre-db-manifest-ref` recovery files
+    still contain the former name.
+  - Old scripts or commands that rely on the removed backend alias, former CLI
+    arguments, former analysis output keys, or old active DB paths must be
+    updated rather than relying on compatibility shims.
+- next steps:
+  - Use only `vanilla-default-{chunk_size}` in new preprocessing and evaluation
+    commands.
+  - Keep historical results and legacy DB directories read-only unless a later
+    cleanup explicitly archives or deletes them.
+
+## 2026-07-22 - Remove unused ColBERT selector families
+
+- objective:
+  - Remove the orphan ColBERT compressor variants that have no active grid,
+    test, or current-document call sites.
+  - Remove their factory registrations, exclusive runtime options, and helper
+    code without changing the maintained ColBERT paths.
+- what was changed:
+  - Removed `FixedRegionColBERTSummarizer`,
+    `PrunedSlidingRegionColBERTWindowSummarizer`,
+    `FullWindowRegionColBERTSummarizer`,
+    `PairGainColBERTWindowSummarizer`,
+    `RegionPairGainColBERTWindowSummarizer`,
+    `RegionFirstColBERTWindowSummarizer`,
+    `ParentAwareColBERTWindowSummarizer`, and
+    `ParentPriorColBERTWindowSummarizer`.
+  - Removed their eight imports and `COMPRESSOR_TYPES` entries from
+    `src/compressor/factory.py`.
+  - Removed `ColBERTWindowEncoder.encode_full_windows()`, which was used only by
+    the deleted full-window runtime encoder path.
+  - Removing the classes also removed all reads and validation for their
+    exclusive environment variables:
+    `COLBERT_REGION_PRUNE_SENTENCE_TOP_R`, `COLBERT_PAIR_GAIN_GAMMA`,
+    `COLBERT_PAIR_TOP_M`, `COLBERT_PAIR_SCOPE`, `COLBERT_REGION_TOP_R`,
+    `COLBERT_PARENT_SCORE_MODE`, `COLBERT_PARENT_TOP_M`,
+    `COLBERT_PARENT_PRIOR_LAMBDA`, and `COLBERT_PARENT_PRIOR_TOP_K`.
+  - No dedicated tests for these eight variants existed. The test named
+    `test_sliding_region_fallback_matches_fixed_region_specs` was retained
+    because it validates the maintained sliding-region fallback constructor,
+    not the deleted `FixedRegionColBERTSummarizer` class.
+- what was verified:
+  - Exhaustive no-ignore searches found no active source, test, run-grid, or
+    current-document references to the deleted classes, method keys, exclusive
+    environment variables, or `encode_full_windows()`.
+  - Factory registry checks confirm all deleted method keys are absent and the
+    maintained `colbert_window`, `colbert_window_budget`,
+    `colbert_chunk_rerank`, `colbert_sliding_region`, and sliding-region
+    pre/post-filter methods remain registered.
+  - `test_colbert_window_optimizations.py` passed 25 tests and
+    `test_colbert_region_specs.py` passed 24 tests. Black, `py_compile`, and
+    `git diff --check` passed. The existing read-only NumPy-to-PyTorch warning
+    remains non-fatal.
+  - Dataset handling, retrieval, prompt construction, maintained compression
+    scoring, metrics, and output formats were not changed. Existing results for
+    maintained methods remain directly comparable.
+- open issues:
+  - Historical outputs and earlier handoff entries for the removed experiment
+    variants remain as experiment records, but their old `COMPRESS_METHOD`
+    values are intentionally no longer executable.
+- next steps:
+  - Continue new experiments only with the maintained ColBERT method registry.
+
+## 2026-07-22 - Remaining dead-code and environment-surface audit
+
+- objective:
+  - Re-audit the repository after removing the unused ColBERT selector families
+    and identify the next safe cleanup targets for the current paper flow.
+- what was changed:
+  - No implementation, evaluation, artifact, DB, or result file was changed.
+- what was verified:
+  - Strictly unreferenced helpers remain: `safe_doc_filename()` in the active
+    ColBERT materializer, `PromptProcessor.render_chat_prompt()`, and
+    `load_ground_truths()` in `acc_metric.py`.
+  - Four factory-reachable compressor families have no active run/grid/current
+    documentation call sites: `MaterializedBudgetComparisonSummarizer`,
+    `DenseSlidingRegionSummarizer`, `TitleRRFSummarizer`, and
+    `WindowedComparisonSummarizer`. Dense sliding region has two isolated unit
+    tests, and title RRF has historical outputs, but neither has a current run
+    configuration.
+  - BM25 async/materialized-async and four hybrid BGE+BM25 variants are referenced
+    only by `test_bm25_compressor.py` and the factory. They are removal candidates
+    if they are no longer required as paper baselines, rather than unconditional
+    dead code.
+  - The current sliding-region runtime still accepts
+    `COLBERT_SLIDING_WINDOW_TOKEN_BUDGET` and silently recomputes region specs when
+    the stored sidecar does not match. This conflicts with the intended strict
+    reuse of artifact window spans.
+  - `RETRIEVAL_CHUNK_SIZE` remains only as an explicit fallback when the DB
+    manifest is unavailable. Current DBs use manifests, so the fallback and its
+    focused test can be removed under a manifest-required policy.
+  - Runtime `COLBERT_DEVICE`, `COLBERT_QUERY_MAXLEN`,
+    `COLBERT_ATTEND_TO_MASK_TOKENS`, `COLBERT_BUDGET_PASSAGE_PREFIX`, and
+    `COLBERT_DISABLE_CPU_EXTENSION` remain configurable even though the intended
+    runtime policy is CPU query encoding with the artifact/default ColBERT query
+    configuration, an empty LLM passage prefix, and the CPU extension disabled.
+  - `COLBERT_CLEAR_INTER_BATCH_CACHE` and `COLBERT_WARMUP_QUERY_ENCODER` are set
+    to true throughout current grids. They can be made fixed evaluation policy
+    instead of environment axes if diagnostic off-runs are no longer needed.
+  - Artifact-build-only historical axes remain for title prefixing and alternate
+    center units: `COLBERT_WINDOW_PREFIX_TITLE`,
+    `COLBERT_WINDOW_TITLE_SEPARATOR`, `COLBERT_WINDOW_CENTER_UNIT`, and
+    `COLBERT_WINDOW_FIXED_CHUNK_SIZE`. Current main artifacts use sentence centers
+    without title prefixes.
+  - General DB preprocessing still embeds a duplicate optional ColBERT artifact
+    build path controlled by `MATERIALIZE_COLBERT_WINDOW`; the dedicated
+    `preprocess_colbert_window.sh`/entrypoint is the current clearer path.
+  - ColBERT data still loads and exposes `token_counts.npy` through
+    `token_count_for_cacheable_id()`, but maintained runtime budget accounting
+    uses LLM prompt-token counts. The stored vector row length is already
+    derivable from offsets, and sidecar construction only checks the file exists.
+  - `COLBERT_CHUNK_ARTIFACT_DIR` and `COLBERT_GATE_CHUNK_ARTIFACT_DIR` have no
+    active config call sites; current paths are derived from dataset subdirectories.
+- open issues:
+  - Removing historical comparison/BM25 families requires a paper-baseline scope
+    decision. Historical outputs alone are not active-code dependencies.
+  - Removing runtime region recomputation changes invalid/mismatched-artifact
+    behavior from silent fallback to an explicit error, which is desirable for
+    reproducibility but should be documented as a strictness change.
+- next steps:
+  - First remove strict dead helpers and make ColBERT runtime artifact-bound and
+    CPU-only.
+  - Then remove redundant artifact-build axes and the duplicate integrated build
+    path.
+  - Finally remove orphan comparison/BM25 families after confirming they are not
+    paper baselines.
+
+## 2026-07-22 - Make ColBERT runtime CPU/artifact-bound and remove orphan comparisons
+
+- objective:
+  - Fix runtime ColBERT query encoding to CPU and make DB/window metadata the
+    only source of retrieval-chunk and region-span semantics.
+  - Remove confirmed dead helpers and the four orphan comparison compressors.
+  - Verify the refactor against unit tests and all current splitlong artifacts.
+- what was changed:
+  - Runtime ColBERT query encoders now always use CPU, disable the optional CPU
+    extension, and use the window artifact's stored `official_query_maxlen`.
+    Runtime `COLBERT_DEVICE`, `COLBERT_QUERY_MAXLEN`,
+    `COLBERT_ATTEND_TO_MASK_TOKENS`, and `COLBERT_DISABLE_CPU_EXTENSION` reads
+    and run-script exports were removed. The build-only
+    `COLBERT_DISABLE_CPU_EXTENSION` option remains in preprocessing scripts.
+  - Sliding-region runtime now requires `region_specs_by_chunk`, requires its
+    `region_token_budget` to equal `colbert_window/index.json`'s
+    `window_token_budget`, and requires exact runtime cacheable-id agreement.
+    `COLBERT_SLIDING_WINDOW_TOKEN_BUDGET`, online token-count reconstruction,
+    and centered-region fallback code were removed.
+  - Retrieval chunk size now comes only from the active DB's
+    `build_manifest.json`; `RETRIEVAL_CHUNK_SIZE` and directory-name inference
+    are unsupported. Missing or invalid manifests fail before evaluation.
+  - Fixed-chunk and gate artifacts are resolved from dataset/subdirectory
+    structure. `COLBERT_CHUNK_ARTIFACT_DIR` and
+    `COLBERT_GATE_CHUNK_ARTIFACT_DIR` were removed.
+  - New ColBERT-window data builds no longer write `token_counts.npy`. The data
+    reader no longer loads it or exposes a token-count accessor. Existing extra
+    token-count files in dataset artifacts were not deleted and are ignored.
+  - Removed the dead helpers `safe_doc_filename()`,
+    `PromptProcessor.render_chat_prompt()`, and `load_ground_truths()`, plus the
+    obsolete runtime region-packing analysis script and tests for the deleted
+    fallback constructor.
+  - Removed `MaterializedBudgetComparisonSummarizer`,
+    `DenseSlidingRegionSummarizer`, `TitleRRFSummarizer`, and
+    `WindowedComparisonSummarizer`, their factory keys, exclusive environment
+    options, shell wiring, helper functions, and isolated tests.
+  - Updated `docs/codebase_guide.md`, `docs/method.md`, and
+    `docs/eval_protocol.md` to document the strict artifact-bound runtime.
+- what was verified:
+  - Black, Python compilation, shell syntax checks, all run-grid YAML parsing,
+    and `git diff --check` passed.
+  - The full unittest suite passed 60 tests with `PYTHONPATH=src`. The nine
+    pytest-style function tests in `test_cacheable_payload.py` and
+    `test_db_build_manifest.py` were also executed directly with equivalent
+    temporary-directory fixtures because pytest is not installed; all passed.
+  - No-ignore repository searches found no remaining active references to the
+    deleted helpers, compressors, method keys, or runtime environment options.
+  - All eight current HotpotQA, 2Wiki, MuSiQue, and Qasper
+    `sent-default-512-splitlong{180,512}` artifacts passed DB manifest path/hash,
+    cacheable-set, per-retrieval-chunk cacheable-order, and stored-region-span
+    validation. In total this covered 31,984 retrieval chunks.
+  - For valid current artifacts, retrieval, ColBERT scoring, region ranking,
+    prompt construction, metrics, and output formats are unchanged. Current
+    grids already used CPU query encoding, so their semantic comparison remains
+    valid. A previously GPU-overridden runtime would have different latency and
+    is not directly latency-comparable to the fixed CPU policy.
+- open issues:
+  - Existing dataset artifacts still contain now-unused `token_counts.npy`
+    files and old index keys. The strict reader does not use them; deleting
+    dataset files was outside this code-refactor scope.
+  - Missing/mismatched manifests or region metadata now fail explicitly rather
+    than silently recomputing candidates. Such invalid old runs are not a
+    supported comparison condition.
+- next steps:
+  - Run future evaluation only with DB manifests and validated window artifacts.
+  - Consider the separately audited build-only ablation axes and duplicate
+    integrated artifact-build path in a later cleanup session.
+
+## 2026-07-22 - Separate DB preprocessing from ColBERT artifact building
+
+- objective:
+  - Make DB preprocessing and ColBERT-window artifact construction two explicit
+    workflows instead of retaining an optional integrated build branch.
+- what was changed:
+  - Removed `materialize_colbert_window` and all `colbert_*` artifact-build
+    arguments, imports, and post-DB build logic from
+    `src/entrypoint/preprocess.py`.
+  - Removed `MATERIALIZE_COLBERT_WINDOW`, the associated ColBERT environment
+    variables, output-directory creation, and CLI arguments from
+    `run/preprocess.sh`.
+  - Kept `run/preprocess_colbert_window.sh` and
+    `src/entrypoint/preprocess_colbert_window.py` as the sole supported
+    ColBERT-window build path. It consumes an existing DB manifest, builds the
+    CUDA artifact, adds stored region spans, and validates it against the DB.
+  - Documented the two-step workflow in `docs/codebase_guide.md`.
+- what was verified:
+  - No active source, test, run-script, or current-document reference to
+    `MATERIALIZE_COLBERT_WINDOW` or `materialize_colbert_window` remains.
+  - Black, Python compilation, both preprocessing shell syntax checks, and
+    `git diff --check` passed.
+  - The full unittest suite passed 60 tests. The nine pytest-style function
+    tests were executed directly with equivalent temporary-directory fixtures
+    because pytest is not installed; all passed.
+  - Dataset handling, DB construction, DB manifest contents, cache/compare
+    materialization, ColBERT artifact construction, evaluation logic, and output
+    formats were not changed. Only the invocation boundary was separated.
+- open issues:
+  - Existing commands that set `MATERIALIZE_COLBERT_WINDOW=True` on
+    `run/preprocess.sh` must be split into a DB preprocessing command followed
+    by `run/preprocess_colbert_window.sh`.
+- next steps:
+  - Use `run/preprocess.sh` for DB/cache/compare embeddings and invoke
+    `run/preprocess_colbert_window.sh` separately after the DB manifest exists.
+
+## 2026-07-22 - Fix ColBERT warmup and inter-batch cache clearing policy
+
+- objective:
+  - Remove two environment variables whose value was `True` in every current
+    grid and make the intended latency policy unconditional.
+  - Reflect the newly separated DB/ColBERT build workflow in the README.
+- what was changed:
+  - Removed `COLBERT_WARMUP_QUERY_ENCODER` and
+    `COLBERT_CLEAR_INTER_BATCH_CACHE` from the compressor factory, evaluation
+    scripts, 42 grid files, and four analysis/recall helper scripts.
+  - Removed the now-unused factory boolean parser and `os` import.
+  - Compressor initialization now always performs one query-encoder warmup when
+    the compressor exposes `warmup_query_encoder()`. Every compression batch
+    always calls `clear_inter_batch_cache()` when supported.
+  - Updated `docs/eval_protocol.md` to describe warmup and cache clearing as
+    fixed policies rather than comparability axes.
+  - Updated `README.md` so `run/preprocess.sh` is documented as the
+    DB/cache/compare-embedding step and `run/preprocess_colbert_window.sh` as
+    the subsequent existing-DB ColBERT artifact step. Also removed the obsolete
+    runtime region-budget knob and replaced the stale MatKV grid example with a
+    vanilla grid example.
+- what was verified:
+  - Added a focused factory test proving warmup occurs exactly once and cache
+    clearing occurs before every compression batch.
+  - The full unittest suite passed 61 tests. The nine pytest-style function
+    tests were executed directly with equivalent temporary-directory fixtures;
+    all passed.
+  - Black, Python compilation, preprocessing/evaluation shell syntax, all grid
+    YAML parsing, no-reference scans, and `git diff --check` passed.
+  - Runtime behavior matches the former all-`True` grid policy. Retrieval,
+    compression scoring, prompts, metrics, and output formats are unchanged, so
+    current results remain directly comparable.
+- open issues:
+  - Diagnostic runs can no longer disable ColBERT warmup or retain caches across
+    measured batches. A future diagnostic mode would require an explicit code
+    change rather than an environment override.
+- next steps:
+  - Keep warmup and inter-batch cache clearing fixed for all reported ColBERT
+    latency experiments.
+
+## 2026-07-22 - Remove unused async and hybrid BM25 compressor families
+
+- objective:
+  - Remove six factory-reachable compressor families that had no active grid or
+    current-document call sites while retaining the referenced plain BM25
+    baseline.
+- what was changed:
+  - Removed the method keys `compare_all_materialized_async`,
+    `bm25_global_async`, `hybrid_bge_bm25`, `hybrid_bge_bm25_rrf`,
+    `hybrid_bge_bm25_async`, and `hybrid_bge_bm25_rrf_async` from the factory.
+  - Removed their six compressor classes from
+    `src/compressor/bm25_compressor.py`.
+  - Removed the exclusive async artifact resolver, PN raw-prompt replacement
+    mixin, per-query normalization helper, reciprocal-rank-fusion helper, and
+    their runtime options (`BM25_ASYNC_IDF_PATH`, `BM25_ASYNC_DATA_SUBDIR`,
+    `HYBRID_BGE_WEIGHT`, and `HYBRID_RRF_K`).
+  - Removed hybrid output-suffix handling from the three evaluation shell
+    scripts and deleted all unit tests/helpers that existed only for the removed
+    families.
+  - Retained `BM25GlobalSummarizer`, `BM25Scorer`, and `bm25_global`. The active
+    external reference is the default `COMPRESS_METHOD_B` in
+    `run/eval_retrieval_compression_pair.sh`.
+  - Retained PN preprocessing and `PN_MAPPING_DIR`; that variable still controls
+    the output of `run/preprocess_pn.sh` independently of the deleted async
+    compressors.
+- what was verified:
+  - Exhaustive current-code searches found no remaining source, test, run, or
+    documentation references to the six deleted methods, classes, exclusive
+    helpers, or exclusive runtime options.
+  - The focused plain-BM25 tests passed. The full unittest suite passed 52 tests,
+    and all nine pytest-style function tests passed via equivalent direct
+    execution because pytest is not installed.
+  - Black, Python compilation, shell syntax, all grid YAML parsing, and
+    `git diff --check` passed.
+  - The maintained plain BM25 selection test still verifies artifact scoring,
+    top-cacheable selection, deduplication behavior, and source document order.
+    No maintained retrieval, prompt, metric, scoring, or output format changed.
+- open issues:
+  - Historical outputs and earlier handoff entries may retain the deleted method
+    names as experiment records, but those methods are intentionally no longer
+    executable.
+- next steps:
+  - Keep `bm25_global` only while the dense-vs-BM25 retrieval/compression pair
+    comparison remains part of the experiment workflow.
+
+## 2026-07-22 - Remove the plain BM25 baseline and pair evaluator
+
+- objective:
+  - Remove the remaining `bm25_global` baseline and its dedicated
+    retrieval/compression pair-comparison workflow.
+- what was changed:
+  - Deleted `run/eval_retrieval_compression_pair.sh` and its sole Python entry
+    point `test/eval_retrieval_compression_pair.py`.
+  - Removed `bm25_global` and `BM25GlobalSummarizer` from the compressor factory.
+  - Deleted the now-unreferenced `src/compressor/bm25_compressor.py` module and
+    `test/test_bm25_compressor.py` unit-test module.
+  - Removed three generated Python bytecode files corresponding to the deleted
+    modules/scripts.
+- what was verified:
+  - No active source, test, run, current-document, filename, or compiled-cache
+    reference to BM25 or the pair evaluator remains under `src/`, `test/`, and
+    `run/`.
+  - The remaining full unittest suite passed 50 tests. All nine pytest-style
+    function tests passed through equivalent direct execution because pytest is
+    not installed.
+  - Black, Python compilation, every remaining run-script shell syntax check,
+    all grid YAML parsing, and `git diff --check` passed.
+  - No maintained retrieval, ColBERT compression, prompt, metric, evaluation
+    output, or dataset behavior changed. Only the removed baseline and its
+    dedicated pair-evaluation path can no longer be run.
+- open issues:
+  - Existing dataset-local BM25 artifact files and historical output records
+    were not deleted. They are no longer referenced by current code.
+- next steps:
+  - Continue baseline comparisons with the remaining registered compressor
+    methods only.
+
+## 2026-07-22 - Post-BM25 dead-code audit
+
+- objective:
+  - Re-audit the remaining compressor registry and obvious runtime helpers after
+    removing BM25, with special attention to `FrontCompressor`.
+- what was changed:
+  - No implementation, evaluation, artifact, DB, or result file was changed.
+- what was verified:
+  - `FrontCompressor` and the `front` factory key have no active source, test,
+    grid, run-script, or current-document call site. `USE_FRONT_BOS_CACHE` is a
+    separate LLM cache option and is unrelated to this compressor.
+  - The OpenAI-backed `Summarizer` and `summ` factory key likewise have no
+    active call site.
+  - The `compare` factory key has no active configuration, but its
+    `ComparisonSummarizer` class must remain because it is the base of the active
+    `compare_all` and `compare_all_materialized` implementations and is used by
+    a profiling helper.
+  - `EXITCompressor` has only commented-out grid cases plus run/protocol support;
+    it is a baseline-scope removal candidate, not strict dead code.
+  - `ProvenceCompressor`, `compare_all`, `compare_all_materialized`, and all
+    currently registered ColBERT variants have active run/grid/document
+    references.
+  - Additional strict helper candidates were identified:
+    `ComparisonSummarizer._score_chunk_texts_per_doc()`,
+    `ComparisonSummarizer._split_sentences()`, and
+    `SlidingRegionColBERTWindowSummarizer._concat_candidate_vectors()` have no
+    call sites.
+  - The old non-vectorized sliding-region scoring helpers
+    `_populate_sentence_score_cache()` and `_score_sliding_region()`, plus
+    `_make_region_cacheable()`, are used only by tests; production uses the
+    vectorized scorer and run-based region constructor.
+  - An unreachable model cache implementation remains in `src/model.py`:
+    `_stack_request_caches()`, `_get_front_bos_cache()`,
+    `_build_front_bos_batch_cache()`, `_trim_prefilled_cache_rows()`,
+    `_pad_request_caches()`, and `_decode_with_grouped_caches()` have no call
+    sites. The current decoder still uses `_select_cache_rows()`, so that helper
+    is not dead.
+- open issues:
+  - Decide whether to remove `EXITCompressor` and its commented grids/protocol
+    branch as an abandoned baseline.
+  - Removing test-only reference scoring helpers should preserve vectorized
+    scorer correctness coverage through direct MaxSim reference tests.
+- next steps:
+  - Safest next cleanup: remove `front`, `summ`, the unused `compare` factory
+    alias, and the strict uncalled helpers.
+  - Handle the unreachable model-cache block separately because cache-on
+    evaluation code is sensitive.
+
+## 2026-07-22 - Remove uncalled and legacy ColBERT scoring helpers
+
+- objective:
+  - Remove the confirmed uncalled compressor helpers and the test-only legacy
+    ColBERT sentence-cache scoring path without changing the production
+    vectorized scoring flow.
+- what was changed:
+  - Removed `ComparisonSummarizer._score_chunk_texts_per_doc()` and
+    `ComparisonSummarizer._split_sentences()`.
+  - Removed
+    `SlidingRegionColBERTWindowSummarizer._concat_candidate_vectors()`.
+  - Removed the legacy `_populate_sentence_score_cache()` and
+    `_score_sliding_region()` methods, together with their now-unreferenced
+    `_sentence_query_max_scores()` helper.
+  - Removed the obsolete `_make_region_cacheable()` constructor.
+  - Deleted tests that existed only to compare against the removed legacy
+    sentence-cache path or exercise the removed constructor. Preserved the
+    direct MaxSim reference, exhaustive small-region, duplicate-ID, run-based
+    region construction, and source-order tests for the production path.
+- what was verified:
+  - No source or test reference to any removed helper remains.
+  - Black, Python compilation, and `git diff --check` passed.
+  - The focused ColBERT optimization suite passed 21 tests.
+  - The full unittest suite passed 47 tests. All nine pytest-style function
+    tests passed through equivalent direct execution because pytest is not
+    installed.
+  - No retrieval, prompt, metric, scoring, output, dataset, or artifact format
+    behavior changed. Production still uses
+    `_score_sliding_regions_vectorized()` and run-based region cacheables.
+- open issues:
+  - The non-writable NumPy-array warning from compact ColBERT artifact loading
+    remains unchanged and is outside this cleanup.
+- next steps:
+  - Continue the dead-code audit with the separately identified unused
+    compressors or unreachable model-cache block; keep cache/evaluation changes
+    isolated from this cleanup.
+
+## 2026-07-22 - Audit fixed-chunk ColBERT reranker runtime viability
+
+- objective:
+  - Determine whether `FixedChunkColBERTRerankSummarizer` remains a usable
+    runtime path after the recent artifact/runtime refactors.
+- what was changed:
+  - No source, evaluation, artifact, DB, or result file was changed.
+- what was verified:
+  - `colbert_chunk_rerank` remains registered in the compressor factory and is
+    referenced by three current grid files and the evaluation protocol.
+  - A real offline CPU smoke test loaded the 2Wiki vanilla-128
+    `colbert_fixed_chunk_docmax512` artifact, encoded a query, performed MaxSim
+    scoring, selected two chunks, cloned the selected documents, and produced
+    the expected timing profile.
+  - Fixed-chunk artifacts exist for vanilla 128/256/512 on 2Wiki, HotpotQA, and
+    MuSiQue. All nine artifacts have the expected v1 format, 512 document
+    maxlen, zero truncations, and the expected chunk size.
+  - Every ID in each current DB exists in its corresponding artifact, and all
+    current DB token counts match the artifact token-count sidecar. The
+    artifacts contain extra IDs from an older/larger DB state, but runtime
+    retrieval cannot select those extra IDs.
+- open issues:
+  - Unlike the current `colbert_window` artifact, the fixed-chunk artifact does
+    not reference or validate a DB build manifest/hash. A future mismatched DB
+    could therefore use stale vectors without an initialization error.
+  - Missing artifact IDs return empty vectors and score as negative infinity
+    instead of failing fast. This is harmless for the currently checked DBs but
+    weakens reproducibility safeguards.
+  - The builder remains under `test/build_fixed_chunk_colbert_artifact.py` and
+    is not integrated into `run/preprocess_colbert_window.sh`; rebuilding the
+    runtime directory requires explicit doc-maxlen, segmentation, and output
+    template arguments.
+  - No dedicated unit test covers the fixed-chunk summarizer. The real CPU
+    smoke test passed, but initialization emits existing ColBERT CUDA-AMP
+    compatibility warnings and the read-only NumPy tensor warning.
+- next steps:
+  - The current artifacts can be used for the planned fixed-chunk reranking
+    baseline. Before rebuilding DBs/artifacts or treating this as a maintained
+    long-term path, add the same manifest-reference/hash validation used by the
+    window artifact and fail on missing retrieved chunk IDs.
+
+## 2026-07-22 - Clarify fixed-chunk reranker compatibility with splitlong512
+
+- objective:
+  - Check whether `FixedChunkColBERTRerankSummarizer` can be attached directly
+    to the existing splitlong512 DB and ColBERT artifact.
+- what was changed:
+  - No source, evaluation, artifact, DB, or result file was changed.
+- what was verified:
+  - Each splitlong512 directory currently contains a `colbert_window` artifact
+    but no `colbert_fixed_chunk_docmax512` artifact, so the fixed-chunk
+    summarizer fails at initialization for those `DATA_SUBDIR` values.
+  - The artifacts are not interchangeable: splitlong `colbert_window` stores
+    subchunk/window representations, while the fixed-chunk reranker expects one
+    whole-retrieval-chunk representation keyed by the retrieval chunk ID.
+  - Splitlong512 DB IDs use `doc::ret_N` and 512-step window metadata, while the
+    vanilla-512 fixed artifact uses `doc-0`, `doc-511`, and subsequent 511-step
+    IDs. Copying or symlinking the vanilla artifact would therefore not provide
+    a valid direct match.
+- open issues:
+  - The fixed-gate ID conversion helper should be audited separately because
+    current splitlong metadata prefers 512-step `window_token_start`, whereas
+    the vanilla fixed artifact uses 511-step IDs.
+- next steps:
+  - Use `FixedChunkColBERTRerankSummarizer` only with the matching vanilla DB and
+    fixed-chunk artifact, or design a distinct splitlong-compatible coarse-chunk
+    reranker/artifact path if that comparison is required.
+
+## 2026-07-22 - Assess coarse reranking from the ColBERT window artifact
+
+- objective:
+  - Determine whether splitlong coarse chunks can be reranked directly from
+    their existing `colbert_window` subchunk representations.
+- what was changed:
+  - No source, evaluation, artifact, DB, or result file was changed.
+- what was verified:
+  - `ColBERTWindowArtifact.vectors_for_doc()` already returns the ordered vector
+    tensors for all cacheables attached to a retrieved coarse chunk.
+  - A coarse score can be defined by pooling/concatenating those subchunk token
+    vectors and applying one query-to-pool MaxSim. The production vectorized
+    region scorer already computes the mathematically equivalent per-query-token
+    maximum across selected subchunks.
+  - No current compressor uses every subchunk of each retrieved document as one
+    coarse reranking region. `colbert_window` ranks individual subchunk
+    candidates, sliding-region methods rank regions, and the existing pre/post
+    filter rerankers use the separate fixed-chunk artifact.
+- open issues:
+  - This score uses subchunk/window-contextualized representations rather than
+    a ColBERT encoding of the whole fixed chunk, so it should be named and
+    interpreted as window-artifact coarse reranking rather than the existing
+    fixed-chunk reranking baseline.
+- next steps:
+  - If needed, implement a small splitlong-compatible reranker that treats all
+    cacheable indices of each retrieved chunk as one vectorized region and
+    selects the top coarse chunks before the existing region/subchunk selection.
+
+## 2026-07-22 - Add ColBERT-window coarse-chunk reranking
+
+- objective:
+  - Add a splitlong-compatible coarse reranker that uses the existing
+    `colbert_window` subchunk representations and exposes the number of retained
+    coarse chunks as an explicit runtime parameter.
+- what was changed:
+  - Added `ColBERTWindowChunkRerankSummarizer` and registered it as
+    `COMPRESS_METHOD=colbert_window_chunk_rerank`.
+  - Added the required positive integer environment variable
+    `COLBERT_WINDOW_CHUNK_RERANK_KEEP` and the `cwcrk{K}` output suffix.
+  - For each retrieved coarse chunk, the method loads all attached subchunk
+    vector tensors, concatenates their nonempty token-vector pools, computes one
+    ColBERT MaxSim score, sorts coarse chunks by that score, and returns cloned
+    top-K chunks in reranked order.
+  - Added a focused unit test proving that vectors from multiple subchunks
+    jointly determine the coarse-chunk ranking.
+  - Documented the new evaluation path and its distinction from the separate
+    whole-fixed-chunk artifact baseline in `docs/eval_protocol.md`.
+- what was verified:
+  - Black, Python compilation, `bash -n run/eval.sh`, reference checks, and
+    `git diff --check` passed.
+  - The focused ColBERT optimization suite passed 22 tests, and the full
+    unittest suite passed 48 tests. All nine pytest-style function tests passed
+    through equivalent direct execution because pytest is not installed.
+  - A real offline CPU smoke test used the 2Wiki
+    `sent-default-512-splitlong512` DB and its `colbert_window` artifact. It
+    loaded three coarse chunks containing 12, 10, and 15 subchunks, encoded one
+    query, scored them, and returned exactly the configured top two chunks.
+  - Existing compressor behavior and existing results were not changed. The new
+    method is separately named, so old and new runs remain distinguishable.
+- open issues:
+  - The implementation concatenates each coarse chunk's subchunk tensors for
+    scoring. This is exact for the intended MaxSim definition, but a future
+    performance pass could reuse the segmented vectorized scorer to reduce
+    temporary allocations without changing scores.
+  - Existing read-only NumPy tensor and upstream ColBERT CPU/CUDA-AMP warnings
+    remain unchanged.
+- next steps:
+  - Add experiment grid cases using `colbert_window_chunk_rerank` and explicitly
+    sweep `COLBERT_WINDOW_CHUNK_RERANK_KEEP` only if this reranker is selected
+    for the paper evaluation.
+
+## 2026-07-22 - Rename the colbert_window factory key
+
+- objective:
+  - Rename the global ColBERT subchunk selector's factory key from the
+    representation-oriented `colbert_window` name to `colbert_subchunk`.
+- what was changed:
+  - Replaced the exact `colbert_window` entry in `COMPRESSOR_TYPES` with
+    `colbert_subchunk`; no backward-compatible alias remains.
+  - Updated the sole active grid reference in `grid_context.yaml` and the
+    initialization error message.
+  - Added a unit test requiring the new key and rejecting the old key.
+  - Documented the evaluation-interface rename and result comparability in
+    `docs/eval_protocol.md`.
+- what was verified:
+  - No exact old factory key remains in source, tests, run configuration, or
+    current documentation. Remaining `colbert_window` strings identify artifact
+    paths/formats or distinct method names such as
+    `colbert_window_chunk_rerank` and `colbert_window_budget`.
+  - Black, Python compilation, grid YAML parsing, and `git diff --check` passed.
+  - The focused ColBERT suite passed 23 tests, the full unittest suite passed 49
+    tests, and all nine pytest-style functions passed through direct execution.
+  - Only the factory/configuration name changed. Retrieval, prompt, scoring,
+    metric, output, artifact, and dataset behavior are unchanged, so old
+    `colbert_window` and new `colbert_subchunk` results are directly comparable.
+- open issues:
+  - Historical grids/results and handoff records may retain the old name as
+    provenance; they were not rewritten.
+- next steps:
+  - Use `COMPRESS_METHOD=colbert_subchunk` for future runs of the global
+    subchunk selector.
+
+## 2026-07-22 - Reconfirm reranker/pre-filter/post-filter semantics
+
+- objective:
+  - Distinguish the newly added window-artifact coarse reranker from the older
+    sliding-region fixed-gate pre-filter and post-filter ablations.
+- what was changed:
+  - No source, evaluation, artifact, DB, or result file was changed.
+- what was verified:
+  - `colbert_window_chunk_rerank` scores each coarse chunk from all of its own
+    `colbert_window` subchunk vectors and returns the top-K whole coarse chunks;
+    it performs no sliding-region selection.
+  - The pre-filter and post-filter methods instead score coarse chunks from a
+    separate vanilla `colbert_fixed_chunk_docmax512` gate artifact, then combine
+    that gate with sliding-region subchunk selection.
+  - Pre-filter limits eligible chunks before region construction/scoring and
+    spends the final subchunk budget only within the gate. Post-filter runs the
+    full sliding-region method first and removes selected cacheables outside the
+    gate afterward; it does not refill the resulting unused budget and currently
+    encodes the query a second time for the gate.
+  - The previously suspected fixed-gate ID mismatch is real for current
+    splitlong512 DBs: direct metadata-based mapping matches only 1404/2831
+    2Wiki chunks, 1710/5807 HotpotQA chunks, and 1827/5823 MuSiQue chunks. The
+    remaining gate lookups receive empty vectors and negative-infinity scores.
+- open issues:
+  - Current pre-filter/post-filter fixed-gate results on splitlong512 are not
+    trustworthy until the 512-step splitlong versus 511-step vanilla chunk
+    boundary/ID mismatch is resolved. The new window-artifact coarse reranker
+    does not have this mismatch because it uses the matching splitlong artifact.
+- next steps:
+  - Decide whether to repair the fixed-gate ablations with an explicit aligned
+    artifact/mapping or remove them as obsolete comparison paths.
+
+## 2026-07-22 - Consolidate ColBERT rerank and pre-filter paths
+
+- objective:
+  - Replace the inconsistent fixed-artifact gate variants with two clearly
+    named paths that share the matching splitlong `colbert_window` coarse score.
+- what was changed:
+  - Renamed `ColBERTWindowChunkRerankSummarizer` and its factory key to
+    `ColBERTRerankSummarizer` / `colbert_rerank`.
+  - Added the shared required positive integer `COLBERT_RERANK_KEEP`; removed
+    `COLBERT_WINDOW_CHUNK_RERANK_KEEP`, `COLBERT_GATE_RERANK_KEEP`, and
+    `COLBERT_GATE_CHUNK_DATA_SUBDIR` from active code/configuration.
+  - Added shared coarse scoring/ranking helpers to `ColBERTWindowSummarizer`.
+    They concatenate all nonempty subchunk token-vector pools for each retrieved
+    chunk and compute one query-to-pool MaxSim score.
+  - Replaced the fixed-artifact pre-filter implementation with
+    `ColBERTRerankPreFilterSummarizer`, registered as `rerank_pre_filter`. It
+    uses that same coarse ranking, keeps K eligible chunks, and runs
+    sliding-region construction/scoring/selection only within those chunks.
+  - Removed the post-filter class, factory key, second query encoding, and three
+    post-filter grid files. Removed the obsolete splitlong-to-vanilla ID mapping
+    helper and all fixed-gate configuration.
+  - Updated all three pre-filter grids, the output suffix (`crk{K}`), tests, and
+    `docs/eval_protocol.md`. No old factory aliases remain.
+- what was verified:
+  - Black, Python compilation, shell syntax, all grid YAML parsing, old-reference
+    checks, and `git diff --check` passed.
+  - The focused ColBERT suite passed 25 tests, the full unittest suite passed 51
+    tests, and all nine pytest-style functions passed through direct execution.
+  - A real offline CPU smoke test on 2Wiki splitlong512 selected coarse top-2
+    chunks from the matching window artifact and confirmed that the final region
+    output was a subset of those two chunks. The profile reported one query and
+    two retained coarse chunks.
+- evaluation impact:
+  - `colbert_rerank` is only a name/environment-variable change from the former
+    `colbert_window_chunk_rerank`, so those results remain directly comparable.
+  - `rerank_pre_filter` is not directly comparable to the former
+    fixed-artifact pre-filter because coarse scoring now uses the matching
+    splitlong window artifact and correct chunk alignment.
+  - The removed post-filter has no replacement. Retrieval, region scoring,
+    prompt formatting, metrics, and output format for other methods are
+    unchanged.
+- open issues:
+  - Historical output records and handoff entries retain old names as
+    provenance; they were not rewritten.
+- next steps:
+  - Use `COMPRESS_METHOD=colbert_rerank` or
+    `COMPRESS_METHOD=rerank_pre_filter` with `COLBERT_RERANK_KEEP=K` in future
+    reranking experiments.
+
+## 2026-07-22 - Rename rerank_pre_filter to rerank_and_reion
+
+- objective:
+  - Rename the rerank-then-region-selection path to the user-selected
+    `rerank_and_reion` factory name.
+- what was changed:
+  - Renamed `ColBERTRerankPreFilterSummarizer` to
+    `ColBERTRerankAndRegionSummarizer` and replaced the factory key
+    `rerank_pre_filter` with `rerank_and_reion`; no alias remains.
+  - Renamed the three pre-filter grid files to
+    `grid_rerank_and_reion_compare{,2,3}.yaml` and updated their run names,
+    compressor settings, and preprocess labels.
+  - Updated tests and `docs/eval_protocol.md`; `COLBERT_RERANK_KEEP` is
+    unchanged.
+- what was verified:
+  - No active source, test, run, current-document, or grid filename reference to
+    `rerank_pre_filter`, the old class, or `prefilter` remains.
+  - Black, Python compilation, every grid YAML parse, and `git diff --check`
+    passed.
+  - The focused ColBERT suite passed 25 tests, the full unittest suite passed 51
+    tests, and all nine pytest-style functions passed through direct execution.
+- evaluation impact:
+  - This is a name-only change from the immediately preceding
+    `rerank_pre_filter` implementation, so those results are directly
+    comparable. It remains not directly comparable to the older fixed-artifact
+    `colbert_sliding_region_rerank_pre_filter` implementation.
+- open issues:
+  - `rerank_and_reion` intentionally preserves the exact requested spelling.
+- next steps:
+  - Use `COMPRESS_METHOD=rerank_and_reion` with
+    `COLBERT_RERANK_KEEP=K` for rerank-then-region-selection experiments.
+
+## 2026-07-22 - Post-rerank dead-code and environment audit
+
+- objective:
+  - Audit remaining dead code and unnecessary/configuration-only environment
+    axes, including all preprocessing entrypoints, without changing behavior.
+- what was changed:
+  - No source, run, test, evaluation, artifact, DB, or result behavior was
+    changed; this session only recorded the audit.
+- strict dead code verified:
+  - `src/model.py` still contains the unreachable cache implementation
+    `_stack_request_caches()`, `_build_front_bos_batch_cache()`,
+    `_trim_prefilled_cache_rows()`, `_pad_request_caches()`, and
+    `_decode_with_grouped_caches()`. `_get_front_bos_cache()`,
+    `_select_cache_rows()`, and `_decode_with_prefilled_cache()` are live and
+    must remain.
+  - The unreachable model block is the only caller of `shift_rotary_cache`.
+  - Unused GDS/AsyncIO imports and commented prototypes remain in
+    `model.py`, `engine.py`, `cache_utils.py`, and
+    `materialize/materialize.py`; `cache_utils.py` also ends with a large inert
+    triple-quoted implementation block.
+  - Additional unused imports remain in `vectordb.py` (`fire`),
+    `materialize/colbert_window.py` (`os`),
+    `comparison_compressor.py` (`CacheableChunk`, NumPy), and several of the
+    cache/model modules.
+  - Factory keys `summ`, `front`, and `compare` have no active grid, script, or
+    current-document selection. Their standalone `Summarizer` and
+    `FrontCompressor` classes are consequently removable; the
+    `ComparisonSummarizer` class itself must remain as the parent of active
+    compare methods and for profiling scripts.
+  - The `compare_all` factory key also has no active configuration now, though
+    its `GlobalComparisonSummarizer` class remains live through inheritance and
+    shared helpers. Removing the key requires deleting the stale grid-summary
+    alias branch that still mentions it.
+- preprocessing findings:
+  - `run/preprocess.sh` is broken with no overrides: it defaults to
+    `SPLITTER=semantic` but an empty `MERGER`, while `DocumentPreprocessor`
+    requires a merger for semantic splitting. README/bootstrap examples use
+    `sentence` and avoid the failure.
+  - `MATERIALIZE_DB=False` does not fully avoid DB side effects: the shell still
+    creates `DB_DIR`, and the entrypoint always constructs `ChromaDB(db_dir)`
+    before checking the flag. Cache/compare-only runs can therefore create/open
+    a Chroma collection even though they do not store records.
+  - `run/preprocess.sh` creates cache, compare-embedding, and DB directories
+    unconditionally even when the corresponding materialization flag is false.
+  - `run/preprocess_pn.sh` and the PN splitter/mapping pipeline have no current
+    grid or documentation consumer. The resolved-sentence resolver arguments
+    likewise have no current experiment configuration; both are removal
+    candidates if those abandoned preprocessing baselines are out of scope.
+  - `sentence_cache_token_format`'s three non-legacy modes and
+    `materialize_doc_ids_file` are Fire-CLI-only axes with no run/config call
+    site. They are not syntactically dead, but are strong policy-removal
+    candidates.
+  - ColBERT preprocessing exposes switches that no current configuration
+    overrides: CPU-extension disable, tensorization verification, DB validation,
+    validation batch size, title prefix/separator, and fixed-chunk size.
+    DB validation should likely become mandatory rather than optional. Title
+    prefixing and fixed/fixed-window center modes can be removed if their old
+    ablations are abandoned; sentence-only center mode remains referenced by
+    active ablation grids.
+  - `COLBERT_WINDOW_MODEL` duplicates runtime `COLBERT_MODEL_NAME`; unifying the
+    name would reduce mismatch risk. Build device is specified by the project
+    policy as CUDA, so `COLBERT_WINDOW_DEVICE` is also a candidate to hardcode.
+- runtime environment findings:
+  - `ColBERTRerankSummarizer` inherits token-budget setup it never uses:
+    `GLOBAL_TOP_R`, `RETAIN_TOKEN_RATIO`, the evaluated-LLM tokenizer, and token
+    length caches are initialized despite whole-chunk top-K output.
+    `colbert_subchunk` similarly loads the LLM budget tokenizer despite using
+    only global subchunk count. Splitting artifact/query-encoder setup from
+    budget accounting would remove these irrelevant dependencies and startup
+    cost.
+  - `GLOBAL_TOP_R` is exported and included in output names for methods where it
+    has no effect, including `colbert_rerank`; method-specific output naming is
+    a cleanup candidate.
+  - `EXITCompressor`, its three eval environment variables, eval suffix branch,
+    protocol branch, and commented grid cases remain a baseline-scope removal
+    candidate; no active grid selects it.
+- verified live/not-dead:
+  - `USE_FRONT_BOS_CACHE` is used directly by `engine.py`; only the older helper
+    implementation around it is dead.
+  - `CHROMA_EMBED_DEVICE` is used when `CHROMA_EMBED_BACKEND=bge_m3`, although it
+    has no effect under the current default backend.
+  - Cache, DB, compare-embedding, resume, deduplication, subchunk-length, and
+    retrieval-chunk controls all have real implementation paths.
+  - Fixed-chunk ColBERT reranking, ColBERT budget/subchunk/sliding methods, and
+    Provence retain active grids or current protocol references.
+- next steps:
+  - Safest cleanup batch: unused imports/commented blocks, unreachable model
+    cache helpers, then `front`/`summ`/unused compare factory aliases.
+  - Handle preprocess policy separately: first fix the broken default and lazy
+    DB/directory creation, then decide whether PN/resolved/semantic alternatives
+    and ColBERT alternate build modes remain in paper scope.
+
+## 2026-07-22 - Preprocessing policy cleanup and lazy DB creation
+
+- objective:
+  - Remove the abandoned PN/resolved-sentence preprocessing paths, reduce the
+    ColBERT artifact-build configuration surface, and make cache/embedding-only
+    preprocessing avoid all Chroma DB side effects.
+- what was changed:
+  - Deleted `run/preprocess_pn.sh`, `run/pronoun_res.sh`,
+    `src/entrypoint/pronoun_resolve.py`, and
+    `src/materialize/splitter/resolution.py`.
+  - Removed `pn_sentence`, `resolved_sentence`, their splitter classes,
+    preprocessing arguments, exports, and the PN-specific unit test.
+  - Removed the resolver environment variables `SENTENCE_RESOLVER`,
+    `OPENAI_MODEL`, and `FASTCOREF_MODEL_NAME`. The independent experimental
+    semantic `coref_pronoun_dp` merger remains available and now uses its
+    existing `biu-nlp/f-coref` constructor default without an environment
+    override.
+  - Changed `run/preprocess.sh`'s default splitter from the invalid
+    `semantic`/empty-merger combination to `sentence`. Semantic preprocessing
+    remains available only when both `SPLITTER=semantic` and `MERGER` are set.
+  - Made cache, compare-embedding, and DB directory creation conditional on
+    their respective materialization flags. `src/entrypoint/preprocess.py` now
+    constructs `ChromaDB` only when `materialize_db=True`; the preprocessor
+    accepts no vector DB in cache/embedding-only mode and validates that one is
+    present when DB materialization is enabled.
+  - Replaced artifact-build `COLBERT_WINDOW_MODEL` with the shared
+    `COLBERT_MODEL_NAME`. Removed `COLBERT_WINDOW_DEVICE` and
+    `COLBERT_VERIFY_TENSORIZATION`; the artifact entrypoint now fixes build
+    device to CUDA and tensorization verification to disabled, matching the
+    previous official shell defaults.
+  - Updated README, codebase guide, and evaluation protocol with these fixed
+    policies and supported preprocessing paths.
+- what was verified:
+  - Added entrypoint regression tests proving `materialize_db=False` never
+    constructs `ChromaDB` and ColBERT artifact builds pass fixed CUDA/disabled
+    tensorization settings.
+  - Full unittest discovery passed: 52 tests.
+  - Nine direct pytest-style test functions passed without pytest, which is not
+    installed in the environment.
+  - Python compilation, Black formatting, shell syntax checks, dead-reference
+    scans, and `git diff --check` passed.
+- evaluation/comparability impact:
+  - No retrieval, compression, prompt, metric, scoring, or evaluation output
+    logic changed. Existing results from explicitly configured current
+    sentence/semantic preprocessing remain comparable when their DB/artifact
+    settings match.
+  - Bare `run/preprocess.sh` previously failed before producing a valid result;
+    it now means sentence preprocessing. Direct artifact CLI builds that relied
+    on CPU or enabled tensorization verification are intentionally unsupported.
+  - PN and resolved-sentence DBs can no longer be rebuilt with current code;
+    those abandoned baseline conditions should not be mixed with current paper
+    results.
+- open issues:
+  - `sentence_cache_token_format` alternatives and
+    `materialize_doc_ids_file` remain Fire-only preprocessing axes from the
+    prior audit.
+- next steps:
+  - Continue the dead-code/environment cleanup with the remaining explicitly
+    selected candidates, without changing the current sentence/ColBERT method
+    semantics.
+
+## 2026-07-22 - Method-specific ColBERT budget state and output naming
+
+- objective:
+  - Stop rerank-only methods from initializing unused LLM budget state, make
+    `colbert_subchunk` honor token budgets, and remove ineffective parameters
+    from automatically generated output filenames.
+- what was changed:
+  - Split `ColBERTWindowSummarizer` initialization policy so global-ratio state
+    and LLM token-budget state are created only when the active configuration
+    uses them. `colbert_rerank` now initializes neither `GLOBAL_TOP_R`,
+    `RETAIN_TOKEN_RATIO`, the evaluated-LLM tokenizer, nor token-length cache.
+  - `colbert_subchunk` now uses `RETAIN_TOKEN_RATIO` first,
+    `COLBERT_FINAL_TOKEN_BUDGET` second, and `GLOBAL_TOP_R` only when neither
+    token budget is configured. Its selection walks globally ranked subchunks
+    under the computed prompt-visible token budget.
+  - Sliding-region and rerank-and-region methods likewise avoid loading the LLM
+    budget tokenizer in their no-token-budget `GLOBAL_TOP_R` fallback mode.
+  - Updated `run/eval.sh` and both retrieval/evidence shell entrypoints so
+    generated filenames contain only effective selection controls. A retained
+    ratio suppresses both ineffective `GLOBAL_TOP_R` and the lower-priority
+    absolute-budget tag. Rerank-only filenames contain their keep-count tag but
+    no global/token-budget tags.
+  - Corrected the factory/configuration name from `rerank_and_reion` to
+    `rerank_and_region` with no compatibility alias. Renamed the three matching
+    grid files and their run/preprocess names.
+  - Updated README and evaluation protocol with budget precedence, output-name
+    behavior, the corrected method name, and result-comparability constraints.
+- what was verified:
+  - Added selection regression coverage proving `colbert_subchunk` actually
+    applies a retained-ratio token budget.
+  - Added constructor coverage proving subchunk loads budget state when needed
+    while `colbert_rerank` does not, even if stale budget environment variables
+    are present.
+  - Added executable shell-output tests for rerank, token-budgeted subchunk, and
+    no-budget subchunk filenames.
+  - Full unittest discovery passed: 56 tests. Nine direct pytest-style tests,
+    Black, Python compilation, shell syntax, all grid YAML parsing, typo scans,
+    and `git diff --check` also passed.
+- evaluation/comparability impact:
+  - This intentionally changes `colbert_subchunk` evaluation semantics when
+    `RETAIN_TOKEN_RATIO` or `COLBERT_FINAL_TOKEN_BUDGET` is set. Earlier results
+    from such configurations actually used `GLOBAL_TOP_R` and are not directly
+    comparable to new token-budgeted results.
+  - `colbert_subchunk` runs with neither token budget keep their previous
+    `GLOBAL_TOP_R` selection semantics. Rerank scoring/selection and all LLM
+    prompt, metric, and scoring logic are unchanged.
+  - Default output paths change where ineffective parameter tags were removed;
+    this changes filenames only, not evaluation contents.
+- open issues:
+  - `colbert_window_budget` now overlaps with token-budgeted
+    `colbert_subchunk` and is a potential future compatibility-free removal,
+    but it remains available in the current ablation grids.
+- next steps:
+  - Re-run any paper `colbert_subchunk` configurations that previously set a
+    token budget, since their old outputs did not evaluate the intended budget.
+
+## 2026-07-22 - Dense baseline rename and online compare removal
+
+- objective:
+  - Remove the unused online `compare`/`compare_all` baselines and rename the
+    materialized global dense selector from `compare_all_materialized` to
+    `dense` without retaining aliases.
+- what was changed:
+  - Removed the `compare` and `compare_all` factory keys and their online
+    sentence-embedding/scoring implementations.
+  - Renamed the public materialized implementation to `DenseSummarizer` and
+    registered only `COMPRESS_METHOD=dense`. The remaining private bases contain
+    only the embedding-query, global deduplication, and selection mechanics used
+    by `DenseSummarizer`.
+  - Moved `GLOBAL_TOP_R` parsing to the shared `parse_global_top_r()` helper so
+    ColBERT fallback selection no longer depends on a removed baseline class.
+  - Changed the default compression method and method-aware output naming in
+    both main/retrieval shell entrypoints to `dense`.
+  - Updated active context/lost-in-middle grids, grid summary naming, analysis
+    scripts, and the evaluation protocol to use `dense`.
+  - Deleted the obsolete online-compare sentence-retrieval entrypoint and its
+    dedicated profiling/parser/failure-analysis scripts.
+  - Kept `COMPARE_EMBED_DIR`, `COMPARE_EMBED_MODEL`, and the existing
+    `compare_embed.pt` artifact format unchanged because these identify the
+    preprocessing artifact rather than the removed runtime method names.
+- what was verified:
+  - Added a dense-selection regression test covering global top-r selection and
+    duplicate cacheable-ID handling across retrieved chunks.
+  - Added factory assertions that `dense` is registered and all three old names
+    are absent.
+  - Full unittest discovery passed: 58 tests. Focused dense/ColBERT tests,
+    Black, Python compilation, shell syntax, all grid YAML parsing, reference
+    scans, and `git diff --check` passed.
+- evaluation/comparability impact:
+  - `dense` preserves the former materialized selector's query embedding,
+    stored sentence embeddings, global deduplication, ranking, and
+    `GLOBAL_TOP_R` selection logic. Results are directly comparable after
+    accounting for the renamed configuration/output field.
+  - The removed online `compare` and `compare_all` baselines are no longer
+    runnable. Default output filenames now contain `dense` instead of
+    `compare_all_materialized`; this is a filename/configuration change only.
+- open issues:
+  - The dense preprocessing artifact retains the historical `compare_embed`
+    terminology. Renaming that on-disk format would require an explicit DB and
+    artifact migration decision and was intentionally outside this change.
+- next steps:
+  - Use `COMPRESS_METHOD=dense` for the materialized dense baseline and update
+    any external launch scripts that still pass an old method name.
+
+## 2026-07-22 - splitlong180 vs splitlong512 MuSiQue result audit
+
+- objective:
+  - Determine whether the MuSiQue-8B disadvantage of splitlong180 justifies
+    using splitlong512 as the paper's primary subchunking configuration.
+- what was changed:
+  - No code, configuration, artifact, or evaluation output was changed.
+- what was verified:
+  - At `TOP_K=20`, `RETAIN_TOKEN_RATIO=0.5`, 8B F1 is 0.22048 for splitlong180
+    and 0.24959 for splitlong512. In a paired 200-example audit, splitlong512
+    wins 8 examples, splitlong180 wins 1, and 191 tie; four 0-to-1 answer flips
+    account for most of the mean difference. The paired bootstrap 95% interval
+    for `F1(512)-F1(180)` is `[0.0096, 0.0529]`.
+  - A permissive normalized character-substring check reports 97/200 prompts
+    for both variants, with one exclusive hit in each direction. This check can
+    overcount short aliases such as `fi`, `UT`, and numeric strings. A stricter
+    contiguous normalized-token check reports 90/200 for splitlong180 and
+    89/200 for splitlong512, with two 180-only hits and one 512-only hit.
+    Primary-answer-only token containment is 76/200 versus 75/200. These are
+    prompt answer-string containment diagnostics, not supporting-evidence
+    recall. Their prompts also share an average of 42.51 exact context segments
+    out of about 44.5, so the 8B gap is still not explained by a broad
+    answer-string containment advantage for splitlong512.
+  - The same MuSiQue setting reverses on the 1B model: F1 is 0.14814 for
+    splitlong180 and 0.12001 for splitlong512, with 16/5/179 paired
+    wins/losses/ties for splitlong180 and a bootstrap interval of
+    `[-0.0568, -0.0022]` for `F1(512)-F1(180)`.
+  - The splitlong512 artifact has 328 truncated ColBERT centers among 70,732
+    cacheables, versus 64 among 71,203 for splitlong180. The splitlong512 DB has
+    369 units longer than 183 Llama tokens (about 0.52%). Only three of the
+    eight 8B-winning prompts contain such a unit, and none of their gold answer
+    strings occur inside those long units.
+- open issues:
+  - The MuSiQue-8B gain is real for this fixed sample but concentrated and
+    model-dependent. It does not establish a generally superior retrieval or
+    subchunk representation for splitlong512.
+  - A 512-token atomic unit can exceed the 180-token ColBERT window: its center
+    representation is truncated while the full unit may be emitted to the LLM,
+    creating a scoring/prompt asymmetry even though the affected fraction is
+    small.
+- next steps:
+  - Prefer splitlong180 as the cross-model primary configuration and present
+    splitlong512 as a sensitivity/ablation result. If the paper instead makes
+    universal 8B operating-point wins over vanilla the hard selection
+    criterion, splitlong512 is the empirically cleaner 8B choice and the window
+    must be defined as a scoring-context limit rather than an atomic-unit cap.
+
+## 2026-07-22 - MuSiQue splitlong180 loss and region-selection audit
+
+- objective:
+  - Inspect the eight MuSiQue-8B `TOP_K=20`, `RETAIN_TOKEN_RATIO=0.5` examples
+    where splitlong512 outscored splitlong180, identify likely distractors, and
+    check whether region continuity, deduplication, or prompt placement contains
+    a bug that selectively harms splitlong180.
+- what was changed:
+  - No runtime, evaluation, artifact, or experiment code was changed. Temporary
+    writable copies of both Chroma DBs were used under `/tmp` because Chroma
+    attempts internal writes even for retrieval diagnostics.
+- what was verified:
+  - The eight gains are heterogeneous. Cases 53, 81, and 188 retain the same
+    decisive evidence and distractors, with only small later prompt changes;
+    cases 61 and 133 do not contain the exact gold answer in either prompt and
+    the 512 result is respectively parametric-knowledge recovery and only a
+    partial lexical F1 match. Cases 71, 113, and 146 are the most plausible
+    prompt-selection/layout effects.
+  - Concrete distractors include Lee Alexander versus John D. Loudermilk
+    (case 53), Eric Beall versus Matthew Lawrence (61), newer president José
+    Ramos-Horta versus dataset answer Francisco Guterres (71), plot phrase
+    `global conspiracy` versus author Robert Ludlum (81), subject `Ten High`
+    versus symbol `fleur-de-lis` (113), `15 consecutive wins` versus Barcelona's
+    `continental treble` (146), and MIT's Robert Robinson Taylor versus Ole
+    Miss's James Meredith (188).
+  - Both complete sidecars have valid contiguous specs: zero invalid indices,
+    zero non-contiguous regions, and zero cacheable occurrences left uncovered.
+    splitlong180 has 40,423 specs over 75,072 cacheable occurrences; splitlong512
+    has 40,102 over 74,598. Duplicate and strict-subset windows are deliberately
+    pruned, explaining why only about 53.8% as many specs as cacheable
+    occurrences remain, but this does not remove evidence coverage.
+  - There is no rule that rejects adjacent regions. The more relevant design
+    issue is the opposite: after a region is selected, overlapping regions keep
+    their full original MaxSim score even though only previously unseen fringe
+    sentences consume budget. In seven exactly reproduced splitlong180 traces,
+    10--43 selected regions per query added at most half novel sentences, and
+    7--29 regions added only one novel sentence. Case 61 selected seven regions
+    from the same coarse chunk in one uninterrupted ranking run.
+  - The final prompt discards region-score order: selected runs are regrouped by
+    original coarse-retrieval index and sorted by source offsets within each
+    chunk. This preserves local chronology but can place a strong lexical
+    distractor before the correct multi-hop chain.
+  - Region selection intentionally adds the final whole region and then checks
+    the token budget, producing observed overshoots of 36--172 tokens in the
+    splitlong180 traces. This is covered by an explicit unit test and is not an
+    accidental adjacency omission.
+  - The corresponding overlap/redundancy statistics are very similar for
+    splitlong512, so these issues can explain MuSiQue distractor sensitivity but
+    do not establish a splitlong180-specific implementation bug.
+  - Focused region-spec and contiguous-window unittest discovery passed: 12 and
+    2 tests respectively.
+- open issues:
+  - Full-region score reuse after overlap dedup is a marginal-utility mismatch:
+    a region can rank highly because of already selected tokens while adding
+    low-relevance fringe. This is a stronger candidate for a method ablation
+    than a hard ban on consecutive regions.
+  - Single-query MaxSim is not chain-aware. It strongly rewards lexical matches
+    such as `first black student` or `wins`, even when another passage is needed
+    to resolve the entity constraint from the first hop.
+  - Score-order versus retrieval-order/grouped prompt placement has not yet
+    been evaluated with LLM generation, so recovery from reordering remains a
+    hypothesis rather than a result.
+- next steps:
+  - Before changing the main method, run three controlled MuSiQue ablations on
+    the same saved retrieval candidates: overlap-aware marginal region scoring,
+    root-document diversity/MMR, and document-group ordering by best region
+    score while preserving sentence order inside each group. Avoid a blind
+    non-adjacent-region ban because true support can span adjacent windows.
+
+## 2026-07-22 - Controlled MuSiQue region-group ordering ablation
+
+- objective:
+  - Test whether regrouping selected splitlong180 regions by coarse retrieval
+    chunk and ordering those groups by the maximum or sum of their selected
+    region scores recovers the MuSiQue-8B losses, without changing region
+    selection or retained context.
+- what was changed:
+  - Added the temporary `COLBERT_REGION_GROUP_ORDER=retrieval|max|sum`
+    experiment control to `colbert_sliding_region` and `rerank_and_region`.
+    `retrieval` preserves the existing behavior. `max` and `sum` order coarse
+    chunks by the respective aggregation of unique selected region scores;
+    source order remains unchanged inside each coarse chunk.
+  - Added unit coverage for group ordering, selected-region score collection,
+    and non-default output tags, plus the temporary controlled runner
+    `test/experimental_region_group_order_eval.py` and grid
+    `run/grid_search/grid_experimental_musique_region_group_order.yaml`.
+  - Documented this evaluation-changing experimental control in
+    `docs/eval_protocol.md`. Results with different group orders are prompt
+    ordering ablations, not identical evaluation configurations.
+- what was verified:
+  - The first three-process grid was contaminated by independent approximate
+    retrieval. Relative to the new retrieval run, max retained the same context
+    text multiset for 188/200 queries and sum for 183/200. Its raw F1 values
+    were retrieval `0.225006`, max `0.215191`, and sum `0.219480`, and must not
+    be interpreted as ordering-only differences.
+  - The controlled run queried Chroma once per question, cloned the resulting
+    top-20 candidates for all three conditions, reused one LLM and ColBERT
+    instance, used `RETAIN_TOKEN_RATIO=0.5`, and generated 200 MuSiQue answers
+    with the 8B FP16 model. Retrieval snapshot ID-order SHA-256 was
+    `ae4f2755aea84aa27055ed25d956190f279718cacc6ee66460b0c3a665bc9615`.
+  - Controlled F1/EM were retrieval `0.220006/0.150`, max
+    `0.215191/0.140`, and sum `0.217813/0.150`. Average model input length was
+    exactly `4289.98` in all three conditions. Context text multisets matched
+    the retrieval condition for 200/200 queries under both reorderings.
+  - Against retrieval order, max had 13 wins, 12 losses, and 175 F1 ties with
+    mean delta `-0.004815` and paired bootstrap 95% interval
+    `[-0.03645, 0.02711]`. Sum had 9 wins, 8 losses, and 183 ties with mean
+    delta `-0.002192` and interval `[-0.02729, 0.02222]`. Bootstrap used
+    100,000 resamples and explicit seed `20260722`. Neither is a significant
+    improvement.
+  - Max ordering improved five of the eight previously inspected 512-winning
+    cases (indices 53, 61, 71, 133, and 146), but introduced larger losses on
+    other questions, so it is useful diagnostically but not as the main method.
+    Sum improved only case 133 among those eight.
+  - Chroma retrieval was completely stable across three repeated passes in one
+    process: 0/200 query order changes and 0/200 candidate-set changes. Separate
+    processes produced different retrieval ID-order fingerprints, narrowing the
+    instability to process initialization such as query embedding or HNSW
+    process state rather than compressor ordering. The exact component remains
+    unresolved.
+  - Focused unittest discovery passed: 13 region-spec tests, 27 optimization
+    tests, and 4 output-naming tests. Black check, `py_compile`, and
+    `git diff --check` also passed.
+- open issues:
+  - Independent Chroma processes should not be used for paired compressor
+    comparisons without saving/replaying retrieved IDs. The exact source of the
+    cross-process top-20 instability still needs an embedding-versus-HNSW
+    isolation test.
+  - The max/sum implementation and its environment variable are temporary
+    experiment code. They should not be promoted into the main method based on
+    this result.
+- next steps:
+  - Keep retrieval-order grouping as the default. Remove
+    `COLBERT_REGION_GROUP_ORDER`, its tests/docs/output naming, the temporary
+    runner, and the experimental grid after no further ordering diagnostics are
+    needed.
+  - If prompt ordering is revisited, evaluate chain-aware or diversity-aware
+    placement rather than a global max/sum sort, using one frozen retrieval
+    snapshot for every paired condition.
+
+## 2026-07-22 - Why MuSiQue splitlong180 does not clear vanilla-256
+
+- objective:
+  - Reframe the MuSiQue-8B analysis around the actual paper criterion: why the
+    splitlong180 `TOP_K=20`, retained-ratio `0.5` point fails to outperform the
+    similarly sized vanilla-256 `TOP_K=20` point while splitlong512 does.
+- what was changed:
+  - No code or evaluation behavior was changed. Existing prediction JSONL files
+    were rescored and compared per query with the MuSiQue official evaluator.
+- what was verified:
+  - Vanilla-256 has average input length `4437.82` and F1 `0.233332`.
+    splitlong180 has `4289.215` and `0.220482`, a delta of `-0.012850`;
+    splitlong512 has `4346.455` and `0.249589`, a delta of `+0.016258`.
+  - Against vanilla-256, splitlong180 has 12 query wins, 17 losses, and 171 F1
+    ties. splitlong512 has 18 wins, 14 losses, and 168 ties. This is not a broad
+    recall difference: strict normalized answer-string containment is 89/200
+    for vanilla-256, 90/200 for splitlong180, and 89/200 for splitlong512.
+  - The complete splitlong180-to-splitlong512 gain is concentrated in exactly
+    eight queries: indices 53, 61, 71, 81, 113, 133, 146, and 188. Their 8B F1
+    improves under splitlong512 and no query loses F1 relative to splitlong180.
+    Six of those eight make splitlong512 beat vanilla where splitlong180 did
+    not; cases 53, 81, and 133 recover or match a vanilla advantage.
+  - The two split variants nevertheless share about 42.51 exact context
+    segments out of roughly 44.5 per prompt, and only three of the eight
+    splitlong512-winning prompts contain an atomic unit longer than the
+    180-token ColBERT window. None of the gold answer strings is in those long
+    units. The gain therefore does not support a general long-adjacent-context
+    mechanism.
+  - Max group ordering independently recovers five of the same eight cases but
+    lowers total F1 by causing losses elsewhere. This demonstrates that these
+    examples are highly prompt-layout sensitive rather than consistently
+    missing evidence under splitlong180.
+- open issues:
+  - The original vanilla, splitlong180, and splitlong512 outputs were generated
+    in separate Chroma processes and, for the split variants, from separately
+    built DB indexes. Cross-process top-20 instability was subsequently
+    observed. Therefore the eight output flips cannot be cleanly attributed to
+    subchunk length rather than retrieval-candidate or prompt-layout changes.
+- next steps:
+  - Do not claim that 512-token atomic units generally preserve useful adjacent
+    evidence. The supported conclusion is that the 512 point crosses vanilla
+    because a small set of MuSiQue-8B prompt-sensitive cases all happened to
+    flip favorably.
+  - A causal comparison requires replaying one fixed set of coarse retrieval
+    candidates through both splitlong180 and splitlong512 artifacts in a single
+    process; without that run, the apparent 512 advantage should be treated as
+    a sensitivity result rather than the primary method choice.
+
+## 2026-07-22 - splitlong180 weakness on 1B 2Wiki
+
+- objective:
+  - Diagnose why splitlong180 appears weak against similarly sized vanilla
+    operating points for Llama-3.2-1B-Instruct on 2Wiki.
+- what was changed:
+  - No code, evaluation behavior, artifacts, or result files were changed.
+    Existing 200-query outputs and original supporting-fact labels were compared
+    per query.
+- what was verified:
+  - The weakness is concentrated at `TOP_K=20`, not universal. At `TOP_K=10`,
+    splitlong180 r=0.25 scores `0.287593` versus vanilla-128/K10 `0.284140`
+    at 1009 versus 1083 tokens, and r=0.5 scores `0.271589` versus
+    vanilla-256/K10 `0.250525` at 1887 versus 1949 tokens.
+  - At `TOP_K=20`, splitlong180 r=0.25 scores `0.280329` versus
+    vanilla-128/K20 `0.291248` at 1937 versus 2095 tokens: 24 wins, 26 losses,
+    and 150 F1 ties. r=0.5 scores `0.257139` versus vanilla-256/K20
+    `0.293357` at 3744 versus 3922 tokens: 20 wins, 33 losses, and 147 ties.
+  - Evidence availability does not explain the deficit. Strict normalized
+    answer containment is 112/200 for vanilla-128/K20 versus 124/200 for
+    split r=0.25, and 126/200 for vanilla-256/K20 versus 135/200 for split
+    r=0.5. Only one split loss in each matched comparison is a case where the
+    vanilla prompt contains the answer and the split prompt does not.
+  - Exact normalized supporting-fact diagnostics also favor splitlong180.
+    For r=0.25, both facts are present in 23 split prompts versus 18 vanilla
+    prompts, with mean fact recall `0.340` versus `0.316`. For r=0.5 the counts
+    are 24 versus 21 and recall is `0.351` versus `0.333`. These are strict
+    text-containment diagnostics, so their absolute recall is conservative,
+    but their direction rules out a broad evidence-loss explanation.
+  - A question-text heuristic over the 200 examples identifies 70 comparison,
+    23 genealogy, and 107 other bridge questions. At r=0.25 the aggregate F1
+    delta versus vanilla is `-3.167` on comparison and `-1.344` on genealogy,
+    while other bridge questions gain `+2.327`. At r=0.5 the deltas are
+    `-2.625`, `-3.319`, and `-1.299`, respectively. The heuristic is diagnostic,
+    not an official dataset type label.
+  - Typical comparison failures choose the wrong one of two explicitly named
+    alternatives despite both being in context: Erich Haenisch instead of
+    William Pooley, Closely Watched Trains instead of Det Sande Ansigt, and
+    Jean-Claude Lauzon instead of Charles Wheatstone. Genealogy failures often
+    move one generation or latch onto another relation-matching entity.
+  - Gold-answer position shifts are modest and inconsistent. For common answer
+    hits at r=0.25 the median relative passage index moves from 0.10 in vanilla
+    to 0.176 in split; at r=0.5 both medians are 0.10. Many exact-to-zero losses
+    have the gold very early in the split prompt, so a pure lost-in-the-middle
+    explanation is insufficient.
+  - The 8B model scores `0.430749` and `0.424074` on the corresponding split
+    r=0.25/r=0.5 runs. Its context text multiset exactly matches the 1B output
+    for 193/200 and 194/200 queries, respectively. This large model gap on
+    nearly identical evidence strongly supports a model-capacity and
+    distractor-resolution explanation.
+  - Online compression adds about 28 ms per K20 query. That cost is material
+    beside the 1B prefill times of about 67 ms at r=0.25 and 128 ms at r=0.5,
+    further weakening latency--F1 even when input tokens are lower.
+- open issues:
+  - ColBERT region scoring is single-query lexical MaxSim, not chain-aware. With
+    20 coarse candidates it can retain both relevant evidence and highly
+    query-matching alternatives without indicating which date, generation, or
+    relation resolves the comparison. The 1B model is substantially less able
+    than the 8B model to perform that resolution from fragmented passages.
+  - Vanilla and split runs used independent Chroma processes, so exact paired
+    attribution remains exposed to the observed cross-process top-20
+    instability. The strong answer/supporting-fact and same-context model-gap
+    results nevertheless argue against retrieval recall as the main cause.
+- next steps:
+  - Describe 1B 2Wiki as a K20 distractor/relational-reasoning failure mode,
+    not a general splitlong180 retrieval failure. K10 remains competitive.
+  - If improving this case is important, test root-document diversity or
+    chain-aware pair selection on a frozen retrieval snapshot. Increasing the
+    retained ratio alone is unlikely to help: K20 F1 peaks at r=0.25 and falls
+    at r=0.5 and r=0.75.
+
+## 2026-07-22 - Evidence-retention framing for the paper
+
+- objective:
+  - Determine how to expose the method's ability to retain important evidence
+    even though standard LongBench records do not contain supporting-fact
+    labels.
+- what was changed:
+  - No code, evaluation protocol, datasets, or results were changed. Existing
+    provenance-recovered evidence assets and retrieval-evaluation outputs were
+    audited.
+- what was verified:
+  - LongBench-query-aligned original evidence labels already exist for all four
+    current datasets. HotpotQA and 2Wiki have usable supporting facts for
+    200/200 records; MuSiQue has usable supporting evidence for 167/200 and
+    Qasper for 190/200.
+  - All 200 LongBench questions were exact-question matched to original
+    validation records when these assets were constructed. The benchmark and
+    evaluation path live under `*-lb200-original/evidence_labels.jsonl` and
+    `run/retrieval_eval/`.
+  - Existing outputs already report context tokens, Rouge-L recall/precision
+    against supporting evidence, document-level recall/precision, and lower
+    level subchunk diagnostics.
+- open issues:
+  - These metrics are not official LongBench supporting-fact metrics. They use
+    the same LongBench query set aligned to original-source documents and must
+    be described as an auxiliary original-evidence benchmark.
+  - HotpotQA source-sentence text does not align exactly with every official
+    LongBench context passage because of source/Wikipedia snapshot differences.
+    Running the auxiliary benchmark on its reconstructed original documents is
+    cleaner than silently treating original sentences as official LongBench
+    labels.
+- next steps:
+  - In the paper, keep standard LongBench answer F1/latency as the main task and
+    add evidence recall versus retained context tokens as a mechanism analysis.
+    Report both end-to-end supporting-evidence recall and conditional retention
+    given evidence present in the coarse top-k candidates.
+  - Use only labeled records for MuSiQue/Qasper and state the denominators. Do
+    not call the derived labels official LongBench annotations.
+
+## 2026-07-22 - Audit LongBench-query-aligned evidence benchmark reliability
+
+- objective:
+  - Determine whether exact-question matching is sufficient to trust the
+    generated `*-lb200-original` supporting-evidence labels and corpora.
+- what was changed:
+  - No dataset, evaluation, runtime, or experiment code was changed. The
+    generated labels were audited against the cached LongBench and original
+    validation Arrow snapshots.
+- what was verified:
+  - HotpotQA is strongly linked: all 200 LongBench questions have one exact
+    original-validation match; source IDs and normalized answers agree for
+    200/200; and all 463 generated supporting sentences occur exactly in the
+    reconstructed source documents. A direct source-annotation projection
+    audit also confirmed that all 200 label records and all 463 facts equal the
+    sentence selected by the original `(supporting_facts.title, sent_id)` pair;
+    every supporting title is unique inside its record.
+  - 2WikiMQA is strongly linked: all 200 questions have one exact match;
+    source IDs and normalized answers agree for 200/200; and all 474 generated
+    supporting sentences occur exactly in the reconstructed source documents.
+    All 200 label records and 474 facts also exactly equal the original
+    `(supporting_facts.title, sent_id)` projection. Eight records contain a
+    duplicate non-supporting context title, but every supporting title itself
+    has exactly one matching context entry, so `.index(title)` is unambiguous
+    for the generated evidence.
+  - MuSiQue is currently invalid. The `bdsaglam/musique` default validation
+    config contains answerable and unanswerable variants with the same
+    question. The preparation script stores records in a question-keyed dict,
+    so later records silently overwrite earlier ones. Against the answerable
+    config, only 85/199 uniquely matched questions use the answerable record;
+    114 use the unanswerable variant, omitting 164 expected supporting
+    paragraphs in total. One additional LongBench question has two answerable
+    exact-question matches; its LongBench context uniquely identifies the
+    correct one. The current MuSiQue documents, labels, DBs, artifacts, and
+    original-evidence results must therefore be rebuilt and rerun.
+  - Qasper is partially mislinked. Of 200 LongBench questions, 181 are unique
+    in original validation and 19 repeat across multiple papers. The
+    question-keyed overwrite selects the wrong paper for 14/19 ambiguous
+    records. Comparing the LongBench context with each candidate original
+    paper uniquely identifies the correct paper for all 19. The current Qasper
+    original-evidence assets/results are therefore not valid as a complete
+    200-query benchmark.
+  - Qasper has a second corpus-coverage issue: of 437 generated evidence
+    strings, 367 occur exactly in their generated document, 15 match after
+    whitespace normalization, and 55 are absent. At record level, 147 have all
+    evidence present, 32 have partial evidence present, 11 have no labeled
+    evidence present, and 10 have empty original evidence annotations. Many
+    absent labels are table/float evidence not represented by the serialized
+    title/abstract/body text.
+- open issues:
+  - These are provenance-recovered auxiliary labels, not official LongBench
+    evidence annotations. Even the valid HotpotQA/2Wiki links use reconstructed
+    original-source documents and source snapshots that can differ textually
+    from LongBench's packaged contexts.
+  - The preparation script does not pin Hugging Face source revisions or store
+    source-file/content hashes in metadata, so rebuilding later is not fully
+    reproducible from metadata alone.
+- next steps:
+  - Keep HotpotQA and 2WikiMQA as auxiliary original-evidence mechanism
+    benchmarks, with the provenance caveat.
+  - Fix MuSiQue by selecting the answerable record and resolving the one
+    remaining collision from LongBench context; rebuild every dependent asset
+    and invalidate prior MuSiQue original-evidence numbers.
+  - Fix Qasper collisions by matching question plus source context/paper, and
+    either serialize table/float evidence into the corpus or exclude absent
+    evidence with an explicit reachable-evidence denominator before rerunning.
+  - Pin source revisions and record hashes in benchmark metadata before using
+    the auxiliary benchmark in the paper.
+
+## 2026-07-22 - Select a long-document evidence-retention benchmark
+
+- objective:
+  - Decide whether reconstructed original HotpotQA/2Wiki corpora are suitable
+    for a 512-token coarse-chunk subchunking analysis or whether a different
+    RAG-native evidence dataset is needed.
+- what was changed:
+  - No source, dataset, or evaluation code was changed. Public MultiHop-RAG
+    corpus/query JSON files were downloaded only to `/tmp` for a read-only
+    feasibility audit.
+- what was verified:
+  - The current original HotpotQA corpus is too short for the intended main
+    analysis: 1,962 documents produce only 1,974 512-token retrieval chunks;
+    only 9 documents are multi-chunk. None of the 399 unique
+    supporting-evidence documents, covering all 463 fact occurrences, exceeds
+    one 512-token chunk. Mean/median retrieval-chunk lengths are 134.4/119
+    Llama tokens.
+  - The current original 2Wiki corpus is also too short: 1,412 documents
+    produce 1,430 chunks; 18 documents are multi-chunk. Only 15/470 unique
+    supporting-evidence documents (15/474 fact occurrences, 3.2%) exceed one
+    512-token chunk. Mean/median chunk lengths are 104.4/72 tokens.
+  - MultiHop-RAG is a strong technical fit. Its released corpus has 609 news
+    documents and 2,556 queries; 2,255 non-null queries have 6,084 evidence
+    facts and 301 null queries have none. All 6,084 evidence strings occur
+    exactly in the corpus document identified by their released URL.
+  - With the locally cached Llama-3.1-8B tokenizer, all 609 MultiHop-RAG
+    documents exceed 1,024 tokens. Mean/median/p90 document lengths are
+    2,289.5/1,687/3,811 tokens; 226 documents exceed 2,048 and 56 exceed 4,096.
+    Thus every evidence occurrence belongs to a document that genuinely
+    requires multiple 512-token chunks.
+  - MultiHop-RAG is RAG-native and manageable: evidence is distributed across
+    two to four documents, the complete corpus is only 609 articles, and the
+    official paper explicitly evaluates chunk retrieval. Its main caveat is
+    synthetic construction: factual/opinion sentences are model-extracted and
+    GPT-4 generates claims, queries, and answers, followed by GPT-4 validation
+    and manual review of only a subset.
+  - KILT HotpotQA is the strongest human-annotation alternative. KILT maps
+    HotpotQA supporting sentences onto one fixed 2019-08-01 Wikipedia snapshot
+    and stores page/paragraph provenance, but the complete knowledge source is
+    about 5.9 million pages/34.76 GiB. Subsetting only gold pages would no
+    longer be the official full-wiki retrieval condition.
+- open issues:
+  - MultiHop-RAG has a single released query set rather than a conventional
+    train/dev/test separation. It should be used zero-shot with a fixed,
+    predeclared sample/configuration rather than repeatedly tuned on reported
+    results.
+  - Exact evidence-string presence establishes reachability but does not make
+    the model-generated evidence necessity judgment equivalent to human
+    supporting-fact annotation.
+  - The official repository's generation evaluator does not implement ordinary
+    exact accuracy. It treats a prediction as correct when it shares any
+    whitespace-delimited word with the gold answer, then derives TP/FP/FN/TN in
+    a way whose reported `accuracy` is not standard per-example accuracy. For
+    example, partially overlapping entity names can count as correct, and an
+    all-wrong prediction set would still yield `accuracy=1/3` under the released
+    formula. Any normalized exact-match/token-F1 evaluator would be a local,
+    explicitly modified protocol and not an official MultiHop-RAG metric.
+- next steps:
+  - Prefer MultiHop-RAG for the first long-document evidence-retention
+    experiment. Run a pre-build audit over chunk-boundary evidence coverage,
+    exact evidence-to-subchunk alignment, query-type distribution, and a fixed
+    200-query stratified sample before building DB/artifacts.
+  - Consider KILT HotpotQA only as a later human-labeled robustness check if
+    the storage/indexing cost is acceptable or a frozen official retrieval
+    candidate set can be used without misrepresenting it as full-wiki RAG.
+
+## 2026-07-22 - Assess KILT HotpotQA local-format integration
+
+- objective:
+  - Determine whether KILT HotpotQA can be represented through the current
+    LongBench-style local query/answer/document/evidence interfaces.
+- what was changed:
+  - No source, dataset, or evaluation code was changed.
+- what was verified:
+  - KILT HotpotQA dev queries, answers, and provenance can be exported to the
+    current `questions/query.jsonl`, `answers/answer.jsonl`, and an extended
+    `evidence_labels.jsonl`. The evidence text must be resolved from
+    `wikipedia_id` plus paragraph/character coordinates against the same KILT
+    2019-08-01 knowledge source, then validated and hashed.
+  - KILT `output` structure must not be flattened blindly. Provenance entries
+    inside one output form a conjunctive evidence set, while multiple outputs
+    can represent alternative valid answers/provenance sets. A KILT adapter
+    should preserve `gold_evidence_sets` and define complete-chain success as
+    completing any valid set.
+  - The current preprocessing and ColBERT builders assume one source file per
+    document and enumerate the entire directory (`os.listdir`/sorted
+    `iterdir`). Expanding about 5.9 million KILT pages into 5.9 million `.txt`
+    files is operationally unsuitable even though it is logically possible.
+  - Full-corpus ColBERT center-token materialization is a larger feasibility
+    problem than JSON conversion: applying the current artifact layout to the
+    complete 34.76-GiB Wikipedia text can require impractically large build
+    time and embedding storage.
+- open issues:
+  - A faithful full-wiki run needs a streaming/sharded KILT corpus reader for
+    DB construction rather than the current one-file-per-page ingestion path.
+  - A practical compression mechanism experiment may need to freeze top-k
+    candidates from a full-wiki retriever and materialize ColBERT artifacts
+    only for the union of retrieved candidates. This preserves end-to-end
+    retrieval misses and conditional compression retention, but it is a frozen
+    retrieval-snapshot protocol and must not be described as full-corpus
+    ColBERT materialization.
+- next steps:
+  - If KILT is selected, first implement and test only the label/query adapter
+    on a very small dev sample, including alternative evidence-set semantics
+    and exact provenance resolution. Decide the full-wiki retrieval/index and
+    candidate-artifact protocol before downloading or expanding the complete
+    knowledge source.
+
+## 2026-07-22 - Estimate full-KILT ColBERT artifact scale
+
+- objective:
+  - Estimate the number and storage cost of applying the current
+    sentence-center ColBERT artifact format to every KILT Wikipedia page.
+- what was changed:
+  - No code or artifact was changed. The estimate combines official KILT
+    corpus statistics with measured local compact-artifact ratios.
+- what was verified:
+  - KILT contains 5,903,530 pages. The Hugging Face conversion reports 29.37 GB
+    generated data and 37.32 GB download size; a commonly used KILT-derived
+    corpus has approximately 36 million 100-word passages.
+  - Current local artifacts store one row per sentence subchunk and average
+    about 28 ColBERT center-token vectors per row. The vector payload is exactly
+    `num_center_tokens * 128 * 2` bytes.
+  - A reasonable full-corpus estimate is roughly 10--15 million 512-token
+    coarse chunks, 150--220 million sentence/subchunk rows, and 4.5--6.5
+    billion center-token vectors.
+  - The vector file alone would therefore be about 1.15--1.66 TB decimal
+    (1.05--1.51 TiB). Row offsets, IDs, window mappings, and region specs can
+    add tens to hundreds of GB, making an overall order-of-magnitude estimate
+    about 1.2--2.0 TB.
+  - The current local build rate is about 2.03 million center tokens in 139
+    seconds on one GPU. Naive linear extrapolation is about 3.6--5.1 days of
+    encoding alone; corpus streaming, tokenization, sorting, region building,
+    validation, and I/O would make the actual end-to-end build longer.
+- open issues:
+  - The estimate is not an exact count because the published KILT byte size
+    includes non-text metadata and the exact sentence/token distribution has
+    not been streamed through the repository splitter.
+- next steps:
+  - Do not attempt full-corpus ColBERT materialization without first running a
+    statistically representative streaming sample and confirming storage and
+    build-time projections. Prefer candidate-scoped artifact materialization
+    for a fixed retrieval snapshot.
+
+## 2026-07-22 - Clarify whether the LongBench multi-hop questions are RAG-designed
+
+- objective:
+  - Determine whether the HotpotQA, 2WikiMultiHopQA, and MuSiQue questions used
+    through LongBench were originally designed for the repository's pooled
+    global-corpus RAG setting.
+- what was changed:
+  - No code, data, evaluation logic, or artifact was changed.
+- what was verified:
+  - HotpotQA explicitly defines both a 10-paragraph distractor setting and a
+    full-Wikipedia setting. Its full-wiki questions were written to support
+    open-corpus retrieval, so it is the strongest direct match to RAG.
+  - 2WikiMultiHopQA was designed primarily as multi-paragraph reading
+    comprehension with gold reasoning-path/evidence annotations. It tests
+    evidence selection among supplied paragraphs, but its questions were not
+    constructed specifically for this repository's pooled global corpus.
+  - MuSiQue constructs each question together with its supporting paragraphs
+    and a 20-paragraph context containing retrieved distractors. It explicitly
+    targets connected multi-hop reasoning and hard local context selection,
+    not unrestricted global-corpus retrieval.
+  - LongBench treats all three as multi-document long-context QA: each query is
+    evaluated with its provided context. Splitting the contexts from 200
+    examples and pooling them into one DB is therefore a custom RAG adaptation
+    that introduces cross-query distractors and does not preserve the original
+    retrieval protocol.
+- open issues:
+  - The pooled setup remains useful for controlled vanilla-versus-compression
+    comparisons, but its results must be described as an adapted RAG benchmark,
+    not an official HotpotQA/2Wiki/MuSiQue retrieval score.
+- next steps:
+  - Keep retrieval quality and conditional compression quality separate in
+    analysis, and use original evidence annotations only after provenance is
+    reconstructed and validated against the exact LongBench examples.
+
+## 2026-07-22 - Survey manageable evidence-grounded alternatives to full KILT
+
+- objective:
+  - Find a benchmark that retains reliable evidence labels and long source
+    documents without requiring full-KILT ColBERT materialization, and check
+    whether prior work uses reduced KILT candidate pools.
+- what was changed:
+  - No code, data, evaluation logic, or artifact was changed.
+- what was verified:
+  - There is no clearly canonical, widely adopted `KILT-small` global corpus.
+    Pooling only gold pages produces a much easier, evaluation-dependent
+    corpus and should not be used as the primary end-to-end result.
+  - Candidate-constrained second-stage evaluation has strong precedent. Re2G
+    searches the full KILT source with DPR and BM25, takes 12 results from
+    each, reranks their union, and sends the top 5 to the generator. This
+    supports materializing expensive ColBERT artifacts only for the frozen
+    union of first-stage candidates while retaining per-query candidate lists.
+  - LongRAG processes full Wikipedia into approximately 4K-token grouped
+    retrieval units and releases NQ retrieval outputs for 100- and 1,000-query
+    subsets, each with about 20K--30K tokens of retrieved context. These are a
+    practical ready-made candidate snapshot, although their Wikipedia/title
+    provenance must be reconciled with the exact KILT/NQ snapshot before using
+    evidence labels.
+  - CLAPNQ is the strongest compact single-hop RAG alternative found: 4,946
+    questions, 2,555 answerable questions, exact gold passages and relevant
+    sentences, and a released corpus of 178,891 passages grouped under 4,293
+    NQ Wikipedia documents. Its gold passage averages 156 words. Using full
+    grouped documents rather than the released passage units would be a
+    documented adaptation, but directly supports long-document subchunk tests.
+  - PeerQA has 579 QA pairs over 208 papers, mapped evidence sentences, and
+    papers averaging about 12K tokens. It is excellent for evidence-retention
+    analysis, but many peer-review questions are document-dependent and need
+    decontextualization for global retrieval; its answer metric is also not
+    directly comparable to LongBench token F1.
+  - FinanceBench's public evaluation has 150 questions over 360 long financial
+    filings with evidence strings. It is compact and realistic but introduces
+    financial/numerical reasoning and normally requires correctness-oriented
+    evaluation rather than plain token F1.
+- open issues:
+  - A frozen candidate protocol changes the claim from full-corpus retrieval to
+    candidate-conditioned chunk retrieval/compression. First-stage candidate
+    recall and conditional evidence retention must therefore be reported
+    separately.
+  - LongRAG NQ and KILT NQ may use different Wikipedia snapshots or document
+    representations; title matching alone is insufficient for exact evidence
+    sentence claims.
+- next steps:
+  - Preferred low-risk pilot: evaluate CLAPNQ document grouping and token-length
+    statistics locally before adapting the pipeline.
+  - Preferred KILT-faithful route: freeze top-20 or top-50 candidates per
+    KILT-NQ query from a declared full-corpus first-stage retriever, materialize
+    artifacts only for their union, do not inject missing gold documents in
+    the main run, and report candidate recall, conditional evidence recall,
+    and end-to-end answer F1 separately.
+
+## 2026-07-22 - Measure current LongBench document-length distributions
+
+- objective:
+  - Measure document counts and token-length distributions for the current
+    HotpotQA, 2Wiki, and MuSiQue pooled LongBench corpora.
+- what was changed:
+  - No code, data, evaluation logic, or artifact was changed.
+- what was verified:
+  - Lengths were recomputed from each dataset root's `documents/*.txt` with
+    `meta-llama/Llama-3.1-8B-Instruct`, `add_special_tokens=False`, matching the
+    tokenizer declared by the splitlong180 DB build manifests.
+  - The active splitlong180 DB parent IDs were read from Chroma metadata, so
+    the primary statistics reflect normalized-hash deduplication rather than
+    raw passage occurrences.
+  - HotpotQA has 1,722 raw files and 1,710 active documents. Active lengths:
+    mean 1,473, p25 326, p50 722, p75 1,733, p90 3,617, p95 5,471, p99 10,450,
+    max 14,136 tokens. 1,044 documents (61.1%) exceed 512 tokens; 680 (39.8%)
+    exceed 1,024; 354 (20.7%) exceed 2,048.
+  - 2Wiki has 1,986 raw files and 1,404 active documents. Active lengths: mean
+    750, p25 192, p50 426, p75 837, p90 1,490, p95 2,402, p99 6,264, max
+    12,700 tokens. 591 documents (42.1%) exceed 512 tokens; 266 (18.9%) exceed
+    1,024; 84 (6.0%) exceed 2,048.
+  - MuSiQue has 1,831 raw files and 1,827 active documents. Active lengths:
+    mean 1,357, p25 256, p50 553, p75 1,320, p90 3,576, p95 5,845, p99 11,287,
+    max 15,094 tokens. 959 documents (52.5%) exceed 512 tokens; 568 (31.1%)
+    exceed 1,024; 330 (18.1%) exceed 2,048.
+  - The active 512-token DB contains 5,807 coarse chunks for HotpotQA (3.40 per
+    document), 2,831 for 2Wiki (2.02), and 5,823 for MuSiQue (3.19). The share
+    of documents with multiple coarse chunks is 61.1%, 42.1%, and 52.5%,
+    respectively.
+- open issues:
+  - These are distributions of the repository's pooled LongBench passage files,
+    not original full-Wikipedia page distributions or official dataset corpus
+    statistics.
+- next steps:
+  - Use the active deduplicated counts as the default table in analysis, with
+    raw occurrence counts shown only to explain deduplication, especially the
+    large 2Wiki reduction.
+
+## 2026-07-22 - Inspect NarrativeQA context and distractor structure
+
+- objective:
+  - Explain why local LongBench NarrativeQA contexts have no `Passage N:`
+    markers and determine whether they contain distractors.
+- what was changed:
+  - No code, data, evaluation logic, or artifact was changed.
+- what was verified:
+  - Each local `documents/<query_id>-context0.txt` is a single full narrative
+    (book or movie-script style text), not a serialization of multiple
+    retrieved passages. This matches NarrativeQA's full-story reading task and
+    LongBench's classification of NarrativeQA as single-document QA.
+  - There are 200 query-associated context files but only 20 unique byte hashes.
+    Each story is repeated for 5--19 questions. Thus the pooled adaptation has
+    20 unique stories: one relevant story and up to 19 cross-query story-level
+    distractors for a query after correct deduplication.
+  - The original per-query context has no deliberately injected distractor
+    documents. Most of the full story is nevertheless irrelevant to a specific
+    question and acts as substantial natural intra-document noise.
+  - The legacy `sent-ret512` DB contains 200 distinct parent IDs and 11,770
+    chunks, demonstrating that it indexed repeated query-level copies rather
+    than hash-deduplicating the 20 stories. The legacy `sent` DB likewise has
+    200 parents. These DBs have no current build manifest and should not be
+    treated as clean pooled corpora.
+- open issues:
+  - NarrativeQA does not provide reliable localized supporting-fact labels for
+    the full story, so answer F1 can evaluate compression end to end but exact
+    evidence recall cannot be measured as cleanly as in KILT/CLAPNQ/PeerQA.
+- next steps:
+  - Rebuild NarrativeQA with current normalized-hash deduplication before any
+    new experiment. Report the corpus as 20 unique full narratives, and describe
+    irrelevant story content separately from cross-story distractors.
+
+## 2026-07-23 - Clarify Qasper suitability for RAG evaluation
+
+- objective:
+  - Reassess the earlier characterization of LongBench-Qasper as unsuitable for
+    RAG and verify the current local corpus structure.
+- what was changed:
+  - No code, data, evaluation logic, or artifact was changed.
+- what was verified:
+  - The local export has 200 query-context files containing 148 unique paper
+    texts. Duplicate-group sizes are at most three query copies per paper.
+  - The current deduplicated `sent-default-512-splitlong180` DB has 148 parent
+    papers and 1,531 512-token coarse chunks, approximately 10.3 chunks per
+    paper. It therefore has ample within-document chunk-selection difficulty.
+  - Qasper is natively a single-paper QA task rather than open-corpus document
+    retrieval. Pooling the 148 papers creates a custom global-RAG setting with
+    up to 147 cross-paper distractors per query.
+  - Many Qasper questions are naturally paper-dependent and may use expressions
+    such as `this paper`, so a global retriever can fail to identify the source
+    paper for reasons unrelated to chunk compression.
+- open issues:
+  - LongBench does not carry Qasper's original evidence annotations in the
+    repository's current evaluation format. Reliable evidence recall would
+    require validated mapping back to the original paper/question/evidence.
+- next steps:
+  - Treat Qasper as suitable for document-scoped chunk retrieval and
+    compression, but avoid using pooled global-paper retrieval as the sole
+    headline RAG result. If used globally, report document-hit and conditional
+    compression performance separately.
+
+## 2026-07-23 - Compare LongRAG's Qasper protocol with the local pooled setup
+
+- objective:
+  - Determine whether LongRAG provides precedent for treating Qasper as a
+    global RAG corpus and how its retrieval flow differs from this project.
+- what was changed:
+  - No code, data, evaluation logic, or artifact was changed.
+- what was verified:
+  - LongRAG treats each complete Qasper paper as one long retrieval unit and
+    searches across the corpus of papers. It therefore provides published
+    precedent for a global-paper Qasper RAG adaptation rather than assuming the
+    source paper is given to the reader.
+  - LongRAG does not encode a whole long paper as one vector. It splits a long
+    unit into 512-token pieces and approximates the paper score with the maximum
+    query-to-piece score, then sends the selected whole paper(s) to a long
+    reader.
+  - Its Qasper ablation reports token-F1 of 26.3 with one retrieved document and
+    25.9 with two, versus 22.6 for 100 short passages. Retrieving five or ten
+    whole documents reduces F1 to 23.9 and 21.6, respectively, which supports
+    the interpretation that additional hard-negative documents can hurt the
+    reader.
+  - This differs from the current project, where all 512-token coarse chunks
+    compete globally and the selected chunks are then subchunked/compressed.
+    LongRAG performs document routing first and does not evaluate fine-grained
+    compression under a matched prompt-token budget.
+- open issues:
+  - LongRAG's reported Qasper split is larger than the local 200-example
+    LongBench subset, so its numeric result is precedent for the protocol but
+    not directly comparable to current results.
+- next steps:
+  - Consider a controlled hierarchical Qasper experiment: score each deduped
+    paper by the max score of its 512-token chunks, freeze the same top-D papers
+    for vanilla and subchunk methods, and then compare within-paper selection at
+    matched prompt lengths. Treat this as a separately declared evaluation-flow
+    change rather than mixing it with existing results.
+
+## 2026-07-23 - Correct LongRAG Qasper data-availability claim
+
+- objective:
+  - Verify whether the Qasper data used in the LongRAG paper is actually
+    available in the authors' public Hugging Face dataset.
+- what was changed:
+  - No code, data, evaluation logic, or artifact was changed.
+- what was verified:
+  - The current `TIGER-Lab/LongRAG` Hugging Face repository exposes exactly
+    seven subsets: `answer_extract_example`, `hotpot_qa`,
+    `hotpot_qa_corpus`, `hotpot_qa_wiki`, `nq`, `nq_corpus`, and `nq_wiki`.
+    It contains no Qasper or MultiFieldQA-en subset.
+  - The official GitHub README likewise documents corpus preparation and
+    reader evaluation only for NQ and HotpotQA. A repository search did not
+    reveal a public Qasper path.
+  - The LongRAG paper reports a Qasper protocol and results, but those facts do
+    not imply that its processed Qasper corpus, retrieval output, or exact
+    split was released.
+- open issues:
+  - Reproducing LongRAG's Qasper numbers would require reconstructing the setup
+    from original Qasper/LongBench data and paper descriptions, and exact
+    parity cannot currently be claimed from the public release alone.
+- next steps:
+  - Use LongRAG only as methodological precedent for document-first Qasper
+    retrieval. Do not describe its Qasper dataset or candidate snapshot as
+    publicly available unless the authors release an additional artifact.
+
+## 2026-07-23 - Explain the missing LongRAG Qasper release
+
+- objective:
+  - Reconcile the Qasper experiment in arXiv:2406.15319 with its absence from
+    the authors' public Hugging Face and GitHub repositories.
+- what was changed:
+  - No code, data, evaluation logic, or artifact was changed.
+- what was verified:
+  - arXiv v1 (2024-06-21) and v2 (2024-06-30) contain no occurrence of Qasper
+    or MultiFieldQA-en. Both experiments first appear in v3 (2024-09-01), which
+    expands the paper from the original NQ/HotpotQA study.
+  - The current Hugging Face and GitHub release still documents and exposes only
+    the original NQ/HotpotQA pipelines and artifacts. The most likely explanation
+    is that the public release was created for the early paper and was never
+    synchronized with the v3 experiment expansion. This is an inference from
+    version/content timing, not an explicit statement by the authors.
+  - v3 states that Qasper was refactored from single-document QA into a RAG task
+    following LoCoV1. Its table reports 416 scientific documents and 371 test
+    cases. LoCoV1's public Qasper test corpus also contains exactly 416 papers,
+    strongly suggesting that it supplied the document corpus/design basis.
+  - LoCoV1 publishes Qasper `title -> full text` and `abstract -> full text`
+    retrieval queries and documents, not LongRAG's 371 QA examples, filtering,
+    rewritten queries, or retrieval outputs. LongRAG's appendix example prepends
+    a paper title to a QA question, but v3 does not fully specify or release the
+    transformation needed for exact reproduction.
+- open issues:
+  - The exact rule producing 371 cases from the original Qasper test split and
+    the exact question/title formatting remain unavailable in the public
+    LongRAG artifacts.
+- next steps:
+  - If reproducing the protocol, use LoCoV1's 416 Qasper documents plus original
+    Qasper QA annotations, define and publish an explicit title-aware query and
+    filtering rule, and describe the result as a reconstruction rather than the
+    authors' released LongRAG-Qasper dataset.
+
+## 2026-07-23 - Correct the inferred relationship between LongRAG and LoCoV1
+
+- objective:
+  - Clarify whether LongRAG sourced NQ, HotpotQA, or Qasper data from LoCoV1.
+- what was changed:
+  - No code, data, evaluation logic, or artifact was changed.
+- what was verified:
+  - LongRAG's NQ and HotpotQA corpora do not come from LoCoV1. The paper and
+    release explicitly build them from the December 20, 2018 NQ Wikipedia dump
+    and the October 1, 2017 HotpotQA Wikipedia abstracts, respectively, then
+    construct LongRAG grouped units using Wikipedia hyperlinks.
+  - For Qasper and MultiFieldQA-en, v3 says only that the authors refactor the
+    original single-document tasks into RAG tasks `following a design similar
+    to LoCoV1`. It does not state that they load or reuse LoCoV1 artifacts.
+  - The 416 Qasper documents are also the size of the original Qasper test
+    document split from which LoCoV1 itself was derived. Therefore the matching
+    count does not establish that LongRAG used LoCoV1; the prior handoff's
+    `strongly suggesting` wording was too strong.
+- open issues:
+  - The exact unreleased LongRAG Qasper transformation and the origin of its
+    371 selected QA cases remain unknown.
+- next steps:
+  - Describe LoCoV1 only as methodological precedent. For reconstruction, start
+    from original Qasper and independently define title-aware query formatting,
+    filtering, and deduplication unless author artifacts become available.
+
+## 2026-07-23 - Verify LoCoV1 contents and whether LoCoV2 exists
+
+- objective:
+  - Verify the public LoCo benchmark versions, task composition, annotation
+    schema, and evaluation target from primary sources.
+- what was changed:
+  - No code, data, evaluation logic, or artifact was changed.
+- what was verified:
+  - The current paper, official Hazy Research announcement, and public datasets
+    release LoCoV1 as a 12-task long-context document-retrieval benchmark.
+  - Its public query rows contain `qid`, `query`, `answer_pids`, and `dataset`;
+    document rows contain `pid`, `passage`, and `dataset`. There is no textual
+    QA-answer or evidence-span field. `answer_pids` are relevant document IDs.
+  - Qasper is present as title-to-full-text and abstract-to-full-text retrieval.
+    2WikiMQA is present; HotpotQA and Natural Questions are not LoCoV1 tasks.
+  - No separately published official LoCoV2 benchmark or dataset was found.
+    The official blog's `LoCoV2 Documents` link text points to the
+    `LoCoV1-Documents` repository and is therefore a labeling typo. This should
+    not be confused with the separately named M2-BERT-V2 model family.
+- open issues:
+  - A future LoCo benchmark release could change this status; re-check official
+    sources before making a time-sensitive claim.
+- next steps:
+  - Treat LoCoV1 as document-level retrieval data, not as a QA-answer or
+    supporting-span benchmark for subchunk evidence recall.
+
+## 2026-07-23 - Verify BEIR annotations and evaluation target
+
+- objective:
+  - Determine whether standard BEIR provides QA answers or evidence spans and
+    whether it can directly evaluate subchunk evidence recall.
+- what was changed:
+  - No code, data, evaluation logic, or artifact was changed.
+- what was verified:
+  - Standard BEIR is a ranked retrieval benchmark. Its normalized format has a
+    corpus (`_id`, optional `title`, `text`), queries (`_id`, `text`), and qrels
+    (`query-id`, `corpus-id`, relevance score).
+  - The standard BEIR release does not retain textual QA answers, supporting
+    sentences, or evidence offsets/spans, even when the source dataset (for
+    example, original HotpotQA or Natural Questions) has richer annotations.
+  - Its headline metric is nDCG@10; the toolkit also reports MAP, recall, and
+    precision at multiple cutoffs and supports MRR.
+  - BEIR HotpotQA has about two relevant corpus items per query, but these are
+    document/passage-level qrels rather than labeled supporting spans.
+- open issues:
+  - Evidence-recall analysis would require joining BEIR queries/documents back
+    to the original source annotations or building a new traceable conversion.
+- next steps:
+  - Do not use standard BEIR alone as evidence-span ground truth for the current
+    subchunk-compression analysis.
+
+## 2026-07-23 - Verify LongRAG NQ versus HotpotQA corpus lengths
+
+- objective:
+  - Explain why the released LongRAG NQ grouped corpus looks substantially
+    longer than its HotpotQA grouped corpus and record the published statistics.
+- what was changed:
+  - No code, data, evaluation logic, or artifact was changed.
+- what was verified:
+  - LongRAG NQ starts from full Wikipedia pages (reported original-document
+    average: 800 tokens), whereas HotpotQA starts only from Wikipedia abstract
+    paragraphs (reported average: 130 tokens).
+  - The released grouped corpora contain 604,351 NQ units and 509,493 HotpotQA
+    units, matching the paper's rounded 600K and 500K figures.
+  - Paper Table 2 reports an NQ grouped unit at about 4K tokens corpus-wide and
+    about 6K among top-1 retrieved test units.
+  - Paper Table 3 reports 1K/8K tokens for two HotpotQA grouped units under its
+    corpus/test-set columns and 4K/29K for eight units. This implies roughly
+    0.5K tokens per unit corpus-wide, but roughly 3.6--4K per retrieved unit.
+  - The grouping algorithm takes a maximum group-token budget and does not
+    guarantee a 4K minimum. Thus the paper's broad `4K-token units` description
+    is not representative of the full released HotpotQA corpus.
+- open issues:
+  - The paper reports averages but not median/percentiles or the fraction above
+    512 tokens. Exact suitability for subchunking requires computing a tokenizer-
+    specific distribution over the released `text` column.
+- next steps:
+  - Before choosing LongRAG HotpotQA, calculate p10/p25/median/p75/p90/p95,
+    maximum, and fractions above 512/1K/4K with the experiment tokenizer.
+
+## 2026-07-23 - Clarify prior LongBench document-length table terminology
+
+- objective:
+  - Confirm the unit and population used in the previously reported HotpotQA,
+    2Wiki, and MuSiQue document-length table.
+- what was changed:
+  - No code, data, evaluation logic, or artifact was changed.
+- what was verified:
+  - All length statistics used `meta-llama/Llama-3.1-8B-Instruct` token counts
+    with `add_special_tokens=False`; they were not character counts.
+  - `original files` meant the local pooled LongBench `documents/*.txt` passage
+    occurrences, not original Wikipedia/source-dataset documents.
+  - `DB documents` meant unique active parent document IDs after normalized-text
+    SHA-256 deduplication, not the number of Chroma rows. The reported length
+    distribution was computed over this deduplicated active-parent population.
+  - Duplicate reductions were 1,722 to 1,710 for HotpotQA, 1,986 to 1,404 for
+    2Wiki, and 1,831 to 1,827 for MuSiQue.
+  - The corresponding 512-token coarse-chunk row counts were 5,807, 2,831, and
+    5,823, respectively.
+- open issues:
+  - The labels `original files` and `DB documents` are ambiguous and should not
+    be reused in a paper table without qualification.
+- next steps:
+  - Prefer `pooled LongBench passage occurrences`, `unique indexed parent
+    passages`, and `512-token DB chunks` as the three explicit count labels.
+
+## 2026-07-23 - Reassess LongBench Qasper for subchunk evaluation
+
+- objective:
+  - Quantify current Qasper parent-document lengths and distinguish mechanical
+    subchunk suitability from open-domain RAG validity.
+- what was changed:
+  - No code, data, evaluation logic, or artifact was changed.
+- what was verified:
+  - Using active parent IDs from the splitlong180 DB and
+    `meta-llama/Llama-3.1-8B-Instruct` with `add_special_tokens=False`, the 148
+    deduplicated Qasper documents have mean 5,062.66, p25 3,209.75, p50
+    4,673.5, p75 5,728.75, p90 7,658.1, p95 9,337.85, p99 18,474.77, and max
+    21,110 tokens; minimum is 1,846.
+  - All 148 documents exceed 512 and 1,024 tokens; 145 (97.97%) exceed 2,048,
+    88 (59.46%) exceed 4,096, and 11 (7.43%) exceed 8,192.
+  - The 200 local LongBench Qasper files collapse to 148 unique papers because
+    multiple questions can share the same paper/context.
+  - Current LongBench Qasper queries omit paper titles and include context-bound
+    wording such as `their model` or `this task`. Original Qasper questions were
+    written after seeing a paper's title and abstract, so pooling papers turns
+    them into an under-specified open-corpus retrieval task.
+- open issues:
+  - Current LongBench Qasper metadata does not retain original Qasper evidence
+    annotations. Adding a title to the query or reconnecting original evidence
+    changes the evaluation protocol and breaks direct comparability with old
+    results.
+- next steps:
+  - Qasper is strong for conditional/oracle coarse-retrieval compression tests,
+    but should not be presented as canonical open-domain RAG in its current
+    pooled LongBench form. A reconstructed title-aware/evidence-aware variant
+    must be labeled as a new evaluation condition.
+
+## 2026-07-23 - Measure full LongRAG NQ and HotpotQA corpus distributions
+
+- objective:
+  - Measure tokenizer-specific length distributions over the complete released
+    LongRAG grouped corpora and assess their suitability for 512-token coarse
+    chunk/subchunk experiments.
+- what was changed:
+  - Added ignored analysis script `test/analyze_longrag_corpus_lengths.py`.
+  - Wrote ignored result
+    `outputs/analysis/longrag_corpus_length_stats.json`.
+  - No source, dataset, retrieval, prompt, metric, scoring, or evaluation output
+    format was changed.
+- what was verified:
+  - Streamed official dataset `TIGER-Lab/LongRAG` revision
+    `d3983d83a3bf90cd3c489303fe392f0a426b3b73` in full.
+  - Tokenized `text` with `meta-llama/Llama-3.1-8B-Instruct`,
+    `add_special_tokens=False`.
+  - Counts match the release metadata exactly: HotpotQA 509,493 units and NQ
+    604,351 units.
+  - HotpotQA grouped units: mean 738.57; p10 35, p25 43, p50 55, p75 98, p90
+    4,164, p95 4,371, p99 4,640, max 9,161 tokens. Strictly over 512:
+    84,767 (16.64%); over 1,024: 16.55%; over 2,048: 16.44%; over 4,096:
+    11.13%; over 8,192: 5 units. Titles per unit have mean 9.72, p50/p75 1,
+    p90 47, confirming a strongly bimodal corpus dominated by singleton short
+    abstracts plus a minority of large groups.
+  - NQ grouped units: mean 4,434.84; p10 3,373, p25 3,958, p50 4,479, p75
+    4,852, p90 5,060, p95 6,292, p99 11,461, max 59,855 tokens. Strictly over
+    512: 577,799 (95.61%); over 1,024: 94.77%; over 2,048: 94.41%; over 4,096:
+    69.52%; over 8,192: 2.61%. Titles per unit have mean 5.34, p50 5, p90 11.
+  - Total token volume is about 376.3M for HotpotQA and 2.680B for NQ. A raw
+    128-dimensional fp16 token-vector artifact would therefore require roughly
+    96.3GB and 686.1GB, respectively, before DB/index/metadata overhead.
+  - Published paper averages are consistent in direction: original documents
+    average 130 tokens for HotpotQA abstracts and 800 for NQ full pages; Table 2
+    reports roughly 4K per NQ grouped corpus unit, while Table 3 reports 1K
+    total for two corpus-average HotpotQA groups but 8K for two retrieved test
+    groups.
+- open issues:
+  - Corpus-wide HotpotQA length is not enough to determine method exposure on
+    relevant evidence. The two supporting titles per query should be mapped to
+    grouped units to measure gold-unit lengths and the fraction requiring
+    subchunking.
+  - Full-corpus NQ is length-appropriate but its estimated ColBERT artifact is
+    too large for current free storage. Full HotpotQA is storage-borderline.
+- next steps:
+  - Before materialization, compute HotpotQA gold-support-group length coverage.
+  - For scalable experiments, consider a frozen first-stage candidate pool and
+    report candidate recall separately; do not inject missing gold units into
+    the main condition.
+
+## 2026-07-23 - Assess large ColBERT artifact runtime behavior
+
+- objective:
+  - Determine whether scaling the ColBERT artifact to LongRAG corpus size would
+    leave per-query compression time essentially unchanged.
+- what was changed:
+  - No code, data, evaluation logic, or artifact was changed.
+- what was verified:
+  - `vectors.fp16.bin` is opened with `np.memmap`; vector slices are resolved by
+    per-cacheable offsets, so bytes read and MaxSim work per query are mainly
+    controlled by retrieved coarse chunks and their token counts, not directly
+    by the total vector-file size.
+  - The runtime does not have a fully disk-backed index. It loads `id_to_row`,
+    `window_ids_by_row`, and `region_specs_by_chunk` from `data/index.json` into
+    Python memory at initialization.
+  - Current HotpotQA splitlong180 artifact is 0.529GB of vectors plus a 24.3MB
+    JSON index for 73,085 cacheables and 5,807 coarse chunks. Qasper is 0.173GB
+    plus 8.74MB for 24,036 cacheables and 1,531 chunks.
+  - Naively scaling the current HotpotQA ratio to estimated full-corpus vectors
+    suggests roughly a 4.4GB JSON file for LongRAG HotpotQA and roughly 31GB for
+    NQ, with substantially larger live Python-object memory after parsing.
+  - `compress_docs` clears the application-level retrievable-vector and region-
+    spec caches before every batch. Reuse is therefore left to the OS page
+    cache. A vector file larger than RAM will incur query-dependent random page
+    faults and cannot reproduce the warm-cache behavior of current sub-GB
+    artifacts.
+- open issues:
+  - Exact cold/warm latency impact has not been measured on a large artifact.
+  - Full NQ is likely blocked by metadata initialization/RAM and storage before
+    per-query MaxSim compute becomes the main concern.
+- next steps:
+  - Before full-corpus scaling, replace global JSON metadata with compact binary
+    arrays plus a disk-backed or compact ID lookup and per-chunk region offsets.
+  - Report warm and cold/randomized-query `artifact_lookup_time` separately from
+    query encoding and MaxSim compute.
+
+## 2026-07-23 - Estimate LongRAG Chroma DB storage
+
+- objective:
+  - Add a current-implementation Chroma DB estimate alongside the LongRAG
+    vector and JSON-index size estimates.
+- what was changed:
+  - No code, data, evaluation logic, or artifact was changed.
+- what was verified:
+  - Current splitlong180 DB sizes/counts are: HotpotQA 219.6MB/5,807 chunks,
+    2Wiki 95.3MB/2,831, Qasper 75.6MB/1,531, and MuSiQue 218.0MB/5,823.
+  - Using their active parent-token totals, DB storage is 87.2, 90.5, 100.9,
+    and 87.9 bytes per token, respectively; weighted mean is 89.5 bytes/token.
+  - Applying that empirical ratio to the measured LongRAG token totals gives a
+    central Chroma DB estimate of 33.7GB for HotpotQA and 239.8GB for NQ.
+  - Practical ranges are approximately 34--40GB and 235--270GB because HNSW,
+    SQLite/FTS row overhead, short-unit fragmentation, and metadata composition
+    do not scale perfectly with token count.
+  - Combined central disk estimates are therefore about 134GB for LongRAG
+    HotpotQA (96GB vectors + 4.4GB JSON + 34GB DB) and 957GB for NQ (686GB +
+    31GB + 240GB), excluding source downloads, build temporaries, and free-space
+    headroom.
+- open issues:
+  - Exact DB size requires building the chosen corpus because embedding backend,
+    coarse-chunk fragmentation, SQLite page utilization, and HNSW parameters
+    affect the result.
+- next steps:
+  - Use these estimates for feasibility screening only; reserve additional build
+    headroom and measure a representative corpus shard before full materialization.
+
+## 2026-07-23 - Correct the LongRAG Chroma DB scaling model
+
+- objective:
+  - Reassess whether extrapolating Chroma DB size solely by tokens is valid once
+    SQLite and HNSW storage behavior are considered.
+- what was changed:
+  - No code, data, evaluation logic, or artifact was changed.
+- what was verified:
+  - The previous bytes-per-token extrapolation is only a rough shortcut, not the
+    correct scaling model. HNSW and embedding storage scale primarily with DB
+    rows/coarse chunks, while text, `cacheables_json`, FTS, and metadata scale
+    with text/subchunk payload.
+  - Current HNSW files use about 1.15--1.52KB per row (weighted 1.43KB/row).
+  - Across the four current splitlong180 DBs, `cacheables_json` character volume
+    is about 4.21 times `chroma:document` character volume.
+  - A two-factor fit over the current SQLite files is approximately:
+    `SQLite bytes = 3.08 * (document_chars + cacheables_json_chars)
+    + 4.19KB * rows + 8.7MB`. It fits the four observed DBs within about 0.6MB,
+    but remains an empirical extrapolation.
+  - Using measured LongRAG character totals, about 1.14M/5.54M estimated 512-
+    chunk rows, and current payload ratios gives revised central DB estimates of
+    about 31GB for HotpotQA and 223GB for NQ. HNSW contributes only about
+    1.6GB/7.9GB of those totals; SQLite payload and indexes dominate.
+  - Revised combined central disk estimates are about 131GB for HotpotQA and
+    940GB for NQ, before source data, temporary build space, and safety margin.
+- open issues:
+  - LongRAG coarse-row counts are estimated rather than exactly summed from all
+    per-unit token lengths. Wikipedia sentence structure may also change the
+    `cacheables_json`/document ratio.
+  - Changing the Chroma embedding backend/dimension or HNSW configuration changes
+    per-row storage.
+- next steps:
+  - Treat 31GB/223GB as improved planning estimates with broad ranges, not exact
+    predictions; build a representative shard to calibrate before scaling.
+
+## 2026-07-23 - Measure LongRAG NQ context-title coverage
+
+- objective:
+  - Determine whether the union of released `nq/full.context_titles` covers all
+    `nq_wiki` documents or only a small retrieved subset.
+- what was changed:
+  - No code, data, evaluation logic, or artifact was changed.
+- what was verified:
+  - Streamed all 3,610 official `nq/full` rows from `TIGER-Lab/LongRAG`.
+  - `context_titles` contain 60,416 total title occurrences and 54,418 unique
+    titles. Per query: mean 16.74, p50 16, p90 29, min 4, max 64. There were no
+    duplicate title occurrences within an individual query.
+  - The official `nq_wiki` release has 3,232,908 document rows. Under the dataset
+    semantics of one Wikipedia page/title per row, at most 1.68% of wiki titles
+    appear in any released query context and at least about 3,178,490 (98.32%)
+    do not.
+  - This follows the data design: `context_titles` names documents contained in
+    the already retrieved top units used as reader input; it is not a corpus
+    inventory or qrels list.
+- open issues:
+  - An exact intersection count requires streaming `nq_wiki.title` and checking
+    normalization, redirects, duplicates, and any stale/missing titles. The
+    existence and approximate magnitude of uncovered documents are already
+    decisive from the counts.
+- next steps:
+  - Treat query-specific `context_titles` as frozen retrieval outputs for a
+    conditional compression evaluation. Do not pool their union and call it a
+    full-corpus retrieval benchmark without explicitly documenting the
+    query-conditioned corpus construction.
+
+## 2026-07-23 - Extract dense compressor implementation
+
+- objective:
+  - Separate the dense compressor implementation from
+    `src/compressor/comparison_compressor.py` without changing compression or
+    evaluation behavior.
+- what was changed:
+  - Added `src/compressor/dense_compressor.py` containing
+    `_DenseEmbeddingSelector`, `_GlobalDenseSelector`, and `DenseSummarizer`.
+  - Removed those dense-only classes and imports from
+    `src/compressor/comparison_compressor.py`.
+  - Updated the compressor factory, dense unit test, ColBERT factory assertion,
+    and dense analysis scripts to import `DenseSummarizer` from the new module.
+  - Kept `parse_global_top_r` in `comparison_compressor.py` because it remains
+    shared with the ColBERT compressor.
+- what was verified:
+  - Black check passed for the new module and directly changed source/test
+    files, excluding the already-modified large ColBERT test file from bulk
+    formatting.
+  - Python compilation passed for `comparison_compressor.py`,
+    `dense_compressor.py`, and `factory.py`.
+  - `test/test_dense_compressor.py` passed.
+  - The focused compressor-factory registration test passed.
+- open issues:
+  - None identified for this structural refactor.
+- next steps:
+  - Continue separating comparison compressors only when a specific boundary is
+    requested; no further refactor is required for this extraction.
+
+## 2026-07-23 - Unify compression under token-budget add-then-stop selection
+
+- objective:
+  - Remove the global candidate-count ratio policy project-wide, make dense and
+    ColBERT subchunk selection use the same token-budget controls as sliding
+    regions, and standardize selection as add-then-stop.
+- what was changed:
+  - Added `src/compressor/token_budget.py` with shared retained-ratio parsing,
+    absolute-budget validation, evaluated-LLM token accounting, sidecar token
+    count reuse, retrieved-context deduplication, and per-query budget
+    resolution.
+  - `dense`, `colbert_subchunk`, `colbert_sliding_region`, and
+    `rerank_and_region` now require exactly one of `RETAIN_TOKEN_RATIO` and
+    `FINAL_TOKEN_BUDGET`. Setting both or neither is an error.
+  - Dense and ColBERT subchunk selection now add each complete ranked subchunk
+    before checking whether the budget has been reached. Sliding-region methods
+    retain the same policy over complete regions. All four methods may therefore
+    exceed the target by their final selection unit.
+  - Removed the global-ratio parser, global-count helper, ColBERT no-budget
+    fallback, `BudgetColBERTWindowSummarizer`, and the
+    `colbert_window_budget` factory option.
+  - Replaced `COLBERT_FINAL_TOKEN_BUDGET` with the method-independent
+    `FINAL_TOKEN_BUDGET`; no compatibility alias is retained.
+  - Updated main and retrieval/evidence shell entrypoints, output suffixes
+    (`rtr` or `ftb`), grid summary fields, active grid configurations, bootstrap
+    example, and maintained official/analysis helpers.
+  - Updated README, `docs/method.md`, and `docs/eval_protocol.md` with the new
+    required controls, soft-target semantics, and comparability boundary.
+- what was verified:
+  - Full unittest discovery passed: 65 tests.
+  - Added/updated regression coverage for exact-one-budget validation, dense
+    deduplication, dense/subchunk budget overshoot, region add-then-stop,
+    factory removal, and output naming/configuration errors.
+  - Black checks passed for all directly changed Python source and maintained
+    test/analysis files.
+  - Python compilation passed for the updated standalone analysis utilities.
+  - Shell syntax checks passed for all changed shell entrypoints.
+  - All 62 grid YAML files parsed successfully.
+  - `git diff --check` and maintained-source legacy-reference scans passed; the
+    only remaining `colbert_window_budget` occurrence is a negative factory
+    assertion.
+- evaluation/comparability impact:
+  - This intentionally changes compression selection and output configuration.
+    Earlier candidate-count-ratio dense/ColBERT results are not directly
+    comparable to the new token-budget results.
+  - Earlier strict-fit `colbert_subchunk` results are not directly comparable
+    because the selector now includes the first subchunk that reaches or crosses
+    the target.
+  - Existing sliding-region add-then-stop scoring/selection semantics are
+    preserved, but its absolute-budget environment name and output suffix have
+    changed.
+  - Dataset handling, retrieval, prompt serialization, answer metrics, scoring,
+    and prediction JSONL contents were not otherwise changed.
+- open issues:
+  - Historical ignored analysis scripts that reconstruct old candidate-ratio
+    outputs retain legacy field names as experiment records; they are not
+    supported current compressor entrypoints.
+- next steps:
+  - Re-run dense and ColBERT subchunk paper conditions with explicit retained
+    ratios or absolute budgets before comparing them with current region runs.
+
+## 2026-07-23 - Rename selector classes by compression role
+
+- objective:
+  - Remove misleading `Summarizer` and `Window` terminology from runtime
+    selector class names after unifying token-budget policy.
+- what was changed:
+  - Renamed `DenseSummarizer` to `DenseCompressor`.
+  - Renamed `ColBERTWindowSummarizer` to `ColBERTSubchunkCompressor`.
+  - Renamed `SlidingRegionColBERTWindowSummarizer` to
+    `ColBERTSlidingRegionCompressor`.
+  - Renamed `ColBERTRerankSummarizer` to `ColBERTRerankCompressor`.
+  - Renamed `FixedChunkColBERTRerankSummarizer` to
+    `FixedChunkColBERTRerankCompressor`.
+  - Renamed `ColBERTRerankAndRegionSummarizer` to
+    `ColBERTRerankAndRegionCompressor`.
+  - Updated the factory, unit tests, profiling utilities, and analysis scripts
+    to import and instantiate the new names. No compatibility aliases were
+    retained.
+  - Kept the actual OpenAI text-summary `Summarizer` name and kept
+    window-oriented artifact/file terminology, where `window` still describes
+    offline contextualization and the stored region/window budget.
+- what was verified:
+  - Full unittest discovery passed: 65 tests.
+  - Python compilation passed for the changed source and standalone analysis
+    utilities.
+  - Black checks passed for the changed maintained Python files.
+  - Old selector class-name scans and `git diff --check` passed.
+- evaluation/comparability impact:
+  - No dataset, retrieval, prompt, compression selection, token-budget,
+    scoring, metric, or output behavior changed. Existing results remain
+    directly comparable; only Python class/import names changed.
+- open issues:
+  - None.
+- next steps:
+  - Use selection-unit names (`Subchunk`, `SlidingRegion`, `Rerank`) for future
+    runtime compressor classes and reserve `Window` for artifact construction
+    and contextual representation metadata.
+
+## 2026-07-23 - Clarify LongRAG NQ answer-recall labels
+
+- objective:
+  - Verify whether the released LongRAG data retains the gold-answer strings
+    used for NQ Answer Recall.
+- what was changed:
+  - Documentation only; no source or evaluation code changed.
+  - Recorded that the query-level `nq` subset contains `answer`, a list of gold
+    answer strings.
+  - Recorded that `nq_corpus` and `nq_wiki` contain query-independent corpus
+    data and therefore do not carry per-query answers.
+  - Recorded that the released `nq` schema does not expose gold evidence spans
+    or offsets; LongRAG's NQ Answer Recall is answer-string containment over
+    retrieved reader context, not evidence-span recall.
+- what was verified:
+  - The official Hugging Face dataset card documents the `nq.answer` field and
+    the corpus schemas.
+  - Section 3.2 of the LongRAG paper defines NQ Answer Recall as presence of the
+    answer string in the retrieved documents supplied to the reader.
+  - The official repository's sample evaluation output retains `answers` and
+    reports `is_retrieval`.
+- open issues:
+  - Inspect and reproduce the repository's exact answer normalization and alias
+    matching rules before claiming metric-level parity with LongRAG.
+- next steps:
+  - For compression analysis, separately report retrieved-context answer-string
+    recall, compressed-context answer-string recall, and conditional answer
+    retention; do not label these as evidence-span recall.
+
+## 2026-07-23 - Survey long-document datasets with gold evidence spans
+
+- objective:
+  - Find datasets that can directly measure evidence retention under
+    512-token coarse retrieval chunks, rather than using answer-string
+    containment as a proxy.
+- what was changed:
+  - Research and documentation only; no source or evaluation code changed.
+- what was verified:
+  - DAPR-ConditionalQA provides a complete 652-document policy corpus, 2,517
+    queries across its splits, and passage-level qrels derived from the original
+    ConditionalQA evidence annotations. The official test split has 271 queries
+    and 1,165 positive qrels.
+  - Direct tokenization of the 652 DAPR-ConditionalQA documents with
+    `meta-llama/Llama-3.1-8B-Instruct` gave mean 1,617.6, p50 1,251, p75
+    1,952, p90 3,015, p95 3,969, maximum 10,913 tokens; 95.09% exceed 512
+    tokens.
+  - QUEST provides a real 325,505-document retrieval corpus and query-to-document
+    substring attributions. Direct Llama-3.1-8B tokenization gave corpus mean
+    666.2, p50 332, and 35.74% over 512 tokens. For the union of relevant
+    documents, mean was 1,087.9, p50 545, and 51.94% over 512; for documents
+    with explicit attributions, mean was 1,323.0, p50 780, and 62.80% over
+    512. The paper reports about 69% complete and 30% partial evidence, so
+    complete-evidence examples should be the primary evaluation subset.
+  - Original QASPER exposes paragraph evidence and highlighted evidence
+    sentences. Direct Llama-3.1-8B tokenization of all 1,585 papers gave mean
+    5,165.9, p50 4,839, and 99.81% over 512 tokens. It remains a
+    within-document benchmark rather than a natural corpus-retrieval benchmark.
+  - MASH-QA provides gold answer-sentence indices, 34,808 QA pairs over 5,574
+    WebMD articles, and an official mean context length of 696.2 tokens. Its
+    answer sentences were expert-curated and manually aligned where automatic
+    matching was insufficient.
+  - PeerQA provides author-highlighted answer evidence mapped to extracted
+    sentence indices. Papers average 12K Llama-3 tokens, but only 383 questions
+    have successfully mapped evidence, and its official RAG setup retrieves
+    within the known paper.
+  - DAPR-NaturalQuestions, original Natural Questions, TechQA, NewsQA,
+    MESAQA, Evidence Inference, and Doc2Dial are valid secondary candidates,
+    but each has a material limitation such as gold-document-union corpora,
+    answer-only spans, non-QA labels, synthetic answers, or single-document
+    conditioning.
+- open issues:
+  - DAPR-ConditionalQA's released DAPR format is optimized for evidence
+    retrieval; final QA evaluation requires joining back to original
+    ConditionalQA answer annotations.
+  - Pooling MASH-QA articles into a global corpus creates incomplete qrels
+    because other WebMD articles may also validly answer generic health
+    questions.
+  - QUEST is an entity-set retrieval task rather than natural-language answer
+    generation, and only complete-evidence examples support strict evidence
+    recall claims.
+- next steps:
+  - Prefer DAPR-ConditionalQA for the first end-to-end retrieval/compression
+    evidence experiment.
+  - Use MASH-QA as a larger, compression-focused supporting-sentence benchmark,
+    or QUEST when a real full-corpus retrieval experiment is more important
+    than final QA generation.
+
+## 2026-07-23 - Verify DAPR-to-ConditionalQA answer joins
+
+- objective:
+  - Verify rather than assume that DAPR-ConditionalQA retrieval records can be
+    joined back to the original ConditionalQA QA annotations.
+- what was changed:
+  - Research and documentation only; no source or evaluation code changed.
+- what was verified:
+  - DAPR preserves the original ConditionalQA question ID and constructs query
+    text as `scenario + " " + question`.
+  - All 271 DAPR test IDs match original ConditionalQA dev IDs, and all 271
+    concatenated query texts match exactly.
+  - DAPR test is the evidence-bearing subset of original ConditionalQA dev:
+    the original dev set has 285 records, while DAPR excludes the 14 records
+    with no evidence. It does not use the public no-answer test annotations for
+    its labeled test split.
+  - Original annotations contain `answers` as `(answer text, condition
+    elements)` pairs, plus separate `evidences`. Among the 271 joined DAPR test
+    examples, 58 have multiple answers and 63 have at least one conditioned
+    answer.
+  - The current official original `documents.json` and DAPR
+    `ConditionalQA-docs` release were compared exhaustively: both contain 652
+    documents; document order/IDs, titles, passage counts, generated passage
+    IDs, and every passage text match with zero failures after applying DAPR's
+    documented transformation (`re.sub("<.*?>", "", text).strip()`).
+  - All 1,165 test qrels were reconstructed from the 271 original dev examples
+    by locating each original evidence element in its URL-linked document.
+    Every reconstructed passage ID and every cleaned evidence text matched the
+    released DAPR qrel/document data; there were zero mapping failures.
+  - Verified the user's referenced train qrel row 8001 as a concrete lookup
+    example: `query_id=train-2327`, `corpus_id=623-48`; document `623` is
+    "Appeal a decision against financial assistance for a reservist", and the
+    parallel `passage_ids`/`passages` entry at index 48 is the gold evidence
+    passage beginning "If a decision’s not made at the hearing...".
+  - DAPR qrels are built from original `evidences`, not from final answer text
+    or the complete set of answer-condition elements. DAPR therefore supports
+    retrieval/evidence-retention evaluation directly, but answer-only or
+    answer-with-conditions QA evaluation requires the original annotations.
+- evaluation/comparability impact:
+  - No evaluation implementation changed. Treating ConditionalQA as ordinary
+    single-answer LongBench-style QA would be an adapted protocol, not the
+    official ConditionalQA evaluation, because the official evaluator handles
+    multiple answers, unanswerable cases, and condition-element accuracy.
+- open issues:
+  - Before implementation, choose between answer-only EM/F1 and the full
+    official answer-with-conditions protocol.
+  - If condition-retention is to be measured separately from evidence
+    retention, map original condition HTML elements to DAPR passage IDs and
+    validate that mapping over the complete selected split.
+- next steps:
+  - Build an explicit, ID-keyed conversion with assertions for ID coverage,
+    exact query-text equality, and answer schema rather than using fuzzy
+    question matching.
+
+## 2026-07-23 - Audit answer-bearing datasets within DAPR
+
+- objective:
+  - Determine which DAPR components can support end-to-end RAG QA by restoring
+    final-answer labels, and establish the task type and available small-LLM
+    reference results for ConditionalQA.
+- what was changed:
+  - Research and documentation only; no source or evaluation code changed.
+- what was verified:
+  - ConditionalQA supports an exact final-answer join: DAPR preserves the
+    original question ID, and the current test release maps exactly to the 271
+    evidence-bearing records from original ConditionalQA dev.
+  - DAPR MS MARCO is built from the MS MARCO v2.1 QnA files and preserves their
+    `query_id`. Those source records contain human-written `answers`, so final
+    answers can be restored by exact query ID even though DAPR discards the
+    field.
+  - DAPR Natural Questions is built from
+    `sentence-transformers/NQ-retrieval`, whose released rows contain questions,
+    titles, candidate passages, and long-answer passage indices but no short
+    answers. DAPR additionally generates IDs as `split-line_number`; therefore,
+    joining short answers from original Natural Questions is not the same
+    direct ID join and requires a separately validated reconstruction.
+  - MIRACL and Genomics are retrieval collections without final QA answer
+    annotations suitable for restoration from the DAPR IDs.
+  - Original ConditionalQA is a single-document reading-comprehension task,
+    not open-domain QA. DAPR converts it into retrieval over a fixed 652-page
+    UK-government corpus, which is a domain-restricted corpus-RAG setting.
+  - ConditionalQA is described by its authors as multi-hop/compositional
+    reasoning, but every question is associated with one webpage. It is best
+    characterized as single-document, multi-evidence conditional reasoning,
+    not HotpotQA-style multi-document multi-hop QA; no per-question hop-count
+    labels are provided.
+  - No directly comparable published Llama-3/3.1-8B result was found for the
+    original ConditionalQA EM/F1 protocol. The closest directly comparable
+    published small-model result is Mistral-7B v0.1 on the 285-example original
+    dev set with oracle evidence: zero-shot answer EM/F1 44.1/50.7 and
+    conditional EM/F1 26.7/30.8; CoT 58.3/68.6 and 37.7/46.4; Chain of
+    Condition 55.5/63.8 and 40.7/47.5.
+- evaluation/comparability impact:
+  - The published Mistral result uses oracle evidence and all 285 original dev
+    examples, whereas DAPR test contains 271 evidence-bearing examples and
+    requires actual retrieval. It is not a directly comparable RAG baseline.
+  - Recent 8B ConditionalQA studies found during the audit use altered
+    multiple-choice, planning, or interactive-clarification protocols and
+    metrics; their numbers must not be reported as original ConditionalQA QA
+    EM/F1.
+- open issues:
+  - Fully audit answer coverage and document-length suitability of DAPR
+    MS MARCO before choosing it for the subchunking experiments.
+  - An exact DAPR-NQ-to-short-answer mapping has not been established.
+- next steps:
+  - If ConditionalQA is adopted, create a local answer-joined 271-query test
+    file and run the project's exact 8B RAG protocol; this is required for a
+    directly comparable 8B result.
+
+## 2026-07-23 - Estimate DAPR MS MARCO storage and measure ConditionalQA lengths
+
+- objective:
+  - Estimate the Chroma DB and compact ColBERT artifact required by DAPR
+    MS MARCO under the current 512-token coarse-chunk/180-token sentence
+    subchunk flow, and report exact ConditionalQA document-length statistics.
+- what was changed:
+  - Analysis and documentation only; no source, dataset, artifact, DB, or
+    evaluation logic changed.
+- what was verified:
+  - DAPR reports 1,359,163 MS MARCO documents. A shard-balanced sample of
+    11,000 official documents (500 from each of 22 parquet shards), tokenized
+    with `meta-llama/Llama-3.1-8B-Instruct` without special tokens, had mean
+    1,919.3, p25 535, p50 947, p75 1,796, p90 3,735, p95 6,598, and p99
+    16,210 tokens; 76.47% exceeded 512 and 46.36% exceeded 1,024. The sample
+    was heavy-tailed, with a maximum of 446,028 tokens.
+  - Extrapolating the balanced mean gives about 2.609B Llama tokens and 11.34B
+    text characters for the complete DAPR MS MARCO document collection.
+  - On a separate balanced 1,100-document sample, ColBERT token count was
+    1.009 times Llama token count before masking. After applying the active
+    ASCII-punctuation masking policy, stored center-vector count was about
+    0.849 times Llama token count.
+  - Under 128-dimensional fp16 storage, the central vector-file estimate is
+    about 567GB. Scaling the current compact JSON/array overhead gives about
+    26GB for `index.json` and about 1GB for offset/count arrays, for a central
+    compact ColBERT artifact estimate of about 594GB.
+  - Using the current empirical 433.6 tokens per 512-token coarse DB row gives
+    about 6.02M Chroma rows. Applying the current two-factor SQLite payload/row
+    model plus 1.43KB HNSW per row gives a central DB estimate of about 217GB.
+  - Central final storage is therefore about 811GB for DB plus ColBERT
+    artifact. Because the estimate is sample-based and MS MARCO has an extreme
+    document-length tail, a practical final-size range is roughly 0.7--0.95TB;
+    safe build capacity should be about 1.0--1.2TB excluding unrelated data.
+  - Exact full-corpus ConditionalQA lengths over all 652 DAPR documents are:
+    total 1,054,678 Llama tokens; mean 1,617.60; min 267; p10 622.2; p25
+    880.75; p50 1,251.5; p75 1,952; p90 3,015.1; p95 3,969.7; p99 6,461.75;
+    max 10,913. Strictly over 512: 620/652 (95.09%); over 1,024: 427 (65.49%);
+    over 2,048: 148 (22.70%); over 4,096: 28 (4.29%); over 8,192: 3 (0.46%).
+- evaluation/comparability impact:
+  - No evaluation changed. The MS MARCO figures are planning estimates, not
+    measured built sizes, and must not be reported as artifact measurements.
+- open issues:
+  - Sentence-packing efficiency and metadata/text redundancy may differ from
+    the four LongBench DBs used to fit the Chroma scaling model.
+  - The current JSON artifact design would require tens of GB on disk and
+    substantially more live Python memory after parsing, independently of the
+    vector-file capacity.
+- next steps:
+  - Prefer ConditionalQA for a feasible first experiment. If MS MARCO remains
+    desired, build and measure a fixed representative shard before committing
+    to the full corpus.
+
+## 2026-07-23 - Define the ConditionalQA conversion policy
+
+- objective:
+  - Review the proposed DAPR ConditionalQA-to-local-RAG conversion and align it
+    with the existing LongBench HotpotQA/2Wiki document/title policy.
+- what was changed:
+  - Design/documentation only; no dataset or evaluation code changed.
+- what was verified:
+  - Every one of the 271 DAPR ConditionalQA test queries has qrels in exactly
+    one gold document. Evidence counts range from 1 to 19, with mean 4.30.
+  - All 652 DAPR document titles are unique, but stable `doc_id` should still
+    be the primary key and title should be retained as display/evaluation
+    metadata.
+  - Existing LongBench HotpotQA and 2Wiki local documents put the title on the
+    first line of each source document. The current main ColBERT artifacts have
+    `prefix_title=False`, so that title is not repeated on every ColBERT window.
+  - The matching ConditionalQA default should therefore write the title once at
+    the start of each reconstructed source document, followed by the ordered
+    DAPR passages. Repeating titles per coarse chunk/window would be a separate
+    ablation.
+  - Qrels must be grouped by `query_id`; each `corpus_id` should remain the
+    source-of-truth evidence identifier. Conversion should also store exact
+    evidence text and deterministic character/token offsets computed while
+    concatenating passages, rather than recovering spans later with fuzzy or
+    first-occurrence string matching.
+  - Gold document title is label metadata for document recall and must not be
+    appended to the retrieval query in the default condition.
+  - Original ConditionalQA `answers` must be preserved as the full list of
+    `(answer, conditions)` pairs. Flattening to one `answer` loses multi-answer
+    and conditional labels. DAPR evidence qrels and answer-condition elements
+    are distinct annotation sets.
+- evaluation/comparability impact:
+  - DAPR test is the 271-example evidence-bearing subset of original
+    ConditionalQA dev, not the full 285-example dev set; results will not be
+    directly comparable to published full-dev ConditionalQA numbers.
+  - The current `acc_metric.py` does not support ConditionalQA. Choosing
+    answer-only versus official answer-with-conditions evaluation requires an
+    explicit metric implementation and `docs/eval_protocol.md` update.
+- open issues:
+  - Choose the exact passage separator (`"\n\n"` is recommended) and freeze it
+    before computing evidence offsets and building the DB.
+  - Decide whether the first experiment reports answer-only EM/F1 or the full
+    official conditional metrics.
+- next steps:
+  - Implement one deterministic converter producing source documents,
+    query/answer files, and an ID/offset-rich evidence-label manifest with
+    validation assertions before running preprocessing.
+
+## 2026-07-23 - Extract ColBERT MaxSim scoring from materialization
+
+- objective:
+  - Begin the role-based split of `materialize/colbert_window.py` by moving
+    compression-only scoring out of the artifact materialization module.
+- what was changed:
+  - Added `compressor/colbert_scoring.py` containing the existing
+    `score_maxsim` implementation.
+  - Removed `score_maxsim` from `materialize/colbert_window.py`.
+  - Updated the ColBERT compressors, maintained tests, and analysis utilities
+    to import the function from its new compression-scoring module.
+  - Kept the MaxSim computation and empty-input behavior unchanged.
+- what was verified:
+  - Black checks and Python compilation passed for all affected files.
+  - The focused ColBERT optimization suite passed: 28 tests.
+  - Full unittest discovery passed: 65 tests.
+- evaluation/comparability impact:
+  - No scoring calculation, selection policy, artifact schema, retrieval,
+    prompt, metric, or output behavior changed. Existing results remain
+    directly comparable.
+- open issues:
+  - `materialize/colbert_window.py` still combines encoder, window building,
+    artifact construction, artifact reading, and region-spec responsibilities.
+- next steps:
+  - Extract the runtime artifact reader into `colbert_artifact.py` as the next
+    isolated refactoring step.
+
+## 2026-07-23 - Extract the ColBERT runtime artifact reader
+
+- objective:
+  - Continue the role-based split of `materialize/colbert_window.py` by moving
+    runtime artifact loading and access out of the materialization module.
+- what was changed:
+  - Added `src/colbert_artifact.py` containing the unchanged
+    `ColBERTWindowData` and `ColBERTWindowArtifact` implementations.
+  - Moved the `colbert_window_artifact_v1` and `colbert_window_data_v1` schema
+    constants into the new artifact module.
+  - Updated the runtime compressor, materialization builder/validator, tests,
+    and maintained analysis utility to use the new module.
+  - The materialization module imports `colbert_artifact` as a module and
+    qualifies its references, so the reader classes and schema constants are
+    no longer accidentally exposed under `materialize.colbert_window`.
+  - Left DB traversal, DB/artifact alignment validation, window construction,
+    artifact writing, and region-spec generation in
+    `materialize/colbert_window.py`.
+- what was verified:
+  - Black checks and Python compilation passed for all affected files.
+  - A module-boundary check confirmed that reader classes and schema constants
+    are owned only by `colbert_artifact`.
+  - The focused ColBERT optimization suite passed: 28 tests.
+  - Full unittest discovery passed: 65 tests.
+- evaluation/comparability impact:
+  - No artifact schema value, mmap layout, validation rule, cache behavior,
+    scoring, selection, retrieval, prompt, metric, or output behavior changed.
+    Existing artifacts and results remain directly compatible and comparable.
+- open issues:
+  - `colbert_artifact.py` still depends on `materialize.db_manifest` for shared
+    DB provenance helpers; that dependency was preserved to keep this step
+    minimal.
+  - `materialize/colbert_window.py` still combines encoder, window building,
+    artifact writing, DB validation, and region-spec generation.
+- next steps:
+  - Design the encoder/window-builder boundary before extracting
+    `ColBERTWindowEncoder`, avoiding a circular dependency through
+    `WindowSpec`.
+
+## 2026-07-23 - Separate common ColBERT encoding from window materialization
+
+- objective:
+  - Extract query/document encoding from `materialize/colbert_window.py`
+    without introducing a circular dependency through `WindowSpec`.
+- what was changed:
+  - Added `src/colbert_encoder.py` with:
+    - official ColBERT repository resolution and imports;
+    - checkpoint/config initialization;
+    - document token counting and offset-aware tensorization;
+    - center-span document encoding via `encode_document_spans`;
+    - query encoding via `encode_queries`.
+  - Changed the materialization-only `ColBERTWindowEncoder` into a thin
+    `ColBERTEncoder` subclass that retains only window-budget validation,
+    centered-window construction, and conversion from `WindowSpec` objects to
+    generic `(text, center_span)` encoder inputs.
+  - Updated runtime ColBERT compressors to instantiate `ColBERTEncoder`
+    directly, removing their dependency on `materialize.colbert_window`.
+  - Updated the preprocessing entrypoint and fixed-chunk artifact utility to
+    import `default_colbert_repo_path` from the new encoder module.
+  - Added a boundary test confirming that window text and center character
+    spans are passed unchanged to the common document encoder.
+- what was verified:
+  - The relocated default repository path still resolves to the checked-out
+    `third_party/ColBERT` directory.
+  - The official `Checkpoint` and `ColBERTConfig` modules import successfully
+    through the new module.
+  - Black checks and Python compilation passed for all affected files.
+  - Focused contiguous-window, region-spec, ColBERT optimization, and
+    preprocessing tests passed.
+  - Full unittest discovery passed: 66 tests.
+- evaluation/comparability impact:
+  - Query tensorization, document tensorization, center-token extraction,
+    vector dtypes, window construction, artifact schema, scoring, selection,
+    retrieval, prompts, metrics, and outputs are unchanged. Existing artifacts
+    and results remain directly compatible and comparable.
+  - The only new validation rejects mismatched `texts` and `center_spans`
+    lengths before document encoding; maintained callers always provide equal
+    lengths.
+- open issues:
+  - `ColBERTWindowEncoder` remains as a materialization-specific subclass for
+    the existing offline builder API. Its actual model/tensor encoding is now
+    implemented entirely by `ColBERTEncoder`.
+  - DB validation and region-spec generation still share
+    `materialize/colbert_window.py` with artifact construction.
+- next steps:
+  - Consider renaming the thin materialization subclass to a builder-oriented
+    name only if its remaining `encode_windows` adapter is first replaced by
+    composition.
+
+## 2026-07-23 - Rename the ColBERT materialization entrypoint
+
+- objective:
+  - Name the ColBERT artifact command by its actual materialization role rather
+    than presenting it as a second document-preprocessing path.
+- what was changed:
+  - Renamed `src/entrypoint/preprocess_colbert_window.py` to
+    `src/entrypoint/materialize_colbert.py`.
+  - Renamed `run/preprocess_colbert_window.sh` to
+    `run/materialize_colbert.sh` and updated its Python entrypoint.
+  - Preserved the shell script's executable permission.
+  - Updated the entrypoint test, README command examples, and
+    `docs/codebase_guide.md` to use the new names.
+  - Added a module docstring clarifying that the command materializes and
+    validates ColBERT artifacts from an existing document DB.
+- what was verified:
+  - No maintained references to `preprocess_colbert_window` remain outside
+    historical handoff entries.
+  - Shell syntax, Black formatting, and Python compilation passed.
+  - The focused entrypoint suite passed: 2 tests.
+  - Full unittest discovery passed: 66 tests.
+- evaluation/comparability impact:
+  - No CLI options, artifact construction, DB filtering, validation,
+    preprocessing, scoring, selection, retrieval, prompt, metric, or output
+    behavior changed. Existing artifacts and results remain directly
+    compatible and comparable.
+- open issues:
+  - None.
+- next steps:
+  - Use `preprocess` for DB/cache construction and `materialize` for derived
+    experiment artifacts in future entrypoint and script names.
+
+## 2026-07-23 - Remove the embedding-similarity merger
+
+- objective:
+  - Remove the unused `EmbeddingSimilarityMerger` before restructuring the
+    splitter as an explicit parser-plus-grouper pipeline.
+- what was changed:
+  - Removed `EmbeddingSimilarityMerger` and its embedding model/tokenizer
+    implementation from `materialize/splitter/merger.py`.
+  - Removed the `SIMILARITY_THRESHOLD` environment parser and the `embed_sim`
+    merger factory branch.
+  - Removed the class from the `materialize.splitter` package exports.
+  - Removed the embedding-similarity variant from
+    `test/analyze_hotpot_support_unit_noise.py`.
+  - Updated `docs/semantic_chunking.md` so the list of current merger
+    implementations contains only the pronoun and coreference variants.
+- what was verified:
+  - No maintained `EmbeddingSimilarityMerger`, `embed_sim`, or
+    `SIMILARITY_THRESHOLD` references remain outside historical handoff
+    entries.
+  - A direct factory check confirmed that `build_merger("embed_sim", ...)`
+    raises the unsupported-merger error.
+  - Black checks and Python compilation passed for the affected files.
+  - Full unittest discovery passed: 66 tests.
+- evaluation/comparability impact:
+  - No active dataset, retrieval, prompt, compression, metric, or output logic
+    changed.
+  - Historical outputs produced with `MERGER=embed_sim` remain interpretable,
+    but that experimental preprocessing configuration can no longer be
+    reproduced from the maintained code without restoring its implementation.
+  - Other merger implementations and their output behavior are unchanged.
+- open issues:
+  - Sentence parsing remains embedded in `DocumentSplitter`; parser/grouper
+    composition has not yet been implemented.
+- next steps:
+  - Extract a span-preserving parsed-unit type and sentence parser before
+    generalizing the splitter orchestration.
+
+## 2026-07-23 - Freeze splitter output contracts before parser extraction
+
+- objective:
+  - Establish deterministic characterization tests before restructuring
+    splitters into parser-plus-grouper composition.
+- what was changed:
+  - Added canonical payload serialization helpers to
+    `test/test_retrievable_overlap_mapping.py`.
+  - Added a sentence-splitter characterization case that fixes:
+    - cacheable IDs, text, parent IDs, token spans, sentence metadata, and
+      prompt-token metadata;
+    - retrievable chunk IDs, decoded text, token counts, window metadata, and
+      overlapping cacheable attachment;
+    - total document tokens and maximum cacheable token length.
+  - Added an equivalent semantic-splitter characterization case using the
+    deterministic existing dummy merger, including merged IDs, sentence
+    membership, spans, and overlap attachment.
+  - Kept the existing long-sentence, repeated-text span, and overlap tests as
+    additional parity constraints.
+- what was verified:
+  - The focused splitter suite passed: 7 tests.
+  - Black formatting and Python compilation passed.
+  - Full unittest discovery passed: 68 tests.
+- evaluation/comparability impact:
+  - Test code only; no preprocessing, artifact, retrieval, compression,
+    prompt, metric, or output behavior changed.
+- open issues:
+  - These deterministic fixtures lock the maintained structural contract but
+    do not by themselves prove parity for every source document.
+  - A full-dataset old/new `SplitDocumentResult` payload comparison remains
+    required before claiming corpus-wide parity after the refactor.
+- next steps:
+  - Extract `ParsedUnit` and the existing sentence parsing/span-alignment logic
+    into a sentence parser without changing the splitter output payloads.
+
+## 2026-07-23 - Extract ParsedUnit and SentenceParser
+
+- objective:
+  - Begin parser-plus-grouper splitter composition by extracting the existing
+    sentence parsing behavior without changing materialized outputs.
+- what was changed:
+  - Added `materialize/splitter/types.py` with the general `ParsedUnit` type,
+    preserving text, character spans, and token spans formerly stored in
+    `SentenceView`.
+  - Added the `materialize/splitter/parser` package with:
+    - the `UnitParser` interface;
+    - `SentenceParser`, containing the existing BlingFire segmentation,
+      conservative boundary repair, source-span matching/fallback, tokenizer
+      offset mapping, and long-unit splitting logic.
+  - Removed sentence-specific parsing methods and `SentenceView` from
+    `DocumentSplitter`.
+  - Added optional parser injection to `DocumentSplitter`,
+    `SentenceWiseSplitter`, and `SemanticSplitter`.
+  - Kept the existing behavioral distinction:
+    - `SentenceWiseSplitter` calls `SentenceParser.split_long_units()` with
+      `max_subchunk_tokens`;
+    - `SemanticSplitter` sends unsplit `SentenceParser.parse()` output to its
+      merger.
+  - Updated ColBERT window materialization to use `SentenceParser` directly,
+    removing its tokenizer-only `DocumentSplitter` subclass.
+  - Updated maintained tests and analysis/validation utilities to use
+    `ParsedUnit` and the parser API.
+  - Documented the parser ownership and long-unit behavior in
+    `docs/codebase_guide.md`.
+- what was verified:
+  - The sentence/semantic characterization payloads remain exactly unchanged.
+  - A new regression test confirms that semantic splitting does not call the
+    long-unit splitting path.
+  - Focused splitter tests passed: 8 tests.
+  - Focused ColBERT contiguous-window and region-spec tests passed: 16 tests.
+  - Black checks and Python compilation passed for all affected files.
+  - Full unittest discovery passed: 69 tests.
+- evaluation/comparability impact:
+  - No cacheable IDs, text, spans, sentence metadata, prompt-token metadata,
+    retrievable overlap mapping, artifact schema, retrieval, compression,
+    prompts, metrics, or outputs changed. Existing results remain directly
+    compatible and comparable.
+- open issues:
+  - Merger classes and the `merge(sentence_texts)` API have not yet been
+    converted to parsed-unit groupers.
+  - Full-dataset old/new payload parity remains to be run before claiming
+    corpus-wide equivalence.
+- next steps:
+  - Rename and reorganize mergers as groupers while preserving their group
+    indices, names used in cacheable IDs, and DP behavior.
+
+## 2026-07-23 - Replace mergers with ParsedUnit groupers
+
+- objective:
+  - Establish the second half of the parser-plus-grouper pipeline while
+    preserving semantic chunk grouping and artifact identifiers.
+- what was changed:
+  - Replaced `materialize/splitter/merger.py` with the
+    `materialize/splitter/grouper` package:
+    - `UnitGrouper` defines `group(list[ParsedUnit])`;
+    - `DPGrouper` contains the unchanged DP table, candidate filtering,
+      tie-breaking hooks, and backpointer reconstruction;
+    - `PronounDPGrouper` contains the existing pronoun scoring policy;
+    - `CorefPronounDPGrouper` contains the existing fastcoref policy;
+    - `build_grouper` maps the existing configuration values to groupers.
+  - Changed `SemanticSplitter` from `merger.merge(sentence_texts)` to
+    `grouper.group(parsed_units)`.
+  - Preserved stripping of unit text before token-length calculation and
+    scoring, matching the old semantic splitter input.
+  - Preserved grouper names `pronoun_dp_128` and
+    `coref_pronoun_dp_128`, which remain part of cacheable IDs.
+  - Kept the external `MERGER`/`merger` preprocessing option for experiment
+    compatibility; internally it is stored as `grouper_name` and passed to
+    `build_grouper`.
+  - Updated package exports, analysis utilities, splitter tests, and semantic
+    chunking/codebase documentation to use grouper terminology.
+- what was verified:
+  - Added pre-refactor characterization cases for `PronounDPGrouper` at token
+    budgets 3, 5, and 8; all group-index outputs match the recorded
+    `PronounDPMerger` outputs.
+  - Added a factory test confirming that legacy config `pronoun_dp` constructs
+    `PronounDPGrouper` with stable name `pronoun_dp_128`.
+  - Existing sentence and semantic canonical payload tests passed unchanged.
+  - Black checks and Python compilation passed for all affected files.
+  - Full unittest discovery passed: 71 tests.
+- evaluation/comparability impact:
+  - No successful-path group indices, cacheable IDs, text, spans, sentence
+    metadata, retrievable overlap mapping, preprocessing CLI values, artifact
+    schema, retrieval, compression, prompts, metrics, or outputs changed.
+    Existing results remain directly compatible and comparable.
+  - The internal invalid-DP error label changed from `merger` to `grouper`;
+    this does not affect successful experiment outputs.
+- open issues:
+  - `SentenceWiseSplitter` still bypasses a grouper instead of using an
+    identity grouper, so the splitter orchestration is not yet fully uniform.
+  - The external option remains named `MERGER`; renaming it to `GROUPER` must
+    be a separate explicit experiment-interface change.
+  - Full-dataset old/new payload parity remains to be run before claiming
+    corpus-wide equivalence.
+- next steps:
+  - Add `IdentityGrouper` and consolidate sentence/semantic paths into a
+    parser-plus-grouper composed splitter while retaining current factory
+    configuration and output IDs.
+
+## 2026-07-23 - Compose sentence and semantic splitting through one pipeline
+
+- objective:
+  - Complete the parser-plus-grouper splitter composition without changing
+    preprocessing configuration or materialized artifact semantics.
+- what was changed:
+  - Added `IdentityGrouper`, which returns one singleton index group per parsed
+    unit and requires no tokenizer or token budget.
+  - Split `UnitGrouper` from `TokenBudgetGrouper`; only DP-based groupers now
+    own tokenizer/token-budget length accounting.
+  - Added `ParsedUnitSplitter` as the common parse -> optional long-unit split
+    -> group -> cacheable-materialization pipeline.
+  - Converted `SentenceWiseSplitter` into a thin compatibility wrapper using
+    `SentenceParser` plus `IdentityGrouper`.
+  - Converted `SemanticSplitter` into a thin compatibility wrapper using
+    `SentenceParser` plus its configured grouper.
+  - Preserved the existing path-specific policies:
+    - sentence splitting applies `max_subchunk_tokens` before grouping and uses
+      `filename::sent_{idx}` chunk IDs;
+    - semantic splitting does not apply long-unit splitting and uses
+      `filename::{grouper.name}::subchunk_{idx}` chunk IDs.
+  - Updated splitter package exports and architecture documentation.
+- what was verified:
+  - Added tests for identity grouping and for both compatibility wrappers
+    sharing `ParsedUnitSplitter`.
+  - Existing sentence and semantic canonical payload tests passed unchanged,
+    including cacheable fields and retrievable overlap mappings.
+  - Existing DP-grouper characterization tests passed unchanged.
+  - Black formatting checks, Python compilation, and `git diff --check`
+    passed for the affected code.
+  - Full unittest discovery passed: 73 tests.
+- evaluation/comparability impact:
+  - No dataset handling, parser behavior, group indices, chunk text, token
+    spans, cacheable IDs, sentence metadata, retrievable overlap mapping,
+    preprocessing CLI values, artifact schema, retrieval, compression, prompts,
+    metrics, or output formats changed. Existing results remain directly
+    compatible and comparable.
+- open issues:
+  - The external semantic preprocessing option remains named `MERGER` for
+    experiment compatibility even though the implementation now uses groupers.
+  - Full-dataset old/new artifact payload parity remains to be run before
+    claiming corpus-wide equivalence.
+- next steps:
+  - Decide separately whether to expose parser/grouper composition directly in
+    preprocessing configuration; doing so would be an experiment-interface
+    change and should retain legacy configuration compatibility.
+
+## 2026-07-23 - Build the DAPR ConditionalQA local RAG dataset
+
+- objective:
+  - Convert the official DAPR ConditionalQA corpus and its exactly joined
+    original answer annotations into the local LongBench-style dataset layout,
+    without performing retrieval chunking.
+- what was changed:
+  - Added `test/prepare_conditionalqa_dataset.py`.
+  - Added `test/test_prepare_conditionalqa_dataset.py`.
+  - Generated `/mnt/nvme1/datasets/conditionalqa` with:
+    - `questions/query.jsonl`;
+    - `answers/answer.jsonl`;
+    - `documents/doc_{dapr_doc_id}.txt`;
+    - `dataset_info/evidence_labels.jsonl`;
+    - `dataset_info/manifest.json`.
+  - Each source document is serialized as its title once, followed by its
+    ordered DAPR passages separated by blank lines.
+  - Answer records preserve all official answer texts and intentionally omit
+    answer-condition annotations.
+  - Evidence labels use only DAPR test qrels and store the source query ID,
+    gold DAPR document ID/title, evidence passage IDs/texts, and exact half-open
+    character spans in the reconstructed document.
+- what was verified:
+  - Official input/output counts are 652 documents, 271 queries, and 1,165
+    qrels.
+  - All query, answer, and evidence records have aligned local IDs `0..270`.
+  - All 1,165 saved evidence spans reproduce their evidence text exactly from
+    the saved document.
+  - All saved gold titles match the first line of the corresponding document.
+  - The 58 multi-answer queries retain all answer strings; the maximum is five
+    answers.
+  - No condition field is present in the answer or evidence-label schemas.
+  - The converter's three focused tests pass, and full unittest discovery
+    passes 76 tests.
+  - Black, Python compilation, and `git diff --check` pass for the new files.
+- evaluation/comparability impact:
+  - No retrieval, chunking, prompt, generation, metric, or scoring logic
+    changed. `docs/eval_protocol.md` therefore did not require an update.
+  - ConditionalQA answer-only official EM/F1 remains to be implemented before
+    reporting QA results; the current HotpotQA/2Wiki evaluator must not be used
+    as a substitute.
+- open issues:
+  - DB preprocessing and ColBERT artifact construction have not been run for
+    the new dataset.
+  - The inference output convention for multiple answers and the official
+    answer-only ConditionalQA evaluator are not yet implemented.
+- next steps:
+  - Run the normal sentence preprocessing over
+    `/mnt/nvme1/datasets/conditionalqa/documents` when the desired DB
+    configuration is fixed.
+  - Add the official ConditionalQA answer-only evaluator with parity tests
+    against the released `evaluate.py` before the first QA experiment.
+
+## 2026-07-23 - Document the splitter composition inline
+
+- objective:
+  - Make the parser -> grouper splitter architecture visible at its common
+    implementation point.
+- what was changed:
+  - Added an inline comment above `ParsedUnitSplitter` describing parser unit
+    extraction, grouper index grouping, and cacheable materialization.
+- what was verified:
+  - Black check, Python compilation, and `git diff --check` passed.
+- open issues:
+  - None introduced by this documentation-only change.
+- next steps:
+  - Continue the splitter refactor in separately verified steps.
+
+## 2026-07-23 - Rename the abstract DP grouper base
+
+- objective:
+  - Make it clear that the shared DP grouper class is an implementation base,
+    not a directly usable grouping policy.
+- what was changed:
+  - Renamed `DPGrouper` to `BaseDPGrouper`.
+  - Updated `PronounDPGrouper` and `CorefPronounDPGrouper` inheritance and
+    splitter package exports.
+  - Kept `grouper/dp.py`, concrete grouper names, factory configuration values,
+    and grouping behavior unchanged.
+- what was verified:
+  - No `DPGrouper` code references remain under `src/` or `test/`.
+  - Grouper characterization tests passed: 4 tests.
+  - Full unittest discovery passed: 73 tests.
+  - Black, Python compilation, and `git diff --check` passed.
+- evaluation/comparability impact:
+  - This is an internal Python class rename only. Materialized IDs, grouping,
+    preprocessing options, artifacts, and evaluation outputs are unchanged and
+    remain directly comparable.
+- open issues:
+  - None introduced by this rename.
+- next steps:
+  - Continue reviewing splitter names and responsibilities one change at a
+    time.
+
+## 2026-07-23 - Separate ColBERT DB-manifest references
+
+- objective:
+  - Keep general DB manifest persistence separate from ColBERT artifact
+    reference and validation behavior.
+- what was changed:
+  - Removed `build_db_manifest_reference()` and
+    `read_referenced_db_manifest()` from `materialize/db_manifest.py`.
+  - Added both ColBERT-specific reference functions to
+    `colbert_artifact.py`.
+  - Updated ColBERT materialization and tests to import or call the functions
+    through `colbert_artifact`.
+  - Moved the manifest-reference round-trip test out of the general DB manifest
+    test module into `test_colbert_manifest_reference.py`.
+  - Documented the responsibility boundary in `docs/codebase_guide.md`.
+- what was verified:
+  - Focused pytest passed: 33 tests, plus 36 subtests.
+  - Full unittest discovery passed: 76 tests.
+  - Black, Python compilation, and `git diff --check` passed.
+  - A full pytest collection attempt in the `vllm` environment could not
+    collect two unrelated preprocessing modules because that environment does
+    not contain `deepspeed`; the base environment's full unittest suite passed.
+- evaluation/comparability impact:
+  - Function bodies and validation rules were moved unchanged. DB manifest
+    contents, ColBERT artifact references, SHA-256 checks, artifact formats,
+    preprocessing, and evaluation outputs are unchanged and remain directly
+    comparable.
+- open issues:
+  - The available environments do not currently provide both pytest and
+    deepspeed in one interpreter for a single full-suite pytest invocation.
+- next steps:
+  - Continue separating general materialization code from method-specific
+    artifact concerns where the ownership boundary is equally clear.
+
+## 2026-07-23 - Document ColBERT artifact responsibilities
+
+- objective:
+  - Make the ownership and storage layout in `colbert_artifact.py` easier to
+    understand without changing runtime behavior.
+- what was changed:
+  - Added module and API docstrings covering the DB-manifest responsibility
+    boundary, reference construction, hash validation, and artifact readers.
+  - Added focused comments for the flattened memory-mapped embedding layout and
+    retrievable-vector cache.
+- what was verified:
+  - Focused ColBERT pytest passed: 29 tests, plus 36 subtests.
+  - Black, Python compilation, and `git diff --check` passed.
+- evaluation/comparability impact:
+  - Documentation-only change; artifacts and evaluation behavior are unchanged.
+- open issues:
+  - None introduced by this change.
+- next steps:
+  - Continue the structural review one file at a time.
+
+## 2026-07-23 - Group dense and ColBERT encoders
+
+- objective:
+  - Place the dense and ColBERT model adapters at the same architectural level
+    while retaining the Chroma-specific adapter in `vectordb.py`.
+- what was changed:
+  - Moved `materialize/embedding_utils.py` to `encoder/dense.py`.
+  - Moved `colbert_encoder.py` to `encoder/colbert.py`.
+  - Added a side-effect-free `encoder` package.
+  - Updated materializers, compressors, preprocessing entrypoints, Chroma
+    integration, and analysis/build utilities to use the new import paths.
+  - Kept `DenseEmbeddingFunction` in `vectordb.py`; it continues to adapt the
+    shared dense encoder to Chroma without duplicating model forward or pooling.
+  - Documented encoder ownership in `docs/codebase_guide.md`.
+- what was verified:
+  - No source or test imports remain for `colbert_encoder` or
+    `materialize.embedding_utils`, and both old files are absent.
+  - Full unittest discovery passed: 80 tests.
+  - Focused dense/ColBERT pytest passed: 47 tests, plus 683621 subtests.
+  - Black, Python compilation, and `git diff --check` passed.
+- evaluation/comparability impact:
+  - This change only moves modules and updates imports. Model loading,
+    tensorization, pooling, normalization, query prefixes, embeddings,
+    artifacts, retrieval, compression, and evaluation outputs are unchanged and
+    remain directly comparable.
+- open issues:
+  - `DenseTextEmbedder` retains its existing name while the module is now
+    `encoder/dense.py`; any class rename should be handled as a separate API
+    change.
+- next steps:
+  - Review whether the dense and ColBERT encoder class names and public methods
+    should be made more symmetric without forcing a shared abstract base.
+
+## 2026-07-23 - Rename the candidate-embedding materialization entrypoint
+
+- objective:
+  - Name the Python entrypoint after the candidate embeddings it materializes
+    while preserving the existing ColBERT artifact workflow.
+- what was changed:
+  - Renamed `entrypoint/materialize_colbert.py` to
+    `entrypoint/materialize_candidate_embeddings.py`.
+  - Updated `run/materialize_colbert.sh` to invoke the new Python path.
+  - Updated the entrypoint unit test import and mocks.
+  - Documented the Python entrypoint behind the existing shell command.
+  - Kept the shell command name, ColBERT environment variables, CLI arguments,
+    artifact directories, and artifact formats unchanged.
+- what was verified:
+  - The old Python entrypoint path has no remaining active source, test, run, or
+    documentation references.
+  - Focused entrypoint tests passed: 2 tests.
+  - Full unittest discovery passed: 82 tests.
+  - Black, Python compilation, shell syntax validation, and
+    `git diff --check` passed.
+- evaluation/comparability impact:
+  - This is a Python entrypoint rename only. Materialization behavior,
+    embeddings, artifacts, retrieval, compression, and evaluation outputs are
+    unchanged and remain directly comparable.
+- open issues:
+  - `run/materialize_colbert.sh` intentionally retains its existing public name
+    for now; renaming that command can be considered separately.
+- next steps:
+  - Decide separately whether the shell entrypoint should also adopt the
+    candidate-embedding terminology.
+
+## 2026-07-23 - Align materialization entrypoints with Candidate Store terminology
+
+- objective:
+  - Match the offline materialization command to the paper's
+    `materialized candidate store` concept.
+- what was changed:
+  - Renamed the Python entrypoint to
+    `entrypoint/materialize_candidate_store.py`.
+  - Renamed the shell entrypoint to `run/materialize_candidate_store.sh` and
+    updated its Python target.
+  - Updated entrypoint tests, README instructions, and the codebase guide.
+  - Described the current ColBERT window artifact as the implementation backing
+    the materialized candidate store.
+  - Reviewed `comparison_compressor.py` but did not rename it to
+    `summarize_compressor.py`, because it contains both `Summarizer` and the
+    non-summarization `FrontCompressor` baseline.
+- what was verified:
+  - No active references remain to the prior candidate-embedding Python
+    entrypoint or `run/materialize_colbert.sh`.
+  - Focused entrypoint tests passed: 2 tests.
+  - Full unittest discovery passed: 83 tests.
+  - Black, Python compilation, shell syntax validation, and
+    `git diff --check` passed.
+- evaluation/comparability impact:
+  - Only entrypoint paths and documentation changed. CLI arguments,
+    environment variables, materialization behavior, artifact paths and
+    formats, retrieval, compression, and evaluation outputs are unchanged and
+    remain directly comparable.
+- open issues:
+  - `comparison_compressor.py` remains broadly named. `baseline_compressor.py`
+    would describe both contained classes; alternatively, the classes could be
+    split into front-selection and summarization modules in a separate change.
+- next steps:
+  - Choose between renaming the mixed module to `baseline_compressor.py` or
+    splitting its two baseline implementations by responsibility.
+
+## 2026-07-23 - Remove the unused front baseline and rename the summary module
+
+- objective:
+  - Remove the unused front-sentence baseline and give the remaining OpenAI
+    summarization compressor a specific module name.
+- what was changed:
+  - Removed `FrontCompressor`.
+  - Removed the `front` key from `COMPRESSOR_TYPES`.
+  - Renamed `compressor/comparison_compressor.py` to
+    `compressor/summ_compressor.py`.
+  - Updated the compressor factory to import `Summarizer` from the new module.
+  - Added a factory regression assertion that `summ` remains registered and
+    `front` is absent.
+  - Updated `docs/eval_protocol.md` to record removal of the accepted
+    `COMPRESS_METHOD=front` evaluation option.
+- what was verified:
+  - No active source, test, run, README, or current protocol references remain
+    to `comparison_compressor.py` or `FrontCompressor`.
+  - Focused factory/ColBERT tests passed: 28 tests.
+  - Full unittest discovery passed: 83 tests.
+  - Black, Python compilation, and `git diff --check` passed.
+- evaluation/comparability impact:
+  - `COMPRESS_METHOD=front` is no longer accepted, so that historical baseline
+    cannot be rerun through the current factory without restoring it.
+  - Existing front-baseline results remain historical results; no existing
+    result is reinterpreted.
+  - `COMPRESS_METHOD=summ` and all other compressor behavior are unchanged, so
+    their old and new results remain directly comparable.
+- open issues:
+  - The retained class is still named the generic `Summarizer`; a class rename
+    can be considered separately if a more explicit API name is desired.
+- next steps:
+  - Continue reviewing compressor module and class names independently from
+    evaluation behavior.
+
+## 2026-07-23 - Move the fixed-chunk ColBERT artifact reader
+
+- objective:
+  - Separate fixed-chunk artifact access from reranking compressor behavior.
+- what was changed:
+  - Moved `FixedChunkColBERTRerankArtifact` out of
+    `compressor/colbert_window_compressor.py` and into
+    `colbert_artifact.py`.
+  - Renamed it to `FixedChunkColBERTArtifact` because the reader itself performs
+    no reranking or compression.
+  - Updated `FixedChunkColBERTRerankCompressor` and two reranking analysis
+    scripts to import and use the renamed artifact reader.
+  - Removed the now-unused JSON and NumPy imports from the compressor module.
+  - Documented that `colbert_artifact.py` owns both candidate-store and
+    fixed-retrieval-chunk artifact readers.
+- what was verified:
+  - Added a focused unit test covering fixed-chunk index loading, memmap vector
+    lookup, and the missing-ID empty-vector result.
+  - Focused pytest passed: 31 tests, plus 36 subtests.
+  - Full unittest discovery passed: 84 tests.
+  - Black, Python compilation, and `git diff --check` passed.
+- evaluation/comparability impact:
+  - The reader implementation and fixed artifact format were moved unchanged.
+    Reranking scores, factory keys, artifact paths, outputs, and evaluation
+    behavior are unchanged and remain directly comparable.
+- open issues:
+  - The three ColBERT reranking compressors still share
+    `colbert_window_compressor.py` with subchunk and region selection.
+- next steps:
+  - Introduce the compressor implementation subdirectory before splitting the
+    remaining ColBERT method classes by responsibility.
+
+## 2026-07-23 - Separate compressor framework from concrete methods
+
+- objective:
+  - Make the `compressor` package distinguish shared framework code from
+    concrete compression implementations.
+- what was changed:
+  - Added the side-effect-free `compressor/methods` package.
+  - Moved concrete implementations without changing their contents:
+    - `dense_compressor.py` -> `methods/dense.py`;
+    - `colbert_window_compressor.py` -> `methods/colbert.py`;
+    - `colbert_scoring.py` -> `methods/colbert_scoring.py`;
+    - `summ_compressor.py` -> `methods/summarization.py`;
+    - `ml_compressor.py` -> `methods/sentence_selection.py`.
+  - Kept `base.py`, `factory.py`, `token_budget.py`, and `output.py` at the
+    package root as shared framework/policy modules.
+  - Updated the factory, internal method imports, analysis utilities, tests,
+    and string-based mock targets to the new module paths.
+  - Documented the package boundary in `docs/codebase_guide.md`.
+- what was verified:
+  - No active source, test, run, README, codebase-guide, or eval-protocol
+    references remain to the five old module paths, and the old files are
+    absent.
+  - Focused dense, region-spec, and ColBERT optimization tests passed: 45
+    tests.
+  - Full unittest discovery passed: 84 tests.
+  - Black, Python compilation, and `git diff --check` passed.
+- evaluation/comparability impact:
+  - This is an import-path-only reorganization. Compressor classes, factory
+    keys, environment variables, scoring, selection, budgets, prompts, and
+    outputs are unchanged, so existing results remain directly comparable.
+- open issues:
+  - External scripts outside this repository that imported the old Python
+    module paths must switch to `compressor.methods.*`.
+  - `methods/colbert.py` still contains subchunk, region, and reranking
+    compressors together; splitting those responsibilities should be a
+    separate refactor.
+- next steps:
+  - Decide whether `methods/colbert.py` should remain one cohesive ColBERT
+    implementation module or be split into subchunk, region, and reranking
+    modules with explicit shared helpers.
+
+## 2026-07-23 - Rename the dense embedding materializer module
+
+- objective:
+  - Make it explicit that the compare-embedding writer materializes dense
+    vectors rather than ColBERT candidate representations.
+- what was changed:
+  - Renamed `materialize/subchunk_embeds.py` to
+    `materialize/dense_embeddings.py`.
+  - Updated `materialize/materialize.py` to import `CompareEmbeddingWriter`
+    from the new path.
+  - Documented the dense artifact writer in `docs/codebase_guide.md`.
+  - Kept the writer class name, dense model behavior, artifact filename, and
+    artifact payload format unchanged.
+- what was verified:
+  - No active source, test, run, codebase-guide, or eval-protocol references
+    remain to the old module path, and the old file is absent.
+  - Full unittest discovery passed: 84 tests.
+  - Black, Python compilation, and `git diff --check` passed.
+- evaluation/comparability impact:
+  - Import-path-only change. Dense embeddings, artifact contents, compressor
+    behavior, and evaluation outputs are unchanged and remain directly
+    comparable.
+- open issues:
+  - `CompareEmbeddingWriter` and `compare_embed.pt` retain legacy
+    comparison-oriented names inside the now dense-specific module.
+- next steps:
+  - Decide separately whether to rename the dense writer and artifact
+    terminology while preserving artifact compatibility.
+
+## 2026-07-23 - Rename dense and ColBERT materializer modules
+
+- objective:
+  - Give the dense and ColBERT materialization implementations symmetric,
+    encoder-specific module names.
+- what was changed:
+  - Renamed `materialize/dense_embeddings.py` to
+    `materialize/dense_materializer.py`.
+  - Renamed `materialize/colbert_window.py` to
+    `materialize/colbert_materializer.py`.
+  - Updated the general preprocessor, candidate-store entrypoint, validation
+    utility, artifact builder, analysis scripts, tests, and module-alias mock
+    target to the new paths.
+  - Updated `docs/codebase_guide.md` with both materializer responsibilities.
+  - Kept all function and class names, window construction, encoders, artifact
+    paths, formats, and CLI behavior unchanged.
+- what was verified:
+  - No active source, test, run, README, codebase-guide, or eval-protocol
+    references remain to the old module paths, and both old files are absent.
+  - Focused contiguous-window, region-spec, DB-document-filter, and entrypoint
+    tests passed after correcting one stale test module alias found by the
+    first focused run.
+  - Full unittest discovery passed: 85 tests.
+  - Black, Python compilation, and `git diff --check` passed.
+- evaluation/comparability impact:
+  - Import-path-only change. Dense and ColBERT materialization, candidate-store
+    contents, region metadata, retrieval, compression, and evaluation outputs
+    are unchanged and remain directly comparable.
+- open issues:
+  - Internal symbols such as `CompareEmbeddingWriter`,
+    `ColBERTWindowEncoder`, and `build_colbert_window_artifact` retain existing
+    historical names; changing them should be considered independently.
+- next steps:
+  - Continue naming cleanup at the symbol level only where it improves the
+    public responsibility without changing artifact compatibility.
+
+## 2026-07-23 - Re-audit engine and model dead code
+
+- objective:
+  - Identify removable or redundant code in the two large runtime modules
+    without changing evaluation behavior.
+- what was changed:
+  - No source or evaluation code was changed; this was a read-only static
+    call-site audit.
+- what was verified:
+  - `model.py` has five strict dead helpers with no active project call site:
+    `_stack_request_caches`, `_build_front_bos_batch_cache`,
+    `_trim_prefilled_cache_rows`, `_pad_request_caches`, and
+    `_decode_with_grouped_caches`.
+  - The active cache-on path uses `_get_front_bos_cache`,
+    `_select_cache_rows`, and `_decode_with_prefilled_cache`; these must remain.
+  - `shift_rotary_cache` is used only by the dead front-BOS batch helper.
+  - `model.py` has unused imports for `LlamaForCausalLM`, transformer
+    `logging`, DeepSpeed GDS/AIO builders, `defaultdict`, and `Dict`.
+  - `model.py` stores unused runtime state in `self.disable_rope`,
+    `self.num_layers`, `self.dim`, and `self.num_kv_heads`; removing the
+    constructor argument is a separate API decision because callers still pass
+    `disable_rope`.
+  - `engine.py` has unused imports for `torch`, DeepSpeed GDS/AIO builders,
+    `file_read`, and `restore_tensor_shape`, plus commented GDS/AIO prototype
+    lines.
+  - `engine.py` otherwise has no clearly dead methods: prompt construction,
+    cache loading, statistics, output serialization, and `process_query` are
+    all reachable from the main evaluation entrypoint.
+  - `process_query` duplicates batch-result accumulation and JSONL writing for
+    full and final partial batches; this is a refactor target, not dead logic.
+  - Pyflakes and vulture remain unavailable in the active Python environment,
+    so findings were verified through repo-wide symbol searches and direct
+    control-flow inspection.
+- evaluation/comparability impact:
+  - None; no code was modified.
+- open issues:
+  - Deleting the strict dead model block should be accompanied by focused cache
+    decode tests because cache-on evaluation is sensitive even though static
+    call-site evidence is conclusive.
+  - Consolidating `engine.py` batch accounting could accidentally alter timing
+    or output metrics and should be a separate characterization-backed change.
+- next steps:
+  - Safest cleanup: remove unused imports/commented prototypes first, then
+    delete the unreachable model helper block while retaining the three live
+    cache helpers.
+
+## 2026-07-23 - Audit ColBERT query lengths for the four evaluation datasets
+
+- objective:
+  - Determine whether the official ColBERTv2 `query_maxlen=32` setting
+    truncates LongBench HotpotQA, 2Wiki, MuSiQue, or DAPR ConditionalQA
+    queries.
+- what was changed:
+  - No production or evaluation code was changed for this audit.
+- what was verified:
+  - Measured raw WordPiece lengths with the tokenizer bundled with
+    `colbert-ir/colbertv2.0`.
+  - Applied the official content-capacity rule
+    `raw_query_tokens > query_maxlen - 3`.
+  - At `query_maxlen=32`, truncation counts are:
+    - HotpotQA: `11/200` (`5.5%`)
+    - 2Wiki: `1/200` (`0.5%`)
+    - MuSiQue: `11/200` (`5.5%`)
+    - ConditionalQA: `271/271` (`100%`)
+  - ConditionalQA raw WordPiece length is mean `58.75`, median `55`, p90
+    `85`, p95 `97.5`, and maximum `147`.
+  - At `query_maxlen=128` (125 content tokens), only `2/271` ConditionalQA
+    queries remain truncated.
+- evaluation/comparability impact:
+  - Current production runtime still uses the artifact's official
+    `query_maxlen=32`; no results or settings were changed.
+  - A longer query setting would be a separate query-encoding ablation because
+    the checkpoint was fine-tuned with `query_maxlen=32`.
+- open issues:
+  - ConditionalQA is structurally mismatched with the current q32 runtime:
+    every query is truncated, often before the final explicit question.
+- next steps:
+  - Before interpreting ConditionalQA compression results, compare explicit
+    q32/q64/q128 query-side settings while reusing the same document artifact.
+
+## 2026-07-23 - Audit final-question extraction for ConditionalQA
+
+- objective:
+  - Check whether using only the final question sentence is a safe way to fit
+    ConditionalQA into ColBERTv2's q32 query encoder after full-query dense
+    retrieval.
+- what was changed:
+  - No production or evaluation code was changed.
+- what was verified:
+  - Deterministic BlingFire final-sentence extraction gives mean `15.59`,
+    median `14`, p90 `25`, p95 `35.5`, and maximum `55` raw ColBERT
+    WordPieces.
+  - `20/271` extracted final sentences still exceed the q32 content capacity
+    of 29 WordPieces; `5/271` exceed the q48 capacity of 45.
+  - Several final sentences are unusably anaphoric without preceding context,
+    including two exact `"Can I?"` cases and examples such as
+    `"Is this allowed?"` and `"Who should I contact?"`.
+- evaluation/comparability impact:
+  - Final-question extraction would change only the compression query, not the
+    full-query dense retrieval, but it is still a distinct query-rewriting
+    policy and must be reported as such.
+- open issues:
+  - Full-query head truncation loses the explicit question, while final-sentence
+    extraction can lose necessary scenario entities and conditions.
+- next steps:
+  - Prefer evaluating fixed q32 tail truncation as the simplest
+    tokenizer-length-preserving policy, alongside current head-q32 and any
+    longer-query ablation.
+
+## 2026-07-23 - Paired ConditionalQA ColBERT query-length ablation
+
+- objective:
+  - Compare q32 head/tail truncation with q100/q128 full-query encoding without
+    allowing approximate Chroma retrieval variation to affect the comparison.
+- what was changed:
+  - Added query max-length and truncation-side controls to the ColBERT query
+    encoder and runtime compressor while preserving q32/right as the default.
+  - Added a fixed-retrieval ablation runner that retrieves the 271
+    ConditionalQA top-20 candidate sets once and reuses the exact same
+    in-memory candidates for every query policy.
+  - Recorded the actual query encoder settings and fixed-candidate SHA-256 in
+    each output.
+  - Documented source-span evidence coverage and query-side ablation
+    comparability in `docs/eval_protocol.md`.
+- what was verified:
+  - Every policy used fixed retrieval fingerprint
+    `50df2d82ab7f4c706afe8c652b03a5ab1e02bb290ce11bae7a601a8371718792`.
+  - Conditions were `TOP_K=20`, `RETAIN_TOKEN_RATIO=0.5`, splitlong180, and
+    271 ConditionalQA queries.
+  - Retrieval evidence character recall was `0.871822`.
+  - Compressed evidence character recall was:
+    - q32 head: `0.766146`
+    - q32 tail: `0.848482`
+    - q100 full query: `0.860054`
+    - q128 full query: `0.860947`
+  - q32 tail versus q32 head improved mean recall by `8.234` percentage
+    points, with 44 wins, 12 losses, and 215 ties. A paired query bootstrap
+    with seed 0 gave a 95% interval of `[4.791, 11.848]` percentage points.
+  - q100 versus q32 tail improved by `1.157` points, with 13 wins, 5 losses,
+    and 253 ties; its paired bootstrap interval `[-0.623, 3.058]` includes
+    zero.
+  - q128 versus q100 improved by only `0.089` points and changed only three
+    queries: 2 wins, 1 loss, and 268 ties. Its interval
+    `[-0.395, 0.642]` includes zero.
+  - Focused ColBERT optimization tests passed before the paired run.
+- evaluation/comparability impact:
+  - q100 and q128 encode the original full query and apply ordinary
+    right-side truncation only beyond their capacity. q32 tail uses left-side
+    truncation and is a distinct query-rewriting policy.
+  - The four compression results are paired on identical retrieval candidates,
+    but differ intentionally in ColBERT query encoding. They are query-policy
+    ablations, not identical configurations.
+  - Earlier source-span compression outputs that reported zero recall due to
+    a selected-region parent-document provenance bug are invalid. The fix
+    changes evaluation provenance metadata, not the selected prompt text.
+- open issues:
+  - q100/q128 are outside the checkpoint's original q32 query-length regime.
+  - The q100/q128 advantage over q32 tail is small, sparse across queries, and
+    not statistically resolved in this 271-query sample.
+- next steps:
+  - Use q32 tail as the conservative ColBERTv2-compatible ConditionalQA policy
+    unless an explicitly labeled long-query ablation is desired.
+  - Do not claim q128 is better than q100 from this result; treat them as tied.
+
+## 2026-07-23 - Analyze q32-tail versus q128-full changed queries
+
+- objective:
+  - Determine whether q128-full differs from q32-tail primarily on unusually
+    long ConditionalQA queries and clarify the semantics of `query_maxlen`.
+- what was changed:
+  - No production or evaluation code was changed.
+- what was verified:
+  - q128-full and q32-tail differed on 20 of 271 queries: 14 q128 wins, 6
+    losses, and 251 ties.
+  - The changed-query WordPiece lengths ranged from 35 to 147. q128 wins had
+    mean/median lengths `66.71/62`; losses had `74.83/55`. Length alone does
+    not explain the direction.
+  - q128 often helped when the scenario head supplied decisive entities or
+    conditions omitted by the 29-content-token tail, but sometimes hurt when
+    the tail already contained a focused question and the full scenario added
+    competing concepts.
+  - The official tokenizer treats `query_maxlen` as a fixed representation
+    length, not only a truncation cap. It replaces padding positions with
+    `[MASK]`; those returned query-vector rows participate in MaxSim scoring.
+    Therefore fixed q100/q128 comparisons mix content truncation with query
+    expansion length.
+- evaluation/comparability impact:
+  - A variable-length query representation that caps content at 128 and
+    excludes padding/MASK rows from scoring would be a new query-encoding
+    ablation and is not directly comparable as the same ColBERTv2
+    configuration.
+- open issues:
+  - It remains to choose whether an adaptive experiment should remove all
+    query expansion or retain the checkpoint's official q32 expansion as a
+    minimum representation length.
+- next steps:
+  - If testing adaptive queries, prefer an explicit q32-floor/cap128 policy:
+    preserve official q32 behavior for short queries, extend only as required
+    by real query content, and exclude batch padding beyond each query's
+    effective length from MaxSim.
+
+## 2026-07-23 - Evaluate adaptive q32-floor query caps 128 and 150
+
+- objective:
+  - Re-evaluate full ConditionalQA compression queries with `query_maxlen`
+    acting as a real cap rather than a fixed MASK-augmented representation
+    length.
+- what was changed:
+  - Added optional `COLBERT_QUERY_MINLEN`. When set, `ColBERTEncoder` returns
+    only `max(MINLEN, min(MAXLEN, raw_content_WordPieces + 3))` query-vector
+    rows for MaxSim.
+  - Kept the existing fixed-length behavior when the new setting is absent.
+  - Added `minlen` to retrieval-evaluation output metadata and filenames.
+  - Extended the paired ablation runner to accept
+    `NAME:MAXLEN:SIDE[:MINLEN]`.
+  - Added unit tests for adaptive q32 flooring, actual-content length, cap
+    enforcement, and unchanged fixed-length behavior.
+- what was verified:
+  - Focused ColBERT tests passed: 32 tests.
+  - Full unittest discovery passed: 87 tests.
+  - Black, Python compilation, shell syntax, and `git diff --check` passed.
+  - All three policies used fixed retrieval fingerprint
+    `8cd6ae4a2998137a662e1aadf4fcef3735f05053469c4048da0732fee26bebfa`.
+  - Conditions were 271 ConditionalQA queries, `TOP_K=20`,
+    `RETAIN_TOKEN_RATIO=0.5`, and splitlong180.
+  - Retrieval evidence character recall was `0.871822`.
+  - Compressed evidence character recall was:
+    - q32 tail: `0.848482`
+    - adaptive q32-floor/cap128 full query: `0.836549`
+    - adaptive q32-floor/cap150 full query: `0.837933`
+  - Adaptive cap128 versus q32 tail changed 27 queries: 11 wins, 16 losses,
+    and 244 ties. Its mean difference was `-1.193` percentage points with a
+    seed-0 paired bootstrap interval of `[-3.560, 1.121]`.
+  - Adaptive cap150 versus q32 tail changed 26 queries: 11 wins, 15 losses,
+    and 245 ties. Its mean difference was `-1.055` points with interval
+    `[-3.360, 1.238]`.
+  - Cap150 versus cap128 changed only the 147-WordPiece `dev-14` query,
+    improving it by `37.5` points; the other 270 queries were identical. The
+    corpus has only two queries above cap128's 125-token content capacity.
+  - Effective representation length was mean `61.66` for cap128 and `61.75`
+    for cap150, compared with fixed lengths 128 and 150.
+- evaluation/comparability impact:
+  - Adaptive results are a new query-encoding ablation and are not directly
+    comparable as the same configuration as earlier fixed q100/q128 results.
+  - The earlier fixed-q128 advantage does not persist after excluding
+    fixed-length MASK expansion. This indicates that fixed q128 mixed content
+    scope with ColBERT query expansion rather than measuring only a larger
+    content cap.
+- open issues:
+  - Neither adaptive full-query cap significantly differs from q32 tail in
+    this 271-query sample, but both are numerically lower.
+- next steps:
+  - Prefer q32 tail for the main ConditionalQA setting.
+  - Treat adaptive cap128 as the clean full-query ablation; cap150 adds almost
+    no value for this query-length distribution.
+
+## 2026-07-23 - Review ColBERT MASK query augmentation
+
+- objective:
+  - Determine whether fixed q128 MASK vectors are merely padding noise or an
+    intentional ColBERT relevance mechanism.
+- what was changed:
+  - No production or evaluation code was changed.
+- what was verified:
+  - The original ColBERT paper explicitly calls MASK padding "query
+    augmentation" and trains it as a differentiable mechanism for query
+    expansion or term reweighting.
+  - Later ColBERTv1/v2 analyses find that contextual MASK vectors primarily
+    behave like repeated weights on existing salient query terms rather than
+    reliable novel-term expansion.
+  - In the ColBERTv2 checkpoint, non-MASK tokens cannot attend to MASK tokens.
+    Adding a MASK therefore does not change existing query representations; it
+    contributes an additional MASK-vector MaxSim term to the document score.
+  - A 2024 study found a non-monotonic effect: a few MASKs can be worse than
+    none, effectiveness rises sharply near the trained total length 32, and
+    then generally plateaus or slightly declines. Fixed length 128 changed
+    most reported metrics by less than 1% on TREC 2019-2020, while TREC COVID
+    saw small 1-3% gains and one significant nDCG@1000 gain.
+  - Fixed q128 adds a mean `66.34` MASK scoring vectors to the current
+    ConditionalQA queries (median 70, maximum 95); only 2 of 271 queries have
+    no q128 MASK padding.
+- evaluation/comparability impact:
+  - Fixed q128 is a legitimate MASK-augmentation ablation, not an accidental
+    padding bug. It is still confounded with full-query content when compared
+    against q32-tail.
+  - The current evidence does not isolate the MASK causal effect because the
+    earlier fixed-q128 and adaptive-q128 runs were not included in the same
+    fixed-candidate paired run.
+- open issues:
+  - It is unknown whether the fixed-q128 improvement transfers from evidence
+    recall to downstream answer quality.
+- next steps:
+  - If deciding the production query policy, run fixed-q128 and
+    adaptive-q128-full together on the same retrieval candidates to isolate
+    MASK augmentation, then compare answer F1 as a separate outcome.
+
+## 2026-07-23 - Remove unused engine/model imports
+
+- objective:
+  - Remove only imports that are currently unused in `engine.py` and
+    `model.py`, without deleting dormant GDS/AIO or cache helper code.
+- what was changed:
+  - Removed unused `torch`, `GDSBuilder`, `AsyncIOBuilder`, `file_read`, and
+    `restore_tensor_shape` imports from `engine.py`.
+  - Removed unused `defaultdict`, `Dict`, `LlamaForCausalLM`, transformers
+    `logging`, `GDSBuilder`, and `AsyncIOBuilder` imports from `model.py`.
+  - Preserved the commented GDS/AIO prototype code, the utility
+    implementations of `file_read` and `restore_tensor_shape`, all dormant
+    cache helpers, and the `shift_rotary_cache` import and usage.
+- what was verified:
+  - Black reported both edited Python files already formatted.
+  - `py_compile` passed for `src/engine.py` and `src/model.py`.
+  - `git diff --check` passed.
+  - The full unit-test suite passed: 85 tests.
+- evaluation/comparability impact:
+  - None. This was import-only cleanup; runtime and evaluation logic were not
+    changed.
+- open issues:
+  - The previously identified dormant cache helpers remain intentionally
+    present.
+- next steps:
+  - Decide separately whether those dormant helpers should be retained for
+    planned batched-cache work or removed in a later focused cleanup.
+
+## 2026-07-23 - Convert ColBERT compressors to a package
+
+- objective:
+  - Begin splitting the large ColBERT compressor module without changing its
+    runtime behavior or existing import path.
+- what was changed:
+  - Moved the intact implementation from
+    `compressor/methods/colbert.py` to
+    `compressor/methods/colbert/implementation.py`.
+  - Added `compressor/methods/colbert/__init__.py` to re-export all existing
+    compressor classes and the configuration helper used by tests.
+  - Kept `from compressor.methods.colbert import ...` compatible for the
+    factory and existing callers.
+- what was verified:
+  - Black, `py_compile`, import smoke tests, and `git diff --check` passed.
+  - After restoring the private helper export used by an existing test, the
+    full unit-test suite passed twice consecutively: 87 tests per run.
+- evaluation/comparability impact:
+  - None. This step only changed module layout and preserved implementation
+    code and runtime class mappings.
+- open issues:
+  - The implementation remains a single large module inside the new package.
+- next steps:
+  - Extract the common window-artifact runtime base and direct subchunk
+    selection into focused modules.
+
+## 2026-07-23 - Extract ColBERT compressor base and subchunk selection
+
+- objective:
+  - Separate common ColBERT window-artifact runtime responsibilities from
+    direct subchunk selection without changing compression behavior.
+- what was changed:
+  - Added `compressor/methods/colbert/base.py` with artifact and encoder
+    initialization, query-encoder warmup, inter-batch cache cleanup, profiling
+    helpers, empty-document construction, and coarse chunk reranking helpers.
+  - Added `compressor/methods/colbert/subchunk.py` containing only direct
+    subchunk candidate scoring, deduplication, token-budget selection, and
+    output construction.
+  - Changed the subchunk, sliding-region, and window-artifact rerank
+    compressors to inherit the common base directly where appropriate.
+    Sliding-region and rerank compressors no longer inherit from the subchunk
+    selection class merely for code reuse.
+  - Updated package exports and test patch targets to follow the new module
+    ownership.
+- what was verified:
+  - Black, `py_compile`, package import and inheritance smoke checks, and
+    `git diff --check` passed.
+  - All 32 focused ColBERT optimization tests passed.
+  - The full unit-test suite passed: 87 tests.
+- evaluation/comparability impact:
+  - None. Candidate scoring, ranking, add-then-budget-check behavior, output
+    construction, environment defaults, and factory mappings were preserved.
+- open issues:
+  - Rerank and region implementations still share the 725-line
+    `implementation.py` module.
+- next steps:
+  - Extract both fixed-chunk and window-artifact rerank compressors into
+    `rerank.py`.
+
+## 2026-07-23 - Extract ColBERT rerank compressors
+
+- objective:
+  - Isolate document-level ColBERT reranking from subchunk and region
+    selection implementations.
+- what was changed:
+  - Added `compressor/methods/colbert/rerank.py`.
+  - Moved `FixedChunkColBERTRerankCompressor`,
+    `ColBERTRerankCompressor`, and shared rerank keep configuration parsing
+    into the new module.
+  - Kept the combined rerank-and-region compressor in the region
+    implementation and made it import only the rerank configuration helper.
+  - Updated package exports while preserving all factory-facing class import
+    paths.
+- what was verified:
+  - Black, `py_compile`, package import smoke tests, and `git diff --check`
+    passed.
+  - All 32 ColBERT optimization tests and all 13 region-spec tests passed.
+  - The full unit-test suite passed: 87 tests.
+- evaluation/comparability impact:
+  - None. Artifact choice, query encoding, MaxSim scoring, ranking limits,
+    profiling fields, and output construction were unchanged.
+- open issues:
+  - Sliding-region and combined rerank-and-region implementations remain in
+    the 587-line `implementation.py`.
+- next steps:
+  - Rename that remaining implementation to `region.py`, then move the
+    ColBERT scoring module into the package while preserving compatibility.
+
+## 2026-07-23 - Rename ColBERT region implementation module
+
+- objective:
+  - Give the remaining region-only compressor module a responsibility-specific
+    name.
+- what was changed:
+  - Renamed `compressor/methods/colbert/implementation.py` to
+    `compressor/methods/colbert/region.py`.
+  - Updated the package export import and module docstring.
+- what was verified:
+  - Black, `py_compile`, package import smoke checks, old-path absence, and
+    `git diff --check` passed.
+  - All 13 region-spec tests and all 32 ColBERT optimization tests passed.
+  - The full unit-test suite passed: 87 tests.
+- evaluation/comparability impact:
+  - None. This was a module rename with no compressor logic or configuration
+    changes.
+- open issues:
+  - `compressor/methods/colbert_scoring.py` still sits outside the ColBERT
+    package.
+- next steps:
+  - Move the scoring module into `compressor/methods/colbert/scoring.py` in a
+    separate compatibility-preserving step.
+
+## 2026-07-23 - Move ColBERT MaxSim scoring into its package
+
+- objective:
+  - Place ColBERT-specific scoring alongside the ColBERT compressor
+    implementations.
+- what was changed:
+  - Moved `compressor/methods/colbert_scoring.py` to
+    `compressor/methods/colbert/scoring.py`.
+  - Updated runtime, unit-test, and analysis-script imports to the new module
+    path.
+  - Updated `docs/codebase_guide.md` to describe `compressor/methods/colbert/`
+    as the concrete ColBERT method package.
+- what was verified:
+  - Black, `py_compile`, the new scoring import, old-path absence, stale import
+    search, and `git diff --check` passed.
+  - All 32 ColBERT optimization tests and all 13 region-spec tests passed.
+  - The full unit-test suite passed: 87 tests.
+- evaluation/comparability impact:
+  - None. The `score_maxsim` implementation and every call site are unchanged
+    apart from their import path.
+- open issues:
+  - Coarse chunk reranking helpers still live in the common ColBERT base even
+    though only rerank-capable paths use them.
+  - The sliding-region and rerank-and-region compression loops remain largely
+    duplicated.
+- next steps:
+  - Move coarse reranking responsibility out of the common base as a separate
+    behavior-preserving refactor.
+
+## 2026-07-23 - Move coarse reranking out of the ColBERT base
+
+- objective:
+  - Keep the common ColBERT base limited to shared artifact, encoder, budget,
+    profile, and output lifecycle responsibilities.
+- what was changed:
+  - Moved `_score_coarse_chunk` and `_rerank_chunk_indices` from
+    `colbert/base.py` into a private `_ColBERTRerankMixin` in
+    `colbert/rerank.py`.
+  - Applied the mixin only to `ColBERTRerankCompressor` and
+    `ColBERTRerankAndRegionCompressor`.
+  - Left direct subchunk and plain sliding-region compressors without the
+    unused coarse-reranking capability.
+- what was verified:
+  - Black, `py_compile`, MRO/capability smoke checks, and `git diff --check`
+    passed.
+  - The smoke check confirmed the common base, direct subchunk compressor, and
+    plain sliding-region compressor no longer expose `_rerank_chunk_indices`,
+    while both rerank-capable compressors do.
+  - All 32 ColBERT optimization tests and all 13 region-spec tests passed.
+  - The full unit-test suite passed: 87 tests.
+- evaluation/comparability impact:
+  - None. The coarse MaxSim calculation, artifact lookup, timing profile
+    updates, sorting, and returned chunk indices were moved without changes.
+- open issues:
+  - The plain sliding-region and rerank-and-region compression methods still
+    duplicate most of their orchestration.
+- next steps:
+  - Consolidate the shared region compression flow while keeping rerank gating
+    as a narrowly scoped hook.
+
+## 2026-07-23 - Consolidate ColBERT region compression flow
+
+- objective:
+  - Remove duplicated orchestration between plain sliding-region compression
+    and rerank-gated region compression without changing either policy.
+- what was changed:
+  - Kept a single `compress_batch_top_k_docs` implementation on
+    `ColBERTSlidingRegionCompressor`.
+  - Added `_region_chunk_indices` as the narrow policy hook: the plain method
+    returns every retrieved chunk, while `ColBERTRerankAndRegionCompressor`
+    returns only the coarse-reranked top `COLBERT_RERANK_KEEP` chunk indices.
+  - Added `_initialize_region_profile` so the combined method preserves its
+    `rerank_kept_chunk_count` field, including for an empty batch.
+  - Made the shared flow derive both the final token-budget input documents
+    and region-construction documents from the allowed chunk indices.
+  - Removed the duplicated combined-method compression loop.
+  - Added regression tests for shared-method inheritance, plain versus rerank
+    chunk gating, gated budget input, gated region construction, and profile
+    accounting.
+- what was verified:
+  - Black, `py_compile`, and `git diff --check` passed.
+  - All 15 region-spec tests and all 32 ColBERT optimization tests passed.
+  - The full unit-test suite passed: 90 tests.
+- evaluation/comparability impact:
+  - None. Plain sliding-region still budgets and scores all retrieved chunks.
+    Rerank-and-region still computes its token budget and regions only from the
+    coarse-reranked top chunks, preserving retrieval-order traversal, region
+    scoring, sorting, add-then-budget-check selection, output construction,
+    and profile fields.
+- open issues:
+  - `region.py` remains 539 lines because region construction, vectorized
+    scoring, budget selection, and orchestration are still colocated.
+- next steps:
+  - Stop structural refactoring here unless region scoring needs independent
+    testing or reuse; if it does, extract only the vectorized scoring kernel in
+    a separate step.
+
+## 2026-07-23 - Rename model-based sentence selectors
+
+- objective:
+  - Restore a model-oriented module name for the Provence and EXIT selector
+    baselines.
+- what was changed:
+  - Renamed `compressor/methods/sentence_selection.py` to
+    `compressor/methods/ml_selector.py`.
+  - Updated the compressor factory import and `docs/codebase_guide.md`.
+- what was verified:
+  - Black, `py_compile`, stale-path search, old-path absence,
+    factory mapping smoke checks, and `git diff --check` passed.
+  - The `exit` and `provence` factory keys still resolve to the same classes.
+  - The full unit-test suite passed: 90 tests.
+- evaluation/comparability impact:
+  - None. This was a module rename; model loading, sentence selection,
+    thresholds, prompts, and factory option names were unchanged.
+- open issues:
+  - `ml_selector.py` still contains both model-specific implementations and
+    their shared selector base.
+- next steps:
+  - Keep the single module unless Provence and EXIT need to evolve
+    independently enough to justify a package split.
+
+## 2026-07-23 - Add concise compressor documentation
+
+- objective:
+  - Make the compressor subsystem easier to read without adding noisy
+    line-by-line comments or changing behavior.
+- what was changed:
+  - Added short module and class docstrings across the compressor framework,
+    factory, token-budget utilities, output provenance helpers, dense baseline,
+    ML selectors, summarization baseline, and ColBERT package.
+  - Documented non-obvious invariants including the first-cacheable fallback,
+    single compressor instance reuse, prompt-visible token accounting,
+    contextualized artifact ownership, coarse rerank capability, vectorized
+    unique-sentence scoring, overlapping-region deduplication, and chunk
+    gating.
+  - Added explicit comments at both ColBERT selection loops stating that the
+    policy includes the current candidate/region before checking whether the
+    token budget has been reached.
+- what was verified:
+  - Black, `compileall`, and `git diff --check` passed.
+  - The full unit-test suite passed: 90 tests.
+- evaluation/comparability impact:
+  - None. Only comments and docstrings were added.
+- open issues:
+  - Documentation was intentionally scoped to `src/compressor/`; other
+    subsystems were not mass-commented.
+- next steps:
+  - Add similarly focused documentation to another subsystem only when it is
+    being actively refactored, so comments remain aligned with current code.
+
+## 2026-07-23 - Add concise documentation across non-compressor source
+
+- objective:
+  - Give the remaining `src/` modules enough local documentation to make their
+    ownership and major data flow understandable without reading every
+    implementation detail.
+- what was changed:
+  - Added responsibility-focused module docstrings across runtime inference,
+    metrics, cache utilities, chunk models, encoders, entrypoints, evidence
+    coverage, vector DB, materialization, and splitter/parser/grouper modules.
+  - Added short class docstrings for major runtime and data abstractions such
+    as `QueryProcessor`, `LLMModel`, chunk types, encoders, vector DB classes,
+    materializers, splitters, parsers, and groupers.
+  - Added focused method documentation for cache-on generation, front-BOS
+    cache construction, batch query execution, candidate-store creation,
+    region sidecar generation, RoPE cache shifting, and evidence coverage.
+  - Preserved the existing parser-then-grouper explanation and avoided
+    line-by-line comments on self-explanatory code.
+- what was verified:
+  - Every non-compressor Python module under `src/` now begins with a module
+    docstring.
+  - Black, full `src/` `compileall`, and `git diff --check` passed.
+  - The full unit-test suite passed: 90 tests.
+- evaluation/comparability impact:
+  - None. Only comments and docstrings were added.
+- open issues:
+  - None introduced by this documentation pass.
+- next steps:
+  - Keep future comments focused on invariants and ownership rather than
+    restating individual statements.
+
+## 2026-07-23 - Reduce ColBERT CPU query-inference overhead
+
+- objective:
+  - Remove avoidable autograd and CUDA-AMP context overhead from online
+    ColBERT query encoding on CPU.
+- what was changed:
+  - Added CPU checkpoint runtime configuration that disables the official
+    ColBERT `MixedPrecisionManager` CUDA AMP context when the requested
+    checkpoint device is CPU.
+  - Wrapped `queryFromText` in `torch.inference_mode()`.
+  - Added regression tests verifying that CPU setup disables the AMP manager
+    and that query encoding executes with inference mode enabled.
+- what was verified:
+  - Black, `py_compile`, and `git diff --check` passed.
+  - All 33 focused ColBERT optimization tests passed.
+  - The full unit-test suite passed: 91 tests.
+- evaluation/comparability impact:
+  - No intended numerical or policy change. CPU CUDA autocast was not
+    applicable to CPU operators, and inference mode changes tensor bookkeeping
+    rather than model computation. Query tokenization, lengths, output dtype,
+    embeddings, MaxSim scoring, and selection remain unchanged.
+- open issues:
+  - The current encoder warmup uses one query even when measured encoding uses
+    a larger batch.
+  - Optimal `COLBERT_BATCH_SIZE` depends on CPU topology and must be measured;
+    larger batches are not unconditionally faster.
+- next steps:
+  - Benchmark CPU query encoding at representative evaluation batch sizes and
+    micro-batches before changing defaults.
+
+## 2026-07-23 - Complete ConditionalQA vanilla and splitlong180 evidence grid
+
+- objective:
+  - Compare splitlong180 ColBERT region selection with vanilla 128/256/512
+    retrieval at `TOP_K=10,20`, without LLM inference, using DAPR
+    ConditionalQA source-span evidence labels.
+  - Verify runtime CPU placement and selected-context structural invariants.
+- what was changed:
+  - Changed `run/preprocess.sh`'s default `MAX_SUBCHUNK_TOKENS` from `None` to
+    `180` and documented the default and explicit `None` opt-out in README.
+  - Added `parent_doc_id`, `window_token_start`, and `window_token_end` metadata
+    to fixed-token retrievable chunks. Rebuilt the ConditionalQA vanilla
+    128/256/512 DBs because the evaluator intentionally does not infer source
+    locations from chunk IDs.
+  - Made runtime ColBERT initialization patch the upstream ColBERT device
+    globals before checkpoint construction and assert that the actual model
+    parameter device matches the requested CPU device.
+  - Extended the experimental ConditionalQA query-policy grid runner to reuse
+    one fixed coarse-retrieval result per `TOP_K`, accept multiple retained
+    ratios, and audit contiguous regions, duplicate selected source subchunks,
+    source-span bounds, boundary overlap, and ColBERT-token over-budget regions.
+  - Updated `docs/eval_protocol.md` to state that results made before the
+    runtime-device enforcement cannot be claimed as CPU query encoding when
+    CUDA was visible.
+- what was verified:
+  - Rebuilt vanilla evidence results over all 271 queries:
+    - vanilla-128: K10 `1235.90` tokens / `0.683145` char recall; K20
+      `2472.71` / `0.804302`.
+    - vanilla-256: K10 `2403.41` / `0.831044`; K20 `4797.89` / `0.899488`.
+    - vanilla-512: K10 `4450.42` / `0.808459`; K20 `8902.75` / `0.869616`.
+  - Completed splitlong180 K10 and K20 for q32-tail and fixed128-full at
+    retained ratios `0.125`, `0.25`, `0.5`, and `0.75`.
+  - K10 q32-tail char recall/token count is: r=.125
+    `0.617742/661.67`; r=.25 `0.698015/1260.96`; r=.5
+    `0.786689/2447.41`; r=.75 `0.813426/3634.59`.
+  - K10 fixed128-full char recall/token count is: r=.125
+    `0.572146/666.85`; r=.25 `0.694230/1261.26`; r=.5
+    `0.780692/2441.22`; r=.75 `0.816130/3636.00`.
+  - K20 q32-tail char recall/token count is: r=.125
+    `0.712470/1252.92`; r=.25 `0.785137/2439.74`; r=.5
+    `0.848482/4804.08`; r=.75 `0.875481/7175.97`.
+  - K20 fixed128-full char recall/token count is: r=.125
+    `0.691366/1252.83`; r=.25 `0.782392/2440.23`; r=.5
+    `0.860947/4809.67`; r=.75 `0.876496/7181.46`.
+  - Token-level evidence recall tracks character recall within about
+    `0.0004` in every reported condition.
+  - Every splitlong summary records `requested_device=cpu` and
+    `actual_device=cpu`. All 16 conditions report zero duplicate selected
+    source subchunks.
+  - K20 retrieved structure contains 1,637 unique coarse chunks, 23,174
+    subchunk references, and 11,168 artifact regions. Source subchunks are at
+    most 180 source-tokenizer tokens. The maximum selected region is 196
+    ColBERT tokens and 240 evaluation-tokenizer tokens.
+  - An exact full-artifact retokenization confirmed the over-budget cause:
+    all 31,808 source units are at most 180 Llama tokens, while 14 are exactly
+    180 ColBERT tokens and 59 exceed 180 ColBERT tokens. These 73 at-or-over
+    units exactly match the artifact's 73 `truncated_centers`.
+  - Across all 16,236 stored region occurrences, only 77 (0.474%) exceed 180
+    ColBERT tokens, and every one contains one of those over-budget centers.
+    Their ColBERT lengths have p50 185, p90 190, p95 194, and maximum 216:
+    69 are 181-190, seven are 191-200, and one is above 200.
+  - All 90 unit tests passed with
+    `python -m unittest discover -s test -p 'test_*.py' -v`.
+- evaluation/comparability impact:
+  - Character coverage is the primary cross-model metric; token coverage is
+    tokenizer-specific and secondary. All results use exact source character
+    spans rather than cacheable IDs.
+  - The fixed-token DB metadata addition enables source-span evaluation but
+    does not alter chunk text. The rebuilt DB can nevertheless produce
+    different approximate Chroma retrieval results, so these outputs are the
+    canonical vanilla evidence results for this grid.
+  - These CPU-enforced ColBERT results are not directly comparable in
+    compression latency or necessarily identical in selection to earlier
+    CUDA-mixed-precision query-encoding results.
+  - Boundary-crossing subchunks are intentional. Consequently, compressed
+    evidence recall may slightly exceed coarse retrieval evidence recall by
+    retaining evidence just outside a retrieved coarse-chunk boundary.
+- open issues:
+  - The source subchunk cap is measured with the Llama source tokenizer, while
+    ColBERT windows use WordPiece tokens. K20 has 47 unique retrieved artifact
+    regions above the 180-token ColBERT budget. Across query outputs, selected
+    over-budget run occurrences range from 10 to 117 depending on query policy
+    and retained ratio, but the maximum selected run is 196 ColBERT tokens.
+  - The ConditionalQA grid measures evidence coverage only. Final-answer
+    inference and the official ConditionalQA answer-only evaluator remain
+    separate follow-up work.
+  - The user-run HotpotQA r=.25 latency overlapped an earlier ConditionalQA CPU
+    run and is contaminated; rerun latency-sensitive HotpotQA points in an
+    isolated condition.
+- next steps:
+  - Use the completed grid to choose the query policy by retained budget:
+    q32-tail is stronger at low budgets, while fixed128-full is stronger at
+    K20 r=.5/.75.
+  - Run ConditionalQA LLM inference only after selecting a small set of
+    representative vanilla and subchunk points.
+
+## 2026-07-23 - Compare CPU ColBERT query microbatch sizes for grid_th_cases
+
+- objective:
+  - Measure `compress_time` up to, but excluding, LLM inference for the active
+    `grid_th_cases.yaml` case with `COLBERT_BATCH_SIZE=32` and `64`.
+- what was changed:
+  - Updated the ignored diagnostic profiler
+    `test/profile_colbert_sliding_region_retrieval.py` for the current
+    `ColBERTWindowArtifact` cache fields.
+  - Added an optional per-repeat ColBERT batch-size sequence so both settings
+    can be alternated within one process and compared against the same
+    retrieval workload.
+- what was verified:
+  - Used HotpotQA `sent-default-512-splitlong180`, `TOP_K=10`,
+    `FINAL_TOKEN_BUDGET=600`, `EVAL_BSZ=116`, and all 200 queries. The measured
+    batches were 116 and 84 queries; model/tokenizer initialization, query
+    encoder warmup, retrieval, and LLM inference were excluded from
+    `compress_time`.
+  - The paired alternating run used four repeats per setting. All repeats had
+    identical region counts, unique-sentence counts, and selected-cacheable
+    counts across batch sizes.
+  - Mean total compression time was `1.735756 s` for batch size 32 and
+    `1.823342 s` for batch size 64 over 200 queries (`8.679` versus `9.117`
+    ms/query). Batch size 64 was `5.05%` slower overall.
+  - Mean query-encoding time alone was `0.826849 s` for batch size 32 and
+    `0.794757 s` for batch size 64. The 64-query microbatch was `3.88%` faster
+    in encoding, but the small gain did not reduce end-to-end compression
+    time.
+  - Black formatting and `py_compile` passed for the diagnostic profiler.
+  - Raw paired output is
+    `outputs/profile_grid_th_cases_colbert_bsz32_64_paired.json` (ignored by
+    Git).
+- evaluation/comparability impact:
+  - The paired profiler warmed only the query encoder, whereas the evaluation
+    engine additionally runs one full retrieval/compression/generation query
+    before measured batches.
+  - The profiler cleared ColBERT inter-batch caches immediately before
+    retrieval and outside its compression timer. The engine clears them
+    through `compress_docs()` inside `compress_time`. Therefore the paired
+    values are suitable for the 32-versus-64 relative comparison, but should
+    not be treated as exact reproductions of engine `compress_time`.
+  - The prior successful `hotpotqa-test` runs used `EVAL_BSZ=1` and reported
+    about `6.15-6.46 s` total compression over 200 queries. Their approximately
+    `0.031 s` per-batch values are also per-query values and cannot be compared
+    directly with a 116-query batch time. The matching `hotpotqa-test2`
+    `EVAL_BSZ=116` run failed during LLM inference before emitting final timing.
+- open issues:
+  - Per-repeat wall times remain noisy on the shared CPU host. The four paired
+    differences are not all in the same direction, so the result does not
+    establish a robust performance advantage for either size.
+  - Rerun through an engine-equivalent compression-only path if an absolute
+    `compress_time` comparable to evaluation logs is required.
+- next steps:
+  - Keep the default `COLBERT_BATCH_SIZE=32`; batch size 64 showed no overall
+    compression-time benefit under the active grid configuration.
+
+## 2026-07-23 - Audit CPU MaxSim and region-scoring efficiency
+
+- objective:
+  - Identify avoidable overhead in the CPU ColBERT sliding-region scoring path
+    without changing scoring or selection semantics.
+- what was changed:
+  - No runtime source code was changed. Added ignored diagnostic outputs for
+    PyTorch CPU thread counts 1, 4, 8, 16, and 32.
+- what was verified:
+  - The initial thread-count run overlapped another CPU workload and is
+    superseded by an uncontended rerun.
+  - On the uncontended HotpotQA 200-query workload, total compression at
+    1/4/8/16/32 threads was respectively
+    `8.552/3.563/2.330/1.776/1.775 s`. The 16- and 32-thread totals are
+    effectively tied.
+  - At 16 threads, query encoding took `0.974 s`,
+    `sentence_maxsim_time` took `0.216 s`, and `region_score_time` took
+    `0.206 s`. At 32 threads those values were `0.881/0.233/0.225 s`;
+    32 threads improved encoding but was slightly slower in the two scoring
+    sections.
+  - `sentence_maxsim_time` currently combines Python sentence deduplication,
+    ID/length tensor creation, vector concatenation and FP16-to-FP32 conversion,
+    matmul, and sentence-level scatter reduction. It is not a pure matmul
+    measurement.
+  - Region aggregation constructs one small index tensor per region in a
+    Python loop, then allocates padded gather/mask tensors. The workload has
+    about 13.5K regions, making this a concrete avoidable allocation pattern.
+  - Sentence scoring allocates a score matrix, makes it contiguous after a
+    transpose, and then makes a second contiguous copy after transposing back.
+    These copies are avoidable by allocating the scatter destination in
+    query-major layout.
+- open issues:
+  - The existing profile does not separate sentence packing, FP32 conversion,
+    matmul, and scatter reduction, so their individual shares are not yet
+    known.
+- next steps:
+  - First split the diagnostic timers without changing logic.
+  - Then benchmark two local optimizations independently: query-major sentence
+    score allocation, and one-shot/CSR-style region index construction.
+
+## 2026-07-23 - Remove region-scoring tensor allocation overhead
+
+- objective:
+  - Optimize the two identified CPU scoring allocation patterns while
+    preserving ColBERT MaxSim scores and selection behavior.
+- what was changed:
+  - Allocated sentence scores directly in query-major layout and retained a
+    transpose view, removing two `contiguous()` copies.
+  - Replaced one small `torch.tensor()` allocation per region with one padded
+    region-index tensor construction.
+  - Strengthened the direct and exhaustive region-score tests from approximate
+    comparison to exact float equality against concatenated MaxSim.
+- what was verified:
+  - All 91 unit tests passed. Black and `py_compile` checks passed for the
+    changed source and test files.
+  - On an uncontended 16-thread, 200-query HotpotQA run with three repeats,
+    median `sentence_maxsim_time` decreased from `0.237004 s` to `0.197196 s`
+    (`-16.8%`) and median `region_score_time` decreased from `0.226925 s` to
+    `0.057098 s` (`-74.8%`).
+  - Their combined median decreased from `0.463929 s` to `0.254294 s`
+    (`-45.2%`). Median query-excluded compression time decreased from
+    `1.053025 s` to `0.778966 s` (`-26.0%`).
+- evaluation/comparability impact:
+  - The scoring equation, input ordering, score ordering, token budget, and
+    selection policy are unchanged. Exhaustive small-region tests produce
+    exactly equal float scores.
+  - Chroma retrieval was run in separate before/after processes and returned
+    13,516 versus 13,511 regions (a five-region difference), so the end-to-end
+    timing comparison is not a byte-identical retrieval replay. The scoring
+    reduction is much larger than this 0.04% workload difference.
+- open issues:
+  - `sentence_maxsim_time` still combines packing, conversion, matmul, and
+    scatter reduction.
+- next steps:
+  - Keep the FP32 embedding-cache idea separate; it was not implemented in this
+    change.
+
+## 2026-07-23 - Reject batch-local FP32 sentence-vector cache
+
+- objective:
+  - Measure whether caching FP16-to-FP32 sentence-vector conversions can
+    improve the optimized region scorer, including its memory cost.
+- what was changed:
+  - Temporarily added an inter-batch-cleared FP32 sentence-vector cache and
+    exact tensor-payload/Python-object memory accounting.
+  - Removed the cache implementation after measurement because it regressed
+    both speed and memory. The preceding query-major and one-shot region-index
+    optimizations remain in place.
+- what was verified:
+  - At 16 threads over three repeats, median `sentence_maxsim_time` increased
+    from `0.197196 s` without the cache to `0.442386 s` with it (`2.24x`).
+  - Median query-excluded compression time increased from `0.778966 s` to
+    `0.953488 s` (`+22.4%`).
+  - The 116-query batch retained 13,983 FP32 tensors with `206,147,072` payload
+    bytes and about `2,603,464` bytes of Python-object overhead: approximately
+    `199.1 MiB` total.
+  - The 84-query batch retained 9,592 tensors with `142,536,704` payload bytes
+    and about `1,676,240` bytes of Python-object overhead: approximately
+    `137.5 MiB` total.
+  - After reverting only the FP32-cache experiment, all 91 unit tests passed;
+    Black and `py_compile` checks passed.
+- open issues:
+  - The cache reused only the relatively small number of repeated retrieval
+    documents, while eagerly converting and retaining every encountered
+    sentence vector.
+- next steps:
+  - Do not add this FP32 cache. Keep FP16 artifact storage and convert the
+    packed per-query tensor to FP32 immediately before matmul.
+
+## 2026-07-23 - Audit CPU-query versus materialized-document numerics
+
+- objective:
+  - Determine whether result changes after enforcing CPU query encoding can be
+    explained by a query/document dtype mismatch.
+- what was changed:
+  - No code was changed.
+- what was verified:
+  - Runtime query embeddings are produced by a CPU FP32 forward pass.
+  - Materialized document embeddings are always persisted as FP16. GPU
+    materialization additionally uses the official ColBERT CUDA autocast
+    context and explicitly converts normalized document vectors to FP16.
+  - MaxSim casts both query and document tensors to FP32 before matmul.
+    Therefore there is no operand-dtype mismatch at scoring time, but casting
+    stored document vectors back to FP32 cannot recover rounding or
+    GPU-autocast differences introduced during materialization.
+  - Current `sent-default-512-splitlong180` artifacts for HotpotQA, 2Wiki,
+    MuSiQue, and Qasper all record the requested `device=cpu`,
+    `batch_size=64`. This does not prove their actual materialization device.
+  - Among the inspected older `sent-default-512` artifacts, only 2Wiki records
+    `device=cuda` (`batch_size=1024`); HotpotQA, MuSiQue, and Qasper record CPU.
+- open issues:
+  - Artifact indexes record `encoder.device`, which is the requested device,
+    but not the model parameter's actual device, AMP state, output dtype
+    provenance, code commit, or library versions.
+  - The inspected HotpotQA splitlong180 index was written on 2026-07-22, before
+    the 2026-07-23 actual-device assertion was added. No retained build log
+    records its actual parameter device, so CPU versus GPU cannot be proven
+    from existing metadata.
+  - For a GPU-materialized artifact, small CPU/GPU query-vector differences can
+    change token-level MaxSim argmaxes and near-tied region order, which can
+    cause discontinuous selection changes at a token-budget boundary.
+- next steps:
+  - On one fixed query/document workload, compare GPU-AMP query, GPU-FP32
+    query, CPU-FP32 query, and CPU-FP16-roundtrip query vectors. Score every
+    variant against the same artifact on CPU FP32 to isolate AMP, device-kernel,
+    and final-output quantization effects.
+
+## 2026-07-23 - Empirically identify HotpotQA artifact encoding device
+
+- objective:
+  - Determine whether the existing HotpotQA splitlong180 ColBERT artifact is
+    numerically closer to fresh CPU-FP32 or GPU-AMP document encoding.
+- what was changed:
+  - Added the diagnostic
+    `test/compare_colbert_artifact_encoding_device.py`. It reconstructs exact
+    materialization windows, verifies their IDs against the artifact, encodes
+    them through both paths, rounds both outputs to the artifact's FP16 storage
+    dtype, and compares them with the stored vectors.
+  - No source or evaluation logic was changed.
+- what was verified:
+  - All reconstructed window IDs matched for 256 deterministic sampled
+    vectors, covering 7,173 token rows and 918,144 scalar values.
+  - The GPU-AMP reconstruction exactly matched 90.5760% of stored FP16 scalar
+    values, versus 33.2942% for CPU-FP32.
+  - 213 of 256 complete GPU-AMP vectors were bitwise identical to the stored
+    vectors; none of the CPU-FP32 vectors were.
+  - GPU-AMP mean absolute error was `5.4570e-06`, approximately 7.07 times
+    smaller than CPU-FP32's `3.8578e-05`. GPU-AMP RMSE was `2.0990e-05`,
+    versus `5.5158e-05` for CPU-FP32.
+  - The full result is in
+    `outputs/compare_hotpotqa_splitlong180_artifact_cpu_gpu_sample256.json`.
+  - These results provide strong empirical evidence that this artifact was
+    generated through the GPU-AMP path, despite its index recording the
+    requested `device=cpu`.
+- open issues:
+  - The remaining GPU differences may come from build-time versus current
+    library/kernel state, nondeterministic GPU execution, or batch composition.
+  - This establishes document-artifact provenance but does not yet quantify
+    how much the current CPU query path changes final selected regions.
+- next steps:
+  - Compare fixed-query GPU-AMP and CPU-FP32 query encodings against this same
+    artifact to measure score, ranking, and final-selection divergence.
+  - For future artifacts, persist actual parameter device, AMP state, output
+    dtype, code revision, and relevant library versions.
+
+## 2026-07-23 - Compare CPU and GPU query paths on HotpotQA first 20
+
+- objective:
+  - Measure whether CPU-FP32 versus GPU-AMP ColBERT query encoding changes
+    MaxSim values, query-token argmaxes, region ranking, or the R=0.15 budget
+    boundary for the first 20 HotpotQA splitlong180 queries at TOP_K=10.
+- what was changed:
+  - Added the diagnostic
+    `test/compare_colbert_query_encoding_paths.py`.
+  - It retrieves each query once and shares those exact top-10 documents
+    between both query-encoding paths. It uses the stored candidate vectors,
+    runtime vectorized region scorer, sentence deduplication, and the current
+    add-then-check budget policy.
+  - No source or evaluation logic was changed.
+- what was verified:
+  - The final run matches the grid's `EVAL_BSZ=1`; actual encoder devices were
+    verified as CPU and `cuda:0`. Scoring for both paths was CPU FP32.
+  - Across 81,920 query-vector elements, CPU/GPU mean absolute difference was
+    `4.6835e-05`, maximum difference was `0.0012727`, mean token cosine was
+    `0.9999998242`, and minimum token cosine was `0.9999911785`.
+  - Across 6,052,544 query/document similarities, mean absolute difference was
+    `5.5604e-05` and maximum difference was `0.00312835`.
+  - 25 of 44,416 query-token/region MaxSim argmaxes changed (`0.05629%`),
+    spread over 25 of 1,388 regions and 10 of 20 queries.
+  - Mean absolute region-score difference was `0.0009518`; maximum was
+    `0.0054035`.
+  - Two region pairs inverted, affecting queries 10 and 11. Each inversion was
+    a one-position swap (ranks 42/43 and 13/14 respectively). Top-1, top-5,
+    top-10, top-20, and top-50 region sets remained identical for every query.
+  - CPU/GPU selected sentence sets, sentence order, accepted-region sequence,
+    boundary region, and used token counts were identical for all 20 queries.
+    Boundary score differences still existed: mean `0.0012019`, maximum
+    `0.0048447`.
+  - The diagnostic's direct per-region MaxSim and the production vectorized
+    scorer differed by at most `1.9073e-06`, validating the measurement
+    decomposition.
+  - Full per-query results are in
+    `outputs/compare_hotpotqa_splitlong180_query_cpu_gpu_first20.json`.
+- evaluation/comparability impact:
+  - This was read-only evaluation of fixed retrieval results. Dataset handling,
+    retrieval output, prompt construction, compression policy, metrics, and
+    persisted experiment results were not changed.
+- open issues:
+  - This 20-query sample proves numerical, argmax, and limited ranking
+    divergence, but does not show a final selection divergence. Larger samples
+    or a near-tied budget boundary may still expose one.
+  - `default_colbert_repo_path()` currently resolves to the nonexistent
+    `src/third_party/ColBERT`; the diagnostic explicitly supplies the real
+    repository-root path. Source behavior was not changed in this session.
+- next steps:
+  - If final-output impact must be quantified, run the same fixed-retrieval
+    comparison over the full HotpotQA evaluation set and count boundary and
+    selected-sentence divergence.
+
+## 2026-07-23 - Benchmark ColBERT document AMP versus GPU FP32
+
+- objective:
+  - Quantify the materialization encoding slowdown from disabling CUDA AMP and
+    clarify FP16 artifact storage and CPU mixed-precision constraints.
+- what was changed:
+  - Added the diagnostic `test/benchmark_colbert_document_amp.py`.
+  - No source, artifact format, or evaluation behavior was changed.
+- what was verified:
+  - Reconstructed 2,048 deterministic HotpotQA splitlong180 materialization
+    windows and measured the same RTX A6000 encoder five times per mode at the
+    artifact batch size of 64, alternating mode order after warmup.
+  - CUDA AMP median was `2.5537 s` (`801.97 windows/s`); GPU FP32 median was
+    `5.6102 s` (`365.05 windows/s`). Disabling AMP made encoding `2.1969x`
+    slower and reduced throughput by `54.48%`.
+  - Encoder-only projection for all 73,085 cacheables is approximately
+    `91.13 s` with AMP versus `200.21 s` with GPU FP32. Total build slowdown
+    should be below `2.20x` because parsing, tokenization, metadata, and I/O are
+    shared costs not isolated in this benchmark.
+  - Full benchmark output is
+    `outputs/benchmark_hotpotqa_colbert_document_amp_fp32.json`.
+  - The current artifact has 2,068,142 token embeddings of dimension 128. Its
+    FP16 vector payload is `504.92 MiB`; FP32 would be `1009.83 MiB`. Including
+    metadata, projected artifact size increases from `529.25 MiB` to
+    `1034.17 MiB`.
+  - Current code converts document vectors to FP16 in both the encoder output
+    path and the materialization writer, and readers assume an FP16 memmap.
+    FP32 storage is possible but requires an explicit artifact-format/dtype
+    change across encoder, writer, index metadata, and reader.
+  - Runtime region MaxSim explicitly converts both query and stored document
+    vectors to FP32 before matmul. CPU query vectors already being FP32 does
+    not add a query conversion and is not the cause of the prior MaxSim
+    latency. FP16 document unpacking-to-FP32 remains part of the measured
+    packing/scoring path.
+  - PyTorch 2.6 exposes CPU autocast with BF16 as its default. This Xeon Gold
+    6338 advertises neither AVX512_BF16/AMX_BF16 nor AVX512_FP16; it only
+    advertises F16C conversion support. CPU BF16/FP16 therefore is not expected
+    to accelerate this encoder and would not reproduce CUDA FP16 AMP kernels.
+- open issues:
+  - A native FP32 mmap artifact could avoid runtime FP16-to-FP32 conversion but
+    doubles vector read bandwidth and resident payload. Its end-to-end MaxSim
+    effect must be benchmarked separately; the rejected eager FP32 cache is not
+    equivalent to an FP32 artifact format.
+  - GPU FP32 still does not guarantee bitwise agreement with CPU FP32 because
+    their kernels and operation ordering differ.
+- next steps:
+  - If this tradeoff is acceptable, add an explicit materialization compute
+    precision and artifact storage dtype rather than coupling them implicitly.
+  - Before adopting FP32 storage, benchmark a temporary native FP32 artifact
+    reader on fixed retrieval inputs for both latency and selected-output
+    comparability.
+
+## 2026-07-23 - Attribute HotpotQA variation using 200 fixed queries
+
+- objective:
+  - Distinguish CPU/GPU ColBERT query-path numerical effects from
+    process-to-process Chroma retrieval variation on the first 200 HotpotQA
+    splitlong180 queries at TOP_K=10 and R=0.15.
+- what was changed:
+  - Extended `test/compare_colbert_query_encoding_paths.py` to compare the
+    actual final compressor document/text sequence after source-position
+    reordering, not only the internal score-order selection trace.
+  - Added `test/compare_retrieval_snapshot.py` to compare a new process's
+    top-10 IDs with the fixed-retrieval reference and, when retrieval differs,
+    rerun CPU compression for those queries.
+  - No source or evaluation logic was changed.
+- what was verified:
+  - With retrieval fixed and shared, CPU-FP32 versus GPU-AMP query encoding
+    changed 275 of 432,512 query-token/region argmaxes (`0.06358%`), affected
+    119 of 200 queries, and changed some region rank in 34 queries.
+  - There were 41 inverted region pairs among 471,191 pairs. Mean absolute
+    region-score difference was `0.0009271` and maximum was `0.0095720`.
+  - Selected sentence sets and budget-boundary regions were identical for all
+    200 queries. One query's internal accepted-region order changed, but final
+    source-position normalization removed it: final document ID sequence,
+    cacheable text sequence, and prompt context text were identical for all
+    200 queries.
+  - The fixed-retrieval result is
+    `outputs/compare_hotpotqa_splitlong180_query_cpu_gpu_first200.json`.
+  - Fresh Chroma processes were intermittent: some reproduced all 2,000
+    top-10 positions, while others changed one or two queries.
+  - In an observed two-query divergent run, query 4 changed one retrieved
+    document and its ratio-derived budget from 600 to 557, but retained the
+    same selected sentences. Query 175 (zero-based) changed one retrieved
+    document, changed its budget from 542 to 603, and changed the selected
+    sentence set to Jaccard `0.34615` (11 reference-only and 6 fresh-only
+    sentences).
+  - The impactful observed retrieval run is recorded in
+    `outputs/compare_hotpotqa_retrieval_snapshot_impactful_observation.json`.
+- interpretation:
+  - Under this exact 200-query condition, CPU/GPU query floating-point
+    differences do not explain a changed LLM input because they produced
+    byte-identical prompt context text.
+  - Process-to-process retrieval variation can change the actual compressed
+    context substantially and is therefore the stronger demonstrated source
+    of cross-run LLM-result variation. LLM inference nondeterminism remains a
+    separate possible source when prompts are identical.
+- open issues:
+  - Retrieval variation is intermittent and was not observed in every new
+    process, so its Chroma/HNSW root cause is not yet isolated.
+  - Existing evaluation outputs need retrieval-ID and final-prompt hashes to
+    attribute any particular old result difference conclusively.
+- next steps:
+  - Persist per-query ordered retrieval-ID hashes and final compressed-context
+    hashes in diagnostic/evaluation logs. Then classify differences as
+    retrieval, compression, or LLM inference without rerunning the pipeline.
+  - Diagnose why the default Chroma collection returns intermittent near-cutoff
+    neighbors across fresh processes.
+
+## 2026-07-23 - Verify GPU isolation of runtime ColBERT compression
+
+- objective:
+  - Confirm by execution, not only source inspection, that candidate-store
+    materialization uses GPU while current retrieval/query
+    encoding/region-scoring uses CPU before LLM inference.
+- what was changed:
+  - Added `test/verify_compression_cpu_only.py`, which runs retrieval and
+    compression without loading an LLM, records actual model/tensor devices,
+    instruments the MaxSim matmul inputs and output, checks PyTorch CUDA
+    initialization state, and polls `nvidia-smi` for its own PID.
+  - No source or evaluation logic was changed.
+- what was verified:
+  - The materialization entrypoint explicitly requests CUDA. The preceding
+    2,048-window document benchmark verified the actual encoder device as
+    `cuda:0` on the RTX A6000, so document candidate-store encoding is
+    empirically GPU-backed.
+  - On five HotpotQA splitlong180 queries with TOP_K=10 and R=0.15, without an
+    LLM:
+    - the runtime ColBERT encoder requested CPU, its actual device was CPU, and
+      every model parameter was on CPU;
+    - query vectors were CPU FP32;
+    - loaded candidate vectors were CPU FP16;
+    - both MaxSim inputs and its output were CPU FP32;
+    - `torch.cuda.is_initialized()` was false before setup and remained false
+      after all retrieval and compression;
+    - 84 successful `nvidia-smi` polls never observed the Python PID as an
+      NVIDIA compute process, with zero observed GPU memory.
+  - Full output is
+    `outputs/verify_hotpotqa_compression_cpu_only.json`.
+- interpretation:
+  - For the current `colbert_sliding_region` plus Chroma default-backend
+    configuration, GPU is used for offline candidate-store encoding and later
+    LLM execution, but not for online retrieval, ColBERT query encoding,
+    artifact loading, MaxSim, region ranking, or budget selection.
+  - This conclusion is configuration-specific. A CUDA-configured dense Chroma
+    backend or another compressor implementation could use GPU.
+- open issues:
+  - None for the measured configuration.
+- next steps:
+  - Keep this diagnostic available when changing retrieval backends or
+    compressor device policy.
+
+## 2026-07-23 - Diagnose hotpotqa-test2 artifact-format failure
+
+- objective:
+  - Identify why `grid_th_cases.yaml` failed while initializing
+    `colbert_sliding_region`.
+- what was changed:
+  - No code or configuration was changed.
+- what was verified:
+  - The failing case explicitly uses `DATA_SUBDIR=sent-default-512`, so runtime
+    correctly resolves
+    `/mnt/nvme1/datasets/longbench-hotpotqa/sent-default-512/colbert_window`.
+  - That artifact records legacy format
+    `matkv_official_colbert_doc_window_v1`, while the current reader requires
+    `colbert_window_artifact_v1` plus its current data sidecar and DB-manifest
+    reference. The format rejection is therefore intentional.
+  - The same grid's first case uses
+    `sent-default-512-splitlong180`; its current artifact passed
+    initialization, but the run later failed independently with LLM CUDA OOM
+    at `EVAL_BSZ=116`.
+  - The subsequent `sent-default-512` budget-1200 and budget-2400 cases both
+    fail before evaluation because they share the legacy artifact.
+- open issues:
+  - Decide whether the budget-1200/2400 cases are intended to use the original
+    `sent-default-512` DB, in which case its candidate store must be rebuilt,
+    or whether they should target splitlong180, in which case the cases'
+    `DATA_SUBDIR` values must change.
+  - The splitlong180 case's batch size needs reduction or separate OOM
+    mitigation.
+- next steps:
+  - Do not point one subdirectory at the other subdirectory's candidate store;
+    current DB-manifest validation is intended to reject that mismatch.
+
+## 2026-07-23 - Fix empty grid budget-controller values
+
+- objective:
+  - Fix ConditionalQA grid cases failing with
+    `ValueError: invalid literal for int() with base 10: ''`.
+- what was changed:
+  - `TokenBudgetMixin._initialize_token_budget()` now strips budget environment
+    values and treats empty/whitespace-only strings as unset.
+  - Added regression coverage for an empty `FINAL_TOKEN_BUDGET` paired with a
+    valid ratio and an empty ratio paired with a valid absolute budget.
+- what was verified:
+  - The failure came from `grid_conditionalqa.yaml`, which intentionally sets
+    both controller variables to empty strings in `fixed_env` to clear inherited
+    shell values, then supplies `RETAIN_TOKEN_RATIO` per case.
+  - `run/eval.sh` already treated the empty absolute budget as unset, but Python
+    passed the exactly-one check and later attempted `int("")`; the two layers
+    now agree.
+  - All 100 discovered unit tests passed. Black and `py_compile` checks passed
+    for the changed files.
+- evaluation/comparability impact:
+  - No budget calculation or selection behavior changed for non-empty values.
+    Previously crashing empty-controller configurations now use their one
+    non-empty controller as intended.
+- open issues:
+  - The failed ConditionalQA grid already recorded many failed cases and must
+    be relaunched to produce results.
+- next steps:
+  - Relaunch the grid; completed-result skipping will not treat failed rows as
+    successful.
+
+## 2026-07-24 - Remove selective document materialization option
+
+- objective:
+  - Remove the unused legacy `materialize_doc_ids_file` preprocessing axis.
+- what was changed:
+  - Removed `materialize_doc_ids_file` from the preprocessing CLI and
+    `DocumentPreprocessor` constructor.
+  - Removed its JSON payload loading, stored document-ID set, and the branch
+    that limited KV-cache and dense comparison-embedding writes to selected
+    filenames.
+  - Removed the now-unused `json` import from `materialize/materialize.py`.
+- what was verified:
+  - No source, test, or run-script references to `materialize_doc_ids_file` or
+    its internal state remain.
+  - Black and `py_compile` checks passed.
+  - All 100 discovered unit tests passed.
+- evaluation/comparability impact:
+  - Current preprocessing behavior is unchanged because no run/config call
+    site used this option. Preprocessing now always materializes enabled
+    outputs for every non-deduplicated document, which was already the default.
+  - Historical selective KV/dense materialization through this Fire-only
+    argument is no longer available.
+- open issues:
+  - None.
+- next steps:
+  - None.
+
+## 2026-07-23 - ConditionalQA coarse-256/window-180 evidence evaluation
+
+- objective:
+  - Build a ConditionalQA retrieval DB with coarse chunks of 256 source
+    tokens, reuse the 180-token sentence-subchunk/window policy, and evaluate
+    evidence coverage for `TOP_K=10,20`.
+- what was changed:
+  - `src/compressor/methods/colbert/region.py` now requires only
+    `retrieval_chunk_size > region_token_budget`. The previous additional
+    100-token buffer was an unsupported heuristic that prevented the intended
+    coarse-256/window-180 condition.
+  - Added a focused test that accepts 256/180 and still rejects 180/180.
+  - Artifact cacheable-ID mismatch errors now report both expected and runtime
+    IDs. The ConditionalQA diagnostic runner also adds query index and chunk
+    context to region-spec failures.
+  - Documented the evaluation/comparability effect in
+    `docs/eval_protocol.md`.
+- artifacts:
+  - Canonical output:
+    `/mnt/nvme1/datasets/conditionalqa/sent-default-256-splitlong180`.
+  - DB manifest: sentence splitter, default Chroma embedding,
+    `retrievable_chunk_size=256`, `max_subchunk_tokens=180`, Llama-3.1-8B
+    tokenizer, and document hash deduplication enabled.
+  - DB contains 4,461 retrievable chunks.
+  - ColBERT artifact was built on CUDA with `colbert-ir/colbertv2.0`:
+    652 documents, 31,808 cacheables, 943,452 center tokens, and 73 centers
+    exceeding the ColBERT document limit.
+  - The mistakenly quarantined duplicate directory
+    `sent-default-256-splitlong180.interrupted-corrupt-20260723` was permanently
+    deleted after the evaluation. The canonical DB and artifact were verified
+    to remain present.
+- what was verified:
+  - `python -m unittest discover -s test -p 'test_*.py' -v`: 92 tests passed.
+  - Black made no changes to the four touched Python files.
+  - Every result reports `requested_device=cpu` and `actual_device=cpu`.
+  - All 16 conditions selected zero duplicate source subchunks.
+  - Maximum source-subchunk length was exactly 180 source-tokenizer tokens.
+    Across retrieved structures the largest region was 216 ColBERT tokens and
+    241 source-span tokens. Across selected outputs the maxima were 194 ColBERT
+    tokens and 240 metric-tokenizer tokens. These bounded overages come from
+    tokenizer differences and the policy that preserves an individually long
+    center; no out-of-range source mapping was found.
+  - Fixed coarse retrieval:
+    - K=10: 2,406.908 context tokens, character recall 0.825481, token recall
+      0.825569, retrieval SHA-256 `96ff3c7a...`.
+    - K=20: 4,803.838 context tokens, character recall 0.893195, token recall
+      0.893417, retrieval SHA-256 `d1eca54b...`.
+  - Compressed results (`tokens / char recall / token recall / conditional
+    character retention`):
+    - K=10, r=0.125: q32-tail
+      `415.565 / 0.539838 / 0.539943 / 0.638691`; fixed128-full
+      `411.454 / 0.514191 / 0.514073 / 0.606552`.
+    - K=10, r=0.25: q32-tail
+      `758.937 / 0.685691 / 0.685814 / 0.816363`; fixed128-full
+      `757.284 / 0.652125 / 0.652197 / 0.772018`.
+    - K=10, r=0.5: q32-tail
+      `1442.373 / 0.786596 / 0.786658 / 0.933049`; fixed128-full
+      `1440.321 / 0.763221 / 0.763277 / 0.903668`.
+    - K=10, r=0.75: q32-tail
+      `2124.720 / 0.832408 / 0.832506 / 0.983912`; fixed128-full
+      `2122.985 / 0.820130 / 0.820184 / 0.969613`.
+    - K=20, r=0.125: q32-tail
+      `752.753 / 0.681693 / 0.681846 / 0.744887`; fixed128-full
+      `750.317 / 0.658936 / 0.659015 / 0.722047`.
+    - K=20, r=0.25: q32-tail
+      `1434.952 / 0.796621 / 0.796452 / 0.869151`; fixed128-full
+      `1436.376 / 0.758368 / 0.758403 / 0.828743`.
+    - K=20, r=0.5: q32-tail
+      `2795.631 / 0.871481 / 0.871539 / 0.954263`; fixed128-full
+      `2800.314 / 0.853170 / 0.853198 / 0.931246`.
+    - K=20, r=0.75: q32-tail
+      `4162.395 / 0.905527 / 0.905581 / 0.991349`; fixed128-full
+      `4159.941 / 0.902925 / 0.902979 / 0.988605`.
+- evaluation/comparability impact:
+  - Removing the 100-token guard enables a new valid configuration but does
+    not change region construction, scoring, or selection for existing
+    coarse-512/window-180 results.
+  - During diagnosis the runner was initially passed the new subdirectory only
+    through `DATA_SUBDIR`; its CLI `--data_subdir` therefore retrieved from the
+    default coarse-512 DB while the compressor opened the coarse-256 artifact.
+    This was the actual mismatch cause, not Chroma corruption. All results
+    recorded above were rerun with both selectors explicitly set to
+    `sent-default-256-splitlong180`.
+- open issues:
+  - q32-tail has higher evidence recall than fixed128-full at every matched
+    K/ratio point, but answer-generation quality and end-to-end latency have
+    not yet been measured for this coarse-256 condition.
+- next steps:
+  - Compare the complete coarse-256 curves with vanilla and coarse-512 curves
+    without nearest-point filtering, then choose any end-to-end LLM conditions
+    explicitly from the evidence/length trade-off.
+
+## 2026-07-23 - Add ConditionalQA end-to-end grid configuration
+
+- objective:
+  - Prepare one reproducible 8B/q32-tail grid covering the existing
+    ConditionalQA vanilla and splitlong180 DBs.
+- what was changed:
+  - Added `run/grid_search/grid_conditionalqa.yaml`.
+  - The grid contains 22 explicit cases: six vanilla cases for coarse
+    128/256/512 and K=10/20, plus 16 ColBERT sliding-region cases for coarse
+    256/512, K=10/20, and retained ratios 0.125/0.25/0.5/0.75.
+  - It fixes all 271 queries, Llama-3.1-8B-Instruct, cache-off evaluation,
+    q32 with left-side truncation, and no adaptive query minimum.
+  - `grid_matkv4.yaml` was already absent, so no file was deleted. Existing
+    Qasper grid files were left unchanged.
+- what was verified:
+  - The YAML parses successfully and contains exactly 22 valid cases.
+  - All five referenced DBs and both referenced ColBERT artifacts exist.
+  - `git diff --check` passes for the new file.
+- evaluation/comparability impact:
+  - This adds configuration only. Dataset handling, prompts, retrieval,
+    compression, generation, and scoring code were not changed.
+- open issues:
+  - `src/acc_metric.py` does not yet register a `conditionalqa` evaluator.
+    Running this end-to-end grid now would complete generation but fail at the
+    final EM/F1 stage. Implement and test the previously selected official
+    ConditionalQA answer-only matching metric before launching the grid.
+- next steps:
+  - Add the official answer-only ConditionalQA evaluator with focused tests and
+    document its comparability policy, then smoke-test one grid case before the
+    full 22-case run.
+
+## 2026-07-23 - Implement official ConditionalQA answer-only EM/F1
+
+- objective:
+  - Make the ConditionalQA end-to-end grid scoreable without inventing a new
+    metric or treating distinct official answers as aliases.
+- what was changed:
+  - Registered `conditionalqa` in `src/acc_metric.py` with
+    `ConditionalQAAnswerOnlyEvaluator`.
+  - Ported the answer EM/F1 path from the official ConditionalQA evaluator at
+    upstream commit `77bd295952daf415548b3244db10880d3d55cfe0`.
+  - Preserved the official normalization, missing-answer padding, optimal
+    permutation matching, per-answer averaging, and exponential
+    extra-prediction discount.
+  - Omitted only condition scoring because the local RAG conversion
+    intentionally stores answer texts without ConditionalQA condition labels.
+  - Added `test/test_conditionalqa_metric.py` and documented the protocol in
+    `docs/eval_protocol.md`.
+- answer provenance:
+  - DAPR supplies the 271 test queries, 652 reconstructed documents, and qrel
+    evidence passages.
+  - Answer texts are not taken from DAPR qrels. The converter joins each DAPR
+    query `_id` to official ConditionalQA `v1_0/dev.json`, requires the DAPR
+    text to exactly equal official `scenario + question`, and copies every
+    official `answers[i][0]`.
+  - Query, answer, and evidence-label local IDs are then checked for exact
+    alignment. The current 271-query answer file has 58 multi-answer records
+    and no empty answer lists.
+- prediction representation:
+  - The current LLM interface emits one free-form prediction string, so it is
+    passed to the official formula as one predicted answer with no conditions.
+  - Empty output is no predicted answer. No comma, newline, conjunction, or
+    other heuristic splitting was added.
+  - Therefore a correct single answer for a record with N distinct official
+    answers scores at most 1/N. Structured multi-answer generation would be a
+    separate prompt/output protocol.
+- what was verified:
+  - Seven focused unit tests cover registration, official normalization,
+    partial F1, missing answers, optimal permutation, extra-answer discount,
+    empty references, and strict local answer shape.
+  - The implementation matched the downloaded official evaluator exactly on
+    all 7,225 combinations of prediction/reference lists of length zero through
+    three over a four-string vocabulary.
+  - On all 271 local records, predicting only the first official answer gives
+    EM=F1=`0.8703567035670356`, exactly equal to the mean official `1/N`
+    missing-answer penalty; 58 records have N greater than one.
+  - Downloaded `v1_0/dev.json` at the pinned upstream commit and rejoined all
+    271 current local rows. Every source ID, `scenario + question`, complete
+    ordered answer-text list, local answer record, and evidence-label answer
+    copy matched exactly.
+  - Full unit suite: 99 tests passed.
+- evaluation/comparability impact:
+  - ConditionalQA can now complete the scoring stage of
+    `run/grid_search/grid_conditionalqa.yaml`.
+  - No existing dataset evaluator changed. ConditionalQA scores are not
+    directly comparable to LongBench alias-max scoring because its answer list
+    contains jointly required distinct answers.
+- open issues:
+  - The generic prompt asks for one shortest answer phrase. It cannot receive
+    full credit on multi-answer ConditionalQA records even if it returns one
+    correct answer. This is documented rather than hidden by an invented output
+    parser.
+- next steps:
+  - Run one ConditionalQA grid smoke case to confirm generation-file scoring
+    integration before launching all 22 cases.
+
+## 2026-07-23 - Audit ConditionalQA vanilla DBs after 512-token F1 inversion
+
+- objective:
+  - Determine whether vanilla-512's slightly higher answer F1 than vanilla-256
+    came from an incorrectly built sentence/subchunk retrieval DB.
+- what was changed:
+  - No code, DB, artifact, or evaluation result was changed. This was a
+    read-only audit.
+- what was verified:
+  - All three manifests use `splitter=fixed_size`, matching
+    cacheable/retrievable sizes 128, 256, and 512, no `max_subchunk_tokens`, the
+    same default 384-dimensional Chroma backend, and all 652 parent documents.
+  - Actual Chroma rows are 8,668/4,478/2,400 for 128/256/512. Every row has
+    `cache_unit=token`; the 512 rows have `chunk_size=512`, empty
+    `sentence_ids`, and exactly one full fixed-chunk cacheable.
+  - Fixed-size content maxima are 127/255/511 tokens because one prompt-visible
+    newline-suffix token is reserved. Starts are contiguous (for example,
+    0/511/1022 for size 512), so this is the intended visible-budget policy,
+    not overlap or subchunk retrieval.
+  - End-to-end vanilla F1:
+    - K=10: size 256 = 0.415521, size 512 = 0.423442; delta = +0.007920.
+    - K=20: size 256 = 0.465622, size 512 = 0.471685; delta = +0.006063.
+  - Query-level paired comparisons:
+    - K=10: 512 wins 62, loses 52, ties 157.
+    - K=20: 512 wins 49, loses 54, ties 168.
+  - A 10,000-sample paired query bootstrap with seed 20260723 gives delta
+    intervals `[-0.0398, 0.0565]` for K=10 and `[-0.0370, 0.0484]` for K=20.
+    The observed F1 advantage is therefore small and not a stable separation.
+  - Gold-answer token-sequence presence must exclude yes/no questions: 143 of
+    271 records have a yes/no gold, for which seeing the literal word in a
+    prompt does not establish answer evidence. On the 128 extractive records:
+    - K=10 macro per-answer containment is 0.8992 for 256 vs 0.9211 for 512;
+      all required answers are present for 112 vs 117 queries.
+    - K=20 macro per-answer containment is 0.9367 vs 0.9563; all required
+      answers are present for 118 vs 122 queries.
+    - Extractive-answer F1 is 0.3987 vs 0.4096 at K=10 and 0.3897 vs 0.4063 at
+      K=20. This agrees with the answer-containment ordering even though DAPR
+      passage-character recall favors 256.
+- interpretation:
+  - DAPR evidence character recall measures coverage of all labeled passage
+    characters. It is not answer-string recall and does not guarantee that the
+    LLM receives the best local reasoning context. For ConditionalQA, report
+    normalized answer-string containment on the extractive subset alongside
+    evidence coverage; retain evidence coverage for yes/no questions and as the
+    provenance-aware metric.
+  - A more mechanism-relevant explanation than answer containment is
+    query-level evidence-set completeness:
+    - At K=10, 256 touches any evidence in 245/271 queries versus 229/271 for
+      512, but covers every gold passage by at least 0.8 in 194 versus 207.
+      Conditional on touching evidence, completeness is 79.2% versus 90.4%.
+    - At K=20, any-evidence counts are 258 versus 243, while all-evidence counts
+      are 222 versus 226; conditional completeness is 86.0% versus 93.0%.
+    - Mean worst-passage coverage per query is 0.7282 versus 0.7648 at K=10
+      and 0.8303 versus 0.8345 at K=20.
+  - Thus 256 has higher gold-evidence hit breadth, which raises average
+    character recall, whereas 512 uses fewer retrieval opportunities but
+    returns a more complete evidence bundle and longer local context when it
+    hits. This trade-off is consistent with the near-tied F1 ordering.
+  - Completeness is not a complete causal explanation: at K=20, queries that
+    newly become complete under 512 do not individually show a positive mean
+    F1 delta. The total F1 gap remains inside the paired-bootstrap interval.
+    Treat completeness as the strongest evidence-side diagnostic, not proof
+    that 512 is intrinsically better.
+  - At the same K, 512 uses far more text: 4,558 vs 2,508 model-input tokens at
+    K=10 and 9,011 vs 4,902 at K=20. Its larger neighborhoods more often contain
+    answer strings despite lower total labeled-evidence character coverage.
+  - Input-length efficiency still favors 256; the small raw-F1 difference does
+    not indicate a malformed DB.
+- next steps:
+  - Compare subchunk points against both vanilla curves using input length and
+    answer F1 jointly rather than treating evidence character recall as a
+    monotonic proxy for generation quality.
+
+## 2026-07-23 - Add evidence-set completeness metrics and rescore subchunk outputs
+
+- objective:
+  - Add the query-level evidence completeness diagnostics identified by the
+    vanilla 256/512 analysis and recover them for existing q32-tail subchunk
+    experiments without rerunning retrieval or compression.
+- what was changed:
+  - `src/evidence_coverage.py` now records, for retrieval and compression:
+    - `any_evidence_char_coverage`;
+    - `all_evidence_char_recall_at_threshold`;
+    - `worst_passage_char_recall`;
+    - aggregate `all_evidence_recall_given_any`.
+  - Existing evidence character/token recall, passage recall, conditional
+    retention, source mapping, and output detail fields are unchanged.
+  - Added focused assertions in `test/test_evidence_coverage.py` and documented
+    the fields in `docs/eval_protocol.md`.
+- evaluation/comparability impact:
+  - This is an additive summary change. It does not change retrieval,
+    compression, thresholds, source spans, or any pre-existing metric, so old
+    and new values for existing metrics remain directly comparable.
+  - Existing detail JSONL already stores every per-passage coverage value, so
+    all coarse-256/512 q32-tail results were recomputed exactly by
+    post-processing; no experiment rerun was needed.
+- what was verified:
+  - Focused evidence tests passed.
+  - Full unit suite: 100 tests passed.
+  - At low/mid ratios, coarse-512 generally has higher all-evidence
+    completeness. At K=20 and ratios 0.5/0.75, coarse-256 slightly exceeds
+    coarse-512 while using substantially fewer tokens.
+- open issues:
+  - Existing summary JSON files do not contain the newly added keys because
+    they were produced before this code change. Values were recovered from
+    their immutable detail JSONL. Rerunning only the summary aggregation or
+    writing a dedicated migration utility would be needed to persist the keys
+    into those old summary files.
+- next steps:
+  - Use all-evidence@0.8 and worst-passage coverage alongside input length,
+    standard evidence recall, and final answer F1 when selecting paper points.
+
+## 2026-07-24 - Diagnose weak ConditionalQA subchunk answer F1
+
+- objective:
+  - Explain why `conditionalqa-q32-tail-0723` subchunk points underperform the
+    vanilla answer-F1 curve despite strong labeled-evidence recall.
+- what was changed:
+  - No code or evaluation logic was changed.
+  - Added this analysis record only.
+- what was verified:
+  - All 22 grid points completed successfully; the weakness is not a failed or
+    partially scored run.
+  - ConditionalQA is dominated by yes/no questions (143/271). Among the 135
+    single-answer yes/no examples, vanilla-512/K=20 and subchunk-512/K=20/r=0.5
+    start with the correct yes/no almost equally often (85 vs 84), but exact
+    terse yes/no outputs fall from 70 to 55. Mean normalized answer length rises
+    from 3.50 to 4.89 tokens.
+  - A diagnostic that canonicalizes only leading yes/no predictions changes
+    vanilla-512/K=20 vs subchunk-512/K=20/r=0.5 from 0.4717 vs 0.4146 official
+    F1 to 0.5187 vs 0.5063. For coarse-256/K=20/r=0.75 it changes 0.4656 vs
+    0.4292 to 0.5162 vs 0.5150. This diagnostic is not an official metric and
+    must not replace reported ConditionalQA F1 silently.
+  - q32-tail has room for 29 content WordPieces. It retains only about 15.5
+    tokens, or 40%, of the scenario on average. Fixed-128/full improves
+    yes/no compressed evidence char recall from 0.8380 to 0.8640 and
+    all-evidence@0.8 from 0.7762 to 0.8252 on the paired retrieval output.
+  - Coarse-512/K=20/r=0.5 preserves all labeled evidence at threshold 0.8 for
+    78.2% of queries. Even among the 212 queries with complete character
+    coverage, official F1 remains sensitive to verbose answer form; a
+    leading-yes/no diagnostic reduces the residual gap to about 0.015.
+  - Increasing coarse-512/K=20 from r=0.5 to r=0.75 raises all-evidence@0.8
+    from 0.7823 to 0.8266 but lowers official F1 from 0.4146 to 0.4039 while
+    increasing prompt fragments from 50.6 to 78.2 per query. This supports
+    hard-distractor/output-style overload rather than simple evidence loss.
+  - Exact repeated region texts occur in 11.8% of r=0.5 and 16.2% of r=0.75
+    coarse-512/K=20 prompts. Exact duplicate characters are only 0.33% and
+    0.41% overall, but repeated 8-gram token coverage is higher than vanilla
+    (13.65% vs 11.91% at r=0.5). Deduplication currently keys on subchunk ID,
+    so overlapping coarse chunks can retain the same parent source text under
+    different IDs.
+  - Region output is source-ordered inside each coarse chunk and coarse groups
+    remain in retrieval order. No region-ordering or non-contiguity bug was
+    found in this diagnosis.
+- open issues:
+  - The user confirmed that the grid YAML was intentionally modified after the
+    run. The completed `conditionalqa-q32-tail-0723` outputs were produced with
+    query maxlen 32 and left truncation, so their query policy is no longer an
+    open provenance question.
+  - Parent-document source-span deduplication across overlapping retrieved
+    coarse chunks is not implemented.
+- next steps:
+  - Run a paired LLM grid with fixed-128/full and q32-tail using an immutable
+    saved grid/environment manifest.
+  - Separately test a ConditionalQA-compatible answer-output contract on every
+    baseline and method; do not compare it directly with the existing prompt.
+  - Evaluate parent-document source-span deduplication as an isolated change.
+
+## 2026-07-24 - Identify completed ConditionalQA fixed-128/full grid
+
+- objective:
+  - Determine whether `conditionalqa-q32-tail-0723-2` is the requested
+    fixed-128/full query-encoding experiment.
+- what was changed:
+  - No code or evaluation logic was changed.
+- what was verified:
+  - The saved run manifest records `COLBERT_QUERY_MAXLEN=128`,
+    `COLBERT_QUERY_MINLEN=""`, and
+    `COLBERT_QUERY_TRUNCATION_SIDE=right`.
+  - Because query minlen is unset, the encoder retains the checkpoint's full
+    fixed 128 positions, including MASK expansion; this is fixed-128/full, not
+    adaptive-128.
+  - The 128-position layout permits 125 content WordPieces after ColBERT query
+    special tokens. Of the 271 ConditionalQA queries, 269 fit completely and
+    only two exceed that content capacity.
+  - All eight coarse-512 subchunk cases completed successfully. The stale
+    `q32_tail` preprocess/output label is naming only and does not describe the
+    saved environment.
+- open issues:
+  - The fixed-128/full run name and output filenames are misleading and should
+    not be reused as paper-facing labels.
+- next steps:
+  - Compare its query-level predictions directly against the original q32-tail
+    run, especially separating answer-format changes from semantic changes.
+
+## 2026-07-24 - Clarify ConditionalQA multi-answer evaluation semantics
+
+- objective:
+  - Determine whether the current one-string generation protocol matches the
+    official ConditionalQA task and contrast it with the LongBench QA protocol.
+- what was changed:
+  - No code or evaluation logic was changed.
+- what was verified:
+  - ConditionalQA reference answers are a required unordered set, not aliases.
+    The official scorer finds the best permutation between predicted and gold
+    answer lists, averages pairwise EM/token-F1 over the number of gold answers,
+    assigns zero credit to missing entries, and exponentially penalizes excess
+    predicted answers.
+  - The 271-query DAPR-aligned subset contains 213 one-answer, 30 two-answer,
+    14 three-answer, 8 four-answer, and 6 five-answer examples. A system that
+    is structurally restricted to one perfectly chosen answer has a maximum
+    average answer F1 of 0.8703567 on this subset.
+  - The current prompt asks for a singular shortest answer and the current
+    ConditionalQA evaluator wraps the whole generated string as a one-element
+    predicted-answer list. It does not parse multiple generated answers.
+  - This is comparable to the original paper's ETC and DocHopper baselines,
+    which explicitly restricted prediction to one answer. The original FiD
+    baseline instead generated a serialized sequence of every answer followed
+    by its conditions and performed better on extractive questions partly
+    because it could predict multiple answers.
+  - LongBench HotpotQA, 2WikiMQA, MuSiQue, Qasper, and NarrativeQA treat their
+    `answers` entries as alternative acceptable references and take the maximum
+    score over them. Their official prompts ask for one concise answer. That
+    list semantics is different from ConditionalQA's required answer set.
+- open issues:
+  - A paper protocol decision is required: either implement structured
+    multi-answer generation and parsing for all 271 queries, explicitly report
+    a one-answer-restricted protocol, or evaluate QA only on the predefined
+    213-query single-answer subset.
+  - Any prompt/parser change requires rerunning every vanilla and subchunk
+    condition and makes the new answer results not directly comparable with
+    the existing grid.
+- next steps:
+  - Document the selected ConditionalQA output contract before further LLM
+    runs and add tests for multi-answer parsing if the full official task is
+    selected.
+
+## 2026-07-24 - Reassess DAPR datasets for factoid QA compression
+
+- objective:
+  - Identify a DAPR alternative to ConditionalQA that better matches
+    fact-seeking QA while retaining long parent documents and passage qrels.
+- what was changed:
+  - No code, data, or evaluation logic was changed.
+- what was verified:
+  - DAPR contains five full datasets: MS MARCO, Natural Questions, MIRACL,
+    Genomics, and ConditionalQA, plus the NQ-hard analysis subset.
+  - Natural Questions is the closest match to the intended experiment. It is
+    fact-seeking QA, and DAPR provides 3,610 test queries, 108,626 parent
+    documents, 2,682,017 passages, and passage qrels. The paper reports 24.7
+    passages per document and 105.5 words per passage on average, so the parent
+    documents are comfortably long enough to exercise 512-token coarse
+    chunking.
+  - DAPR itself stores retrieval queries, documents/passages, and qrels rather
+    than QA answer strings. Final answer evaluation for DAPR-NQ therefore
+    requires a verified join to the original NQ answer annotations.
+  - MS MARCO is another QA-derived option but is much larger and its DAPR
+    construction has incomplete paragraph segmentation and discards roughly
+    half of QA pairs whose source passage could not be matched to the crawled
+    document.
+  - MIRACL and Genomics are appropriate for retrieval evaluation but do not
+    provide a directly usable factoid-answer endpoint in DAPR. NQ-hard is a
+    deliberately failure-selected stress subset and should not be the primary
+    benchmark.
+- open issues:
+  - Verify the exact DAPR-NQ-to-original-NQ identifier mapping before creating
+    answer labels; do not assume that query text matching is sufficient.
+  - DAPR-NQ is an official pooled corpus assembled from gold-relevant NQ
+    passages, not full-Wikipedia open-domain retrieval, and must be described
+    accordingly.
+- next steps:
+  - Inspect the DAPR-NQ query IDs and original NQ identifiers, then estimate
+    local DB/artifact cost before deciding whether to preprocess the full
+    corpus.
+
+## 2026-07-24 - Validate DAPR-NQ join and estimate 512-chunk artifact size
+
+- objective:
+  - Verify whether DAPR Natural Questions test queries can be joined safely to
+    original NQ answer annotations and estimate preprocessing scale under the
+    current sentence/splitlong180, 512-token coarse-chunk protocol.
+- what was changed:
+  - No source code, dataset output, or evaluation protocol was changed.
+  - Downloaded analysis-only copies of the DAPR-NQ queries, qrels, and parent
+    documents plus an original simplified NQ dev mirror under
+    `/mnt/nvme1/datasets/.hf_cache_dapr_nq` and
+    `/mnt/nvme1/datasets/.hf_cache_original_nq`.
+- what was verified:
+  - DAPR IDs such as `dev-2` are not original NQ opaque `example_id` values and
+    are not a single-offset mapping to original dev row numbers.
+  - All 3,610 DAPR-NQ test query strings have exactly one exact match among the
+    7,830 original NQ dev questions; none are absent or ambiguous, and the
+    matched rows have 3,610 unique original `example_id` values.
+  - Of 4,379 DAPR qrel passages, 4,369 have at least 0.95 normalized
+    character-sequence similarity to an annotated original-NQ long-answer
+    paragraph. Most non-exact cases differ only in citation rendering. Ten are
+    below 0.95, including several visibly truncated or mojibake-corrupted DAPR
+    passages, so evidence text should come from DAPR qrels while answer labels
+    should come from the matched original NQ row.
+  - Only 2,982/3,610 matched rows have any short-answer or yes/no annotation;
+    2,311/3,610 have such an answer from at least two of the five dev
+    annotators. A factoid QA subset therefore needs an explicit answer
+    consensus rule rather than treating all DAPR-NQ queries as answerable.
+  - Serializing every DAPR parent document as
+    `title + "\n" + passages joined by "\n\n"` produces 108,626 distinct
+    documents and 278,693,385 Llama-3.1-8B-Instruct tokens. Exact SHA-256
+    deduplication removes zero documents.
+  - Non-overlapping 512-token coarse chunking produces exactly 600,655 chunks.
+    Document token lengths are mean 2,565.6, p50 1,382, p75 3,221, p90 6,453,
+    p95 9,162.5, p99 15,677.25, and max 89,393.
+  - A fixed-seed (`20260724`) uniform 3,000-document sample, processed with the
+    current sentence parser, splitlong180 policy, ColBERT tokenizer, and
+    punctuation mask, estimates 8,386,447 cacheable subchunks (95% bootstrap
+    interval 8,310,652--8,469,430) and 235,022,017 stored center tokens
+    (234,501,516--235,556,922).
+  - The center-token counter was calibrated on four existing artifacts and
+    differed from their actual counts by only 0.05--0.10%.
+  - At 128-dimensional FP16, estimated vector payload is 60.17 GB. Using the
+    observed compact-index overhead from the four existing artifacts, the
+    complete ColBERT artifact is about 63.04 GB / 58.71 GiB, with a sampling
+    interval of approximately 62.88--63.21 GB. Allow modest extra margin for
+    longer NQ identifiers and JSON serialization.
+- open issues:
+  - Decide whether the paper-facing QA set should use the 2,311-query
+    two-annotator-consensus subset, a different official NQ answerability rule,
+    or retrieval/evidence metrics on all 3,610 queries.
+  - The ten low-similarity DAPR/original evidence cases need manual review
+    before producing a final answer-label manifest.
+- next steps:
+  - If DAPR-NQ is selected, implement a reproducible converter that stores both
+    DAPR IDs and original NQ `example_id`, preserves DAPR qrel evidence text,
+    records the chosen answer-consensus policy, and validates every serialized
+    evidence span.
+
+## 2026-07-24 - Clarify DAPR-NQ scale and annotation counts
+
+- objective:
+  - Explain the runtime impact of the larger NQ artifact and disambiguate the
+    7,830/3,610 and five-annotator counts.
+- what was changed:
+  - No source code or evaluation behavior was changed.
+- what was verified:
+  - Original NQ dev has 7,830 questions and five independent annotations per
+    question. DAPR filters that source split to 3,610 questions with paragraph
+    long answers and uses the filtered set as its test queries.
+  - The prior 3,610/3,610 statement means that every DAPR query found exactly
+    one match when searched against all 7,830 original questions; it does not
+    mean that matching itself reduced 7,830 to 3,610.
+  - The two-annotator threshold is the official NQ non-null consensus
+    threshold (`beta=2`), not a DAPR annotation count. It determines whether a
+    question has a non-null short/yes-no gold answer under the original NQ
+    protocol.
+  - Runtime vectors are memory-mapped and only slices for retrieved chunks are
+    read. With 512-token chunks, expected vector reads are roughly 1.1 MB/query
+    at K=10 and 2.2 MB/query at K=20, so steady-state compression compute does
+    not scale with the full 63 GB artifact.
+  - The current metadata design does scale poorly: `data/index.json` is parsed
+    completely at startup. Existing artifacts use about 2.40--2.44 bytes of
+    Python object memory per JSON byte. The estimated 2.77 GB NQ data index
+    would therefore require roughly 6.6--6.8 GB of Python heap, plus other
+    runtime state, and likely tens of seconds to minutes of startup parsing.
+  - NQ has 600,655 retrieval chunks versus roughly 2.8K--5.8K in the current
+    LongBench corpora. The larger HNSW/Chroma search space is more likely to
+    increase end-to-end retrieval latency than the memory-mapped ColBERT
+    MaxSim stage, although the increase must be measured after building the
+    actual DB.
+- open issues:
+  - Before full NQ inference, replace the monolithic JSON metadata with a
+    keyed/lazy or binary memory-mapped representation; the FP16 vector file
+    itself can remain memory-mapped.
+  - Benchmark cold- and warm-cache compression separately because a 60 GB
+    vector file will not remain fully resident in page cache.
+- next steps:
+  - Decide the NQ answer protocol first, then prototype lazy metadata lookup
+    before committing to the full DB/artifact build.
+
+## 2026-07-24 - Check qrels for the NQ short-answer consensus subset
+
+- objective:
+  - Verify that the 2,311 DAPR-NQ queries satisfying the original NQ
+    two-annotator short/yes-no consensus rule also have DAPR qrels, and check
+    whether extractive short answers occur in the qrel passages.
+- what was changed:
+  - No code, dataset, or evaluation protocol was changed.
+- what was verified:
+  - All 2,311 consensus-subset queries have at least one DAPR qrel: 2,916 qrels
+    in total, mean 1.262 and range 1--4 per query.
+  - These are long-answer/relevant-passage qrels, not annotations of the short
+    answer string itself. Short/yes-no labels remain external annotations from
+    original NQ.
+  - The subset contains 2,234 extractive-only, 72 yes/no-only, and 5
+    mixed-annotation queries.
+  - Among the 2,239 queries with at least one extractive annotation, 2,202 have
+    at least one annotator's complete short-answer span set literally contained
+    in the DAPR qrel passage text after Unicode/punctuation normalization.
+    Thirty-seven do not, due to passage truncation, snapshot/text differences,
+    mojibake, or divergent evidence/answer formulations.
+  - String containment is inapplicable to the 72 yes/no-only queries because
+    their qrels provide evidence from which yes/no must be inferred.
+- open issues:
+  - A strict text-grounded concise-answer subset could use the 2,202 verified
+    extractive queries. Including yes/no questions requires preserving their
+    inference-based semantics and ideally manually checking the 72 qrels.
+- next steps:
+  - Choose between the official 2,311-query short-answer protocol and a stricter
+    2,202-query literal-extractive protocol before generating a local dataset.
+
+## 2026-07-24 - Remove legacy dense comparison artifacts
+
+- objective:
+  - Remove persisted `compare_embed.pt` artifacts before adopting the clearer
+    `dense_embed` terminology without a legacy compatibility layer.
+- what was changed:
+  - Permanently deleted all 21 files named `compare_embed.pt` under
+    `/mnt/nvme1/datasets`.
+  - Empty parent directories were left untouched.
+- what was verified:
+  - No `compare_embed.pt` or `dense_embed.pt` files remain under
+    `/mnt/nvme1/datasets`.
+  - No source code or evaluation behavior was changed in this step.
+- open issues:
+  - The source, CLI arguments, environment variables, run configurations,
+    artifact filename, and artifact format identifier still use
+    `compare_embed` terminology.
+- next steps:
+  - Rename the complete dense materialization interface to `dense_embed` in one
+    coordinated change and rebuild any dense artifacts needed by experiments.
+
+## 2026-07-24 - Rename dense artifact interface to `dense_embed`
+
+- objective:
+  - Replace the misleading `compare_embed` terminology with `dense_embed`
+    throughout the active code and experiment interface after removing all
+    legacy artifacts.
+- what was changed:
+  - Renamed the materializer class to `DenseEmbeddingWriter` and all
+    preprocessing parameters/state from `compare_embed` to `dense_embed`.
+  - Replaced the runtime and script environment variables with
+    `DENSE_EMBED_DIR`, `DENSE_EMBED_MODEL`, `DENSE_EMBED_DEVICE`,
+    `DENSE_EMBED_BATCH_SIZE`, `DENSE_EMBED_OVERWRITE`, and
+    `MATERIALIZE_DENSE_EMBEDS`.
+  - Changed the artifact contract to filename `dense_embed.pt` and format ID
+    `dense_embed_single_v1`.
+  - Updated run scripts, affected grid configurations, tests, README, active
+    documentation, and the analysis notebook to use the new terminology and
+    default `dense_embed/` directory.
+  - Added a unit test that checks the materializer filename and compressor
+    reader format contract.
+  - Intentionally added no aliases or fallback support for the removed names.
+- what was verified:
+  - A repository-wide search outside historical handoff notes found no
+    remaining `compare_embed`-related code or configuration references.
+  - Black formatting, shell syntax checks, YAML parsing, notebook JSON parsing,
+    and `git diff --check` passed.
+  - `python -m unittest discover -s test -p 'test_*.py'` passed all 101 tests.
+  - No scoring, retrieval, prompt, token-budget, or selection logic changed.
+- open issues:
+  - There are currently no dense embedding artifacts under
+    `/mnt/nvme1/datasets`; dense experiments will fail until the required
+    dataset artifacts are rebuilt with the new interface.
+- next steps:
+  - Run `run/preprocess.sh` with `MATERIALIZE_DENSE_EMBEDS=True` for each
+    dataset/subdirectory needed by a dense baseline experiment.
+
+## 2026-07-24 - Extract the shared DB cacheable reader
+
+- objective:
+  - Complete the first behavior-preserving step toward moving dense artifact
+    construction out of preprocessing and into candidate-store materialization.
+- what was changed:
+  - Added `materialize/db_cacheables.py` with public read-only
+    `iter_db_cacheables` and `iter_db_cacheable_groups` functions.
+  - Moved the existing Chroma SQLite queries out of
+    `materialize/colbert_materializer.py` without changing their SQL,
+    `order by e.id` ordering, pagination, payload decoding, or filtering.
+  - Updated ColBERT artifact validation, document-ID discovery, and region
+    metadata construction to use the shared reader.
+  - Updated the sentence-concatenation rerank analysis utility to import the
+    shared group reader instead of the removed ColBERT-private helper.
+  - Added SQLite-fixture tests for flat iteration order, retrieval-group
+    boundaries, non-dict payload filtering, pagination, and missing-DB errors.
+  - Updated the codebase guide to make this the shared DB-facing boundary for
+    candidate-store materializers.
+- what was verified:
+  - Black formatting, Python compilation, and `git diff --check` passed.
+  - `python -m unittest discover -s test -p 'test_*.py'` passed all 104 tests.
+  - No dense materialization, preprocessing, candidate-store entrypoint,
+    scoring, selection, or evaluation behavior changed.
+- open issues:
+  - Dense artifact construction is still coupled to `DocumentPreprocessor`.
+- next steps:
+  - Add a dense candidate-store builder that consumes the shared DB reader,
+    deduplicates cacheables by stable ID with conflict validation, and produces
+    deterministic document groups before changing any entrypoint.
+
+## 2026-07-24 - Add the DB-based dense artifact builder
+
+- objective:
+  - Complete the second isolated step toward moving dense artifact construction
+    into candidate-store materialization without changing current entrypoints.
+- what was changed:
+  - Added `build_dense_embedding_artifact_from_db` to
+    `materialize/dense_materializer.py`.
+  - The builder reads persisted cacheables through the shared DB reader,
+    deduplicates overlap repetitions by stable cacheable ID, and rejects
+    duplicate IDs whose full serialized payloads differ.
+  - Non-empty cacheables must have a source `parent_doc_id`; documents are
+    ordered by ID and their cacheables by source token start plus stable ID
+    before they are passed to the existing `DenseEmbeddingWriter`.
+  - Existing artifacts are left untouched when `overwrite=False`, before a
+    model is initialized or the DB is scanned.
+  - Added focused tests for deterministic grouping, valid overlap
+    deduplication, conflicting duplicate rejection, missing parent document
+    rejection, and existing-artifact skip behavior.
+- what was verified:
+  - Full metadata scans succeeded on the main HotpotQA and 2Wiki
+    `sent-default-512-splitlong180` DBs with no conflicting duplicate payloads.
+    HotpotQA had 77,065 cacheable occurrences and 73,085 unique cacheables;
+    2Wiki had 31,702 occurrences and 30,309 unique cacheables.
+  - Black formatting, Python compilation, and `git diff --check` passed.
+  - `python -m unittest discover -s test -p 'test_*.py'` passed all 108 tests.
+  - The builder is not called by preprocessing or the candidate-store
+    entrypoint yet, so experiment behavior did not change.
+- open issues:
+  - `DocumentPreprocessor` remains the only active caller of
+    `DenseEmbeddingWriter`.
+  - The generic candidate-store entrypoint is still ColBERT-only.
+- next steps:
+  - Add an explicit dense/ColBERT backend interface to
+    `entrypoint/materialize_candidate_store.py` and its run script, while
+    retaining the current ColBERT defaults until that dispatch is verified.
+
+## 2026-07-24 - Add candidate-store backend dispatch
+
+- objective:
+  - Connect the DB-based dense builder to the candidate-store workflow without
+    yet removing the existing preprocessing path.
+- what was changed:
+  - Added an explicit `backend=colbert|dense` dispatch to
+    `entrypoint/materialize_candidate_store.py`; `colbert` remains the default
+    so existing keyword-based invocations preserve their behavior.
+  - Kept the ColBERT CUDA device, disabled tensorization verification, region
+    metadata construction, and optional DB validation unchanged.
+  - The dense branch calls only `build_dense_embedding_artifact_from_db`, with
+    BGE-M3 and batch size 128 as backend-specific defaults.
+  - Dense candidate materialization now derives `sentence` versus `token`
+    artifact metadata from the DB manifest splitter unless an internal caller
+    explicitly supplies the unit.
+  - Updated `run/materialize_candidate_store.sh` with
+    `CANDIDATE_STORE_BACKEND`, backend-specific output/model/batch/overwrite
+    variables, argument lists, and an error for unsupported backend names.
+  - Updated README and the codebase guide with both candidate-store commands
+    and the temporary transition state.
+- what was verified:
+  - Added tests proving the dense branch does not invoke ColBERT discovery or
+    build functions, unknown backends fail, the omitted backend still takes the
+    existing ColBERT path, and manifest splitters map to the expected dense
+    cache unit.
+  - Black formatting, Python compilation, shell syntax, and
+    `git diff --check` passed.
+  - `python -m unittest discover -s test -p 'test_*.py'` passed all 111 tests.
+  - No retrieval, compression, scoring, prompt, or evaluation logic changed.
+- open issues:
+  - Dense materialization is available through both preprocessing and the
+    candidate-store entrypoint during this transition.
+  - `materialize_candidate_store.py --help` currently fails inside Fire's
+    IPython inspector on Python 3.13 because the installed inspector requires a
+    `theme_name`; normal CLI argument parsing reaches the new backend dispatch
+    correctly.
+- next steps:
+  - Remove `DenseEmbeddingWriter` ownership and all dense materialization
+    options from `DocumentPreprocessor`, `entrypoint/preprocess.py`, and
+    `run/preprocess.sh`, then verify that DB preprocessing output is unchanged.
+
+## 2026-07-24 - Remove dense materialization from preprocessing
+
+- objective:
+  - Finish the responsibility split so preprocessing produces only the
+    retrieval DB and optional KV caches, while both dense and ColBERT artifacts
+    are produced by the candidate-store workflow.
+- what was changed:
+  - Removed `DenseEmbeddingWriter` imports, constructor options, state,
+    directory creation, per-document writes, and finalization from
+    `DocumentPreprocessor`.
+  - Removed `materialize_dense_embeds` and all `dense_embed_*` arguments from
+    `entrypoint/preprocess.py`.
+  - Removed `MATERIALIZE_DENSE_EMBEDS`, dense model/output/overwrite variables,
+    directory creation, and dense CLI arguments from `run/preprocess.sh`.
+  - Removed the inert `MATERIALIZE_DENSE_EMBEDS` value from
+    `lost_in_middle.yaml`; the grid runner used that group only as evaluation
+    environment and never invoked preprocessing.
+  - Added a test asserting that candidate-store options cannot reappear in the
+    preprocessing CLI contract, and updated README/codebase documentation to
+    describe the final two-stage workflow.
+- what was verified:
+  - Active source and run configuration contain no preprocessing dense
+    materialization option or writer ownership. `DenseEmbeddingWriter` is now
+    instantiated only inside the DB-based dense candidate-store builder.
+  - Black formatting, Python compilation, shell syntax, YAML parsing, and
+    `git diff --check` passed.
+  - `python -m unittest discover -s test -p 'test_*.py'` passed all 112 tests.
+  - DB splitting, DB storage, manifest generation, KV-cache handling,
+    retrieval, compression, scoring, prompt construction, and evaluation logic
+    were not changed. DB/cache results remain directly comparable.
+- open issues:
+  - Running `run/preprocess.sh` no longer creates a dense artifact implicitly.
+    Any dense experiment requires a subsequent
+    `CANDIDATE_STORE_BACKEND=dense run/materialize_candidate_store.sh` step.
+- next steps:
+  - Rebuild required dense artifacts through the candidate-store workflow
+    before launching dense baseline experiments.
+## 2026-07-24 — NQ original evaluation vs NQ-open RAG evaluation clarification
+
+### Objective
+- Clarify whether the five original NQ annotators must be scored separately in a RAG experiment, and distinguish the original NQ protocol from the commonly used NQ-open protocol.
+
+### What was verified
+- The original NQ benchmark uses five annotations and a consensus threshold such as `beta=2` for its original long-/short-answer span evaluation.
+- Standard open-domain QA/RAG work generally uses NQ-open instead:
+  - the model emits one answer string;
+  - each example has a list of acceptable answer strings;
+  - normalized exact match succeeds when the prediction matches any acceptable string;
+  - annotator-specific scores are not computed and averaged.
+- The official NQ-open conversion collects qualifying short-answer strings across annotations; it does not apply the original NQ `beta=2` consensus rule and does not construct five separately scored targets.
+- Direct comparison found that DAPR-NQ test and official NQ-open dev both contain 3,610 questions but are not the same set:
+  - exact-question intersection: 2,390;
+  - DAPR-only: 1,220;
+  - NQ-open-only: 1,220.
+- All 2,390 intersecting questions have DAPR qrels.
+- Of the previously identified 2,311 DAPR questions satisfying the original-NQ `>=2` short/yes-no annotation condition, only 1,984 occur in official NQ-open dev.
+
+### Correction
+- The previously suggested 2,311-question `>=2 annotators` subset is an original-NQ-consensus-derived custom subset. It is not the standard NQ-open RAG evaluation set.
+- For standard-answer comparability while retaining DAPR retrieval labels, the cleanest option is the explicitly named 2,390-question `DAPR-NQ test ∩ official NQ-open dev` subset, using DAPR qrels for retrieval/evidence evaluation and official NQ-open answer lists for QA evaluation.
+
+### Evaluation implication
+- Recommended QA reporting for that intersection:
+  - normalized exact match against any official NQ-open reference answer for literature comparability;
+  - optionally maximum token F1 over the reference-answer list as a secondary metric for consistency with the existing LongBench-style analysis.
+- Results on this intersection must not be labeled as full DAPR-NQ or full NQ-open results.
+
+### Changes
+- No source code or evaluation logic was changed in this clarification.
+
+## 2026-07-24 — Feasibility of a local DAPR-NQ/NQ-open RAG dataset
+
+### Objective
+- Check whether the 2,390-query DAPR-NQ/NQ-open intersection can be represented
+  with the same local questions/answers/documents interface as the LongBench
+  experiments.
+
+### What was verified
+- The local interface can represent the dataset without dropping official
+  fields:
+  - `questions/query.jsonl` can store the verbatim DAPR/NQ-open question;
+  - `answers/answer.jsonl` must store the complete official NQ-open `answers`
+    list rather than collapse it to one `answer`;
+  - `documents/` can store each DAPR parent document as its title followed by
+    its ordered passages;
+  - `dataset_info/evidence_labels.jsonl` can retain DAPR query/passage IDs,
+    qrel scores, exact evidence texts, and deterministic character spans in the
+    serialized parent document.
+- The DAPR-NQ corpus has 108,626 unique parent documents and 2,682,017 unique
+  passages. All 2,682,017 passages have `is_candidate=True`, all 4,379 test
+  qrel passage IDs exist in the corpus, and no qrel points to a non-candidate
+  passage.
+- The 2,390-query intersection should be selected by verbatim exact-question
+  match. The previously verified match is unique; normalization/fuzzy matching
+  is unnecessary and would weaken provenance.
+- The full 108,626-document DAPR corpus must be used. Restricting documents to
+  the 2,390 queries' gold/qrel documents would leak the retrieval target.
+- The current `src/acc_metric.py` has no NQ-open dataset registration or
+  dedicated official-normalization evaluator. Dataset conversion alone is
+  therefore insufficient for end-to-end scoring.
+
+### Evaluation/claim implications
+- This is structurally compatible with the local LongBench RAG pipeline, but it
+  is an adaptation of DAPR's passage-retrieval corpus into parent-document
+  fixed-chunk retrieval.
+- Because it uses the DAPR corpus and a 2,390-query intersection rather than
+  the standard full NQ-open corpus/dev protocol, its QA scores are suitable for
+  controlled within-paper method comparisons but are not directly comparable
+  to published full NQ-open EM values.
+
+### Changes
+- No dataset files, source code, or evaluation logic were changed.
+
+## 2026-07-24 — Candidate-store metadata scaling design for DAPR-NQ
+
+### Objective
+- Determine how to avoid loading a projected multi-gigabyte
+  `colbert_window/data/index.json` into the Python heap at runtime.
+
+### Findings
+- The current data index eagerly deserializes three corpus-scale structures:
+  `id_to_row`, `window_ids_by_row`, and `region_specs_by_chunk`.
+- Vector data and token offsets are already suitable for large corpora:
+  `vectors.fp16.bin` is memory-mapped and `offsets.npy` is opened with
+  `mmap_mode="r"`.
+- Runtime requests only need metadata for cacheables and retrieval chunks in
+  the current top-k result. Eagerly materializing all corpus metadata is
+  unnecessary.
+- `window_cacheable_ids` is attached to direct-subchunk candidate dictionaries
+  but is not consumed by the current selection logic. Window membership is
+  needed offline to construct region specs, not by the current online scorer.
+- Inter-batch vector and region caches are cleared through the compressor
+  factory, so they are not the primary corpus-scale memory issue.
+
+### Recommended design
+- Introduce a new candidate-store format with:
+  - a small JSON manifest containing only scalar configuration, filenames, and
+    the referenced DB-manifest hash;
+  - the existing memory-mapped vector and offset files;
+  - a read-only SQLite metadata sidecar keyed by cacheable ID and retrieval
+    chunk ID.
+- Batch-query cacheable IDs to obtain vector rows and point-query the at-most
+  top-k chunk records for region specs. Store region member indices as compact
+  integer blobs and an ordered-cacheable-ID digest for runtime validation
+  rather than duplicating large string lists in Python.
+- Use bounded SQLite page-cache settings so startup and Python-heap usage stay
+  small; only current-query metadata should be decoded.
+- Do not add a permanent legacy reader. Existing artifacts can be migrated
+  once from JSON metadata to the new sidecar without recomputing their existing
+  vector files, then validated against the DB manifest.
+
+### Retrieval-scale implication
+- This change solves eager artifact metadata loading, but it does not remove
+  the genuine cost of searching a 600k-vector Chroma/HNSW collection.
+- HNSW is not linear in corpus size, so the latency increase cannot be inferred
+  as 100x from the chunk-count ratio. It must be measured with separate cold
+  start, warm retrieval, and warm compression timings.
+- Hierarchical corpus pruning would change the retrieval protocol and should
+  not be introduced solely as an implementation optimization without an
+  explicit experimental decision.
+
+### Changes
+- No source code or artifact files were changed; this is a proposed design.
+
+## 2026-07-24 — Verify EXIT's Natural Questions QA metrics
+
+### Objective
+- Check whether EXIT reports NQ token F1 and how it aggregates multiple answer
+  aliases.
+
+### What was verified
+- The EXIT paper explicitly reports both EM and F1 for NQ, TriviaQA, HotpotQA,
+  and 2WikiMultiHopQA.
+- The released EXIT evaluation utilities use SQuAD-style normalization:
+  lowercase, punctuation removal, English-article removal, and whitespace
+  normalization.
+- For a record with multiple answers, both EM and token F1 are computed against
+  every reference and the maximum reference score is retained.
+- The latest official reproduction runner implements the same max-over-alias
+  EM/F1 behavior and has a regression test for it.
+- EXIT evaluates NQ dev with pre-retrieved CompAct-style records, Contriever
+  retrieval over a December 2018 Wikipedia corpus, and reports Top-5/Top-20
+  settings with Llama-3.1 8B and 70B readers.
+
+### Implication
+- Reporting max-over-alias token F1 as well as normalized EM on the proposed
+  DAPR-NQ/NQ-open intersection follows the metric convention used by a directly
+  relevant context-compression paper; it is not a newly invented auxiliary
+  metric.
+- EXIT's absolute NQ numbers remain non-comparable to the proposed experiment
+  because the corpus, retrieval artifacts, and query set differ.
+
+### Changes
+- No project source code or evaluation logic was changed.
+
+## 2026-07-24 — Materialize DAPR-NQ/NQ-open dataset and start 512-token DB
+
+### Objective
+- Prepare the requested full-corpus DAPR-NQ/NQ-open intersection dataset and
+  build its sentence-based 512-token Chroma retrieval DB reproducibly.
+
+### What was changed
+- Added `test/prepare_dapr_nq_open_dataset.py` and its focused tests.
+- Materialized `/mnt/nvme1/datasets/dapr-nq-open` with:
+  - 2,390 exact-question-intersection query/answer records;
+  - every official NQ-open answer alias;
+  - all 108,626 DAPR parent documents and 2,682,017 ordered passages;
+  - 2,971 DAPR qrel evidence records with exact text and source-character spans;
+  - source revisions, hashes, counts, and serialization policy in
+    `dataset_info/manifest.json`.
+- Changed DB preprocessing to buffer retrievable chunks and call Chroma upsert
+  with `DB_BATCH_SIZE` chunks at a time; the default is 256. Generated chunk
+  content, IDs, metadata, and ordering are unchanged.
+- Added `db_batch_size` to new DB build manifests and documented that changing
+  insertion batch boundaries can change Chroma's approximate HNSW graph.
+- Added an explicitly provider-pinned wrapper for Chroma's default MiniLM ONNX
+  graph. Preprocessing can use CUDA and a configurable internal embedding
+  batch, while ordinary runtime `ChromaDB(db_dir)` query encoding is
+  permanently pinned to CPU and exposes no device argument. CUDA is reachable
+  only through preprocessing-only `ChromaDB.for_build(...)`. Build device and
+  embedding batch are recorded in the DB manifest.
+- Added `onnxruntime-gpu==1.21.0` to the environment requirements.
+- Updated the README, codebase guide, and evaluation protocol. Methods in a
+  comparison must share the same physical DB.
+
+### What was verified
+- Independently checked all 2,390 query/answer/evidence ID alignments, every
+  official answer list, every one of the 2,971 qrel passage sequences, every
+  evidence character span, and existence of all 108,626 document files.
+- Dataset size is approximately 1.5 GiB.
+- Focused DB-manifest tests passed in the `vllm` environment (4 tests).
+- Preprocessing entry-point tests passed in the base environment (9 tests);
+  Black, shell syntax, and `git diff --check` also passed.
+- A combined pytest collection in `vllm` cannot import the preprocessing test
+  because that environment lacks DeepSpeed; the same test module passed
+  directly in the base environment.
+- On the RTX A6000, CUDA MiniLM batch 128 processed the representative
+  256-WordPiece workload at approximately 536 chunks/s. The selected ONNX
+  providers were CUDA then CPU fallback.
+- CPU-vs-CUDA embeddings for the same smoke texts had minimum cosine similarity
+  approximately 0.99999964 and maximum absolute component difference
+  approximately 0.000147; they are not bit-identical.
+- A CUDA-built 128-document Chroma collection was reopened with the CPU query
+  encoder and successfully searched.
+
+### Open issues
+- The initial `DB_BATCH_SIZE=256` build was stopped at approximately 3% and its
+  partial DB was removed. Chroma's default embedding wrapper creates a new
+  ONNX embedding-function/session object for every upsert, although each call
+  still executes internal batches of 32.
+- The CPU `DB_BATCH_SIZE=5000` build was later stopped around 11% at the user's
+  request, and its partial DB was removed.
+- The clean CUDA 512-token DB build completed at
+  `/mnt/nvme1/datasets/dapr-nq-open/sent-default-512/db` with
+  `DB_BATCH_SIZE=5000`, sentence splitting, `MAX_SUBCHUNK_TOKENS=180`, and the
+  Chroma default MiniLM backend on CUDA with internal embedding batch 128.
+  The first complete 5,000-chunk flush took about 23 seconds instead of about
+  60 seconds on CPU. The full build processed 108,626 parent documents in
+  7,310.03 seconds and stored exactly 600,655 retrievable chunks.
+- Final DB size is approximately 23 GiB. `build_manifest.json` records
+  `embedding_device=cuda`, `embedding_batch_size=128`, `db_batch_size=5000`,
+  `retrievable_chunk_size=512`, and `max_subchunk_tokens=180`.
+- The completed GPU-built DB was reopened through ordinary
+  `ChromaDB(db_dir)`. ONNX reported only `CPUExecutionProvider` for runtime
+  query encoding, and a real NQ query returned three retrieval results
+  successfully.
+
+### Open issues
+- NQ-open EM/F1 registration in `src/acc_metric.py` has not yet been
+  implemented.
+
+### Next steps
+- Build the ColBERT candidate store after the planned JSON-to-SQLite metadata
+  change.
+- Add the explicitly requested NQ-open EM/F1 evaluation registration before
+  running end-to-end QA evaluation.
+
+## 2026-07-24 — Rename retrievable source-span metadata
+
+### Objective
+- Replace the misleading retrievable-chunk metadata names
+  `window_token_start`/`window_token_end` with
+  `source_token_start`/`source_token_end` without rebuilding embeddings or
+  changing retrieval behavior.
+
+### What was changed
+- Added `src/retrieval_metadata.py` as the canonical home for retrievable
+  metadata-key constants.
+- Updated preprocessing, source-span evidence mapping, analysis utilities,
+  tests, and method/evaluation documentation to use the new keys exclusively.
+- Migrated the persisted metadata in every Chroma DB under
+  `/mnt/nvme1/datasets`.
+- Removed the one-time migration module, executable script, and dedicated
+  migration tests after the persisted migration and post-migration validation
+  completed, as requested.
+- Added the current `db_batch_size=256` argument to one older ColBERT artifact
+  test fixture so it matches the current DB-manifest constructor.
+
+### What was verified
+- A read-only preflight inspected 86 Chroma SQLite DBs. Fifty DBs contained
+  428,453 paired legacy start/end rows, with no conflicting canonical values or
+  unpaired spans.
+- The first apply attempt stopped on the actively preprocessing DAPR DB after
+  nine DB transactions had committed. Transactions were DB-local, so the
+  locked DB was unchanged. The remaining DBs were migrated after that writer
+  released its lock.
+- Final independent inspection found 438,453
+  `source_token_start` rows and 438,453 `source_token_end` rows, including
+  10,000 rows that already used the canonical names. Both legacy-key counts and
+  the unpaired-span count were zero across all 86 DBs.
+- No active source, test, run script, or documentation reference remains to
+  the legacy keys or the deleted migration utility.
+- Black reported no formatting changes, all 117 unit tests passed, and
+  `git diff --check` passed.
+
+### Evaluation comparability
+- Only `embedding_metadata.key` values changed. Chunk IDs, texts, embeddings,
+  insertion order, retrieval flow, prompts, scoring, metrics, and output format
+  were not changed.
+- Existing results remain directly comparable. The migrated DBs can be used
+  with the canonical code without re-embedding or rebuilding ColBERT candidate
+  stores.
+
+### Open issues
+- Historical output files and older handoff entries may still display the
+  legacy field names as immutable experiment records; runtime code does not
+  read them.
+
+### Next steps
+- Use `source_token_start` and `source_token_end` for all newly added
+  retrievable metadata consumers.
+
+## 2026-07-24 — Build ColBERT candidates from persisted DB cacheables
+
+### Objective
+- Remove duplicate sentence parsing from ColBERT candidate-store
+  materialization and make the DB's persisted split result the sole authority
+  for candidate IDs, texts, and source order.
+- Reject ColBERT center-unit configurations that reinterpret a DB built with a
+  different splitter.
+
+### What was changed
+- Moved stable-ID deduplication, duplicate-payload validation, parent-document
+  grouping, and source-order sorting into the shared
+  `materialize/db_cacheables.py` reader.
+- Updated both dense and ColBERT materializers to use that shared DB reader.
+- Removed `SentenceParser.parse()` and `split_long_units()` from
+  `colbert_materializer.py`. Sentence and sentence-only artifacts now construct
+  windows directly from persisted cacheable IDs and texts.
+- Fixed-size artifacts also take their center IDs, texts, and token spans from
+  DB cacheables. Only `fixed_chunk_window` reads/tokenizes the source document
+  to recover surrounding context; `prefix_title=True` still reads the source
+  title.
+- The source LLM tokenizer is now loaded lazily only for `fixed_chunk` and
+  `fixed_chunk_window`; sentence and sentence-only materialization use DB text
+  plus the ColBERT tokenizer and do not instantiate it.
+- Flattened the former nested-helper structure: fixed-window construction is a
+  module-level pure helper, while pending encoding, vector-file writes, offsets,
+  and artifact indexes are owned by `_ColBERTArtifactWriter`.
+- Removed cacheable-ID parsing and the separate DB document-ID prescan from the
+  candidate-store entrypoint. `parent_doc_id` metadata is now authoritative.
+- Added pre-write manifest validation:
+  - sentence DBs allow only `sentence` and `sentence_only`;
+  - fixed-size/fixed-subchunk DBs allow only `fixed_chunk` and
+    `fixed_chunk_window`, with an exact `fixed_chunk_size` match;
+  - semantic DBs are rejected until a semantic-cacheable center mode is
+    explicitly defined.
+- Added focused grouping, conflict, compatibility, and DB-driven build tests;
+  updated older internal-function tests to the shared-reader API.
+
+### What was verified
+- For
+  `/mnt/nvme1/datasets/longbench-hotpotqa/sent-default-512-splitlong180`,
+  the legacy reparse path and the new DB path were compared across all 1,710
+  DB documents and 73,085 candidates using the same Llama-3.1 source tokenizer
+  and ColBERT tokenizer/window builder.
+- All 73,085 candidate ID sequences, texts, and complete `WindowSpec` values
+  matched exactly: window text, center start/end, selected indices, addition
+  order, and truncated-center flag all had zero mismatches.
+- The new DB-derived windows were also compared with the already persisted
+  artifact's 73,085 `id_to_row` entries and 73,085 `window_ids_by_row` entries;
+  both comparisons had zero mismatches.
+- The DB contained 77,065 cacheable occurrences, of which 3,980 were
+  overlap-induced duplicates. They reduced to 73,085 stable IDs with zero
+  duplicate-payload conflicts.
+- The sentence build integration test confirms that no source document is read
+  when neither title prefixing nor fixed-window context recovery requires it.
+- After the lazy-tokenizer and writer refactor, the full 73,085-WindowSpec
+  comparison was repeated and still had zero mismatches.
+- Black, Python compilation, all 123 unit tests, and `git diff --check` passed.
+
+### Evaluation comparability
+- Retrieval, prompt construction, scoring, metrics, and runtime compression
+  were not changed.
+- The verified sentence/splitlong180 ColBERT window inputs are exactly
+  identical to the previous reparse path, so existing and newly materialized
+  artifacts remain directly comparable. Existing artifacts do not need to be
+  rebuilt for this refactor.
+
+### Open issues
+- Semantic DB candidate stores remain intentionally unsupported by the current
+  ColBERT center-unit vocabulary rather than being silently reinterpreted as
+  sentences.
+
+### Next steps
+- If semantic ColBERT candidates are needed, add an explicitly named
+  DB-cacheable center mode and define its window semantics before enabling it.
+
+## 2026-07-24 — Remove ColBERT title-prefix materialization
+
+### Objective
+- Remove the unused title-prefix experiment and its only locally persisted
+  `prefix_title=True` artifact.
+
+### What was changed
+- Permanently deleted the 601 MiB artifact at
+  `/mnt/nvme1/datasets/longbench-hotpotqa/sent-ret512/colbert_window_title_sep`.
+  Its index contained 73,321 candidates with `prefix_title=True` and
+  `title_separator="[SEP]"`; the deletion is not guaranteed to be recoverable.
+- Removed `prefix_title` and `title_separator` from the candidate-store
+  entrypoint and ColBERT materializer interfaces.
+- Removed the corresponding shell environment variables and CLI arguments from
+  `run/materialize_candidate_store.sh`.
+- Removed title extraction, prefix construction, reserved-title token-budget
+  accounting, center-span shifting, and title fields in newly written artifact
+  summaries.
+- Removed the obsolete title-prefix branch from the ColBERT encoding-device
+  comparison utility.
+- Added an interface regression test ensuring the removed options are not
+  exposed again.
+
+### What was verified
+- The deleted artifact path no longer exists.
+- No remaining dataset artifact has `prefix_title=True`. Twenty-one existing
+  non-title artifacts retain the historical `prefix_title=False` metadata
+  field and 38 older artifacts have no such field; runtime ignores these extra
+  historical index fields.
+- No production source, run script, README, or documentation reference remains
+  to the removed option or title-prefix helpers. The only test references are
+  negative interface assertions that the two removed argument names stay absent.
+- Black, Python compilation, shell syntax validation, all 124 unit tests, and
+  `git diff --check` passed.
+
+### Evaluation comparability
+- The default and all retained artifacts used `prefix_title=False`; their
+  window text, embeddings, retrieval, compression, prompts, and metrics are
+  unchanged. Existing non-title results remain directly comparable.
+- Results from the removed title-prefix condition are a separate historical
+  condition and its local artifact is no longer available.
+
+### Open issues
+- None.
+
+### Next steps
+- Continue using DB cacheable text directly as the complete ColBERT window
+  content.
+
+## 2026-07-24 — Rename ColBERT center units to subchunks
+
+### Objective
+- Name the ColBERT artifact center after the persisted DB cacheable/subchunk
+  rather than the sentence parser that originally produced it.
+
+### What was changed
+- Renamed ColBERT `center_unit="sentence"` to `"subchunk"`.
+- Renamed `center_unit="sentence_only"` to `"subchunk_only"`.
+- Changed the Python entrypoint and shell default to `subchunk`.
+- Updated DB-manifest compatibility validation, tests, and the codebase guide.
+- The DB manifest continues to use `splitter="sentence"` because that field
+  describes the parser, not the materialized candidate unit.
+- No compatibility aliases were retained: new builds reject the removed
+  `sentence` and `sentence_only` center-unit values.
+
+### What was verified
+- The splitlong180 DB-derived windows were compared with all 73,085 persisted
+  artifact IDs and `window_ids_by_row` entries; there were zero mismatches.
+- Black, Python compilation, shell syntax validation, all 124 unit tests, and
+  `git diff --check` passed.
+
+### Evaluation comparability
+- This is a configuration/metadata rename only. Candidate IDs, texts, source
+  ordering, window construction, embeddings, retrieval, compression, prompts,
+  and metrics are unchanged.
+- Existing artifacts retain their historical `center_unit="sentence"` or
+  `"sentence_only"` metadata. Runtime does not branch on this index field, so
+  they remain usable and do not need to be rebuilt.
+
+### Open issues
+- Historical artifact directory names and ablation run names containing
+  `sentence_only` are preserved as experiment identifiers.
+
+### Next steps
+- Use `subchunk` and `subchunk_only` for all newly materialized ColBERT
+  candidate stores.
+
+## 2026-07-24 — Clarify centered-window token-budget naming
+
+### Objective
+- Distinguish the ColBERT materialization window limit from compression-time
+  token budgets.
+
+### What was changed
+- Renamed the bare `token_budget` parameters used by centered-window
+  construction to `window_token_budget`.
+- Updated the two materializer call sites and the corresponding test fake.
+- Kept the public `window_token_budget` option, artifact metadata, and
+  environment variable unchanged.
+
+### What was verified
+- The DB-cacheable and materialization-entrypoint tests passed (16 tests).
+- Black, Python compilation, and `git diff --check` passed.
+
+### Evaluation comparability
+- This is an internal parameter rename only. Window construction, embeddings,
+  artifact format, compression, and evaluation behavior are unchanged.
+
+### Open issues
+- None.
+
+### Next steps
+- Continue reserving unprefixed token-budget terminology for contexts where
+  the owning scope already makes its meaning unambiguous.
+
+## 2026-07-24 — Remove unused ColBERT boolean parser
+
+### Objective
+- Remove dead parsing code from the ColBERT materializer.
+
+### What was changed
+- Deleted the unreferenced `parse_bool` helper from
+  `src/materialize/colbert_materializer.py`.
+
+### What was verified
+- No `parse_bool` reference remains in `src/`, `test/`, or `run/`.
+- The DB-cacheable and materialization-entrypoint tests passed (16 tests).
+- Black, Python compilation, and `git diff --check` passed.
+
+### Evaluation comparability
+- No behavior changed because the removed function had no callers.
+
+### Open issues
+- None.
+
+### Next steps
+- None for this cleanup.
+
+## 2026-07-24 — Validate user profiling-call cleanup against unit tests
+
+### Objective
+- Preserve the user's profiling cleanup while restoring only behavior required
+  by unit-test contracts.
+
+### What was changed
+- No removed profiling call was restored: ColBERT region/profile tests already
+  passed with the user's current code.
+- Updated `test_colbert_contiguous_window.py` to use the current
+  `window_token_budget` keyword instead of the previously removed
+  `token_budget` name.
+- Did not add a legacy production keyword alias.
+
+### What was verified
+- The contiguous-window test file passed all 5 tests after the keyword update.
+- Full unittest discovery passed all 129 tests.
+- Black, Python compilation, and `git diff --check` passed.
+
+### Evaluation comparability
+- Production profiling and evaluation code was not changed during this check.
+- The only edit was a stale test-call update to the already-current API.
+
+### Open issues
+- Three pytest-style test files are not collected by unittest and pytest is not
+  installed in the current environment.
+- Existing non-failing warnings remain for read-only NumPy tensor views and
+  unclosed SQLite test connections.
+
+### Next steps
+- Keep the user's removed profiling calls removed unless a future behavioral
+  test demonstrates that one was part of a runtime contract rather than timing
+  instrumentation.
+
+## 2026-07-24 — Bulk-convert fixed-length ColBERT queries
+
+### Objective
+- Avoid applying the same dtype/contiguity operation separately to every
+  fixed-length query row.
+
+### What was changed
+- In the `query_minlen=None` path, convert the complete query tensor to
+  contiguous fp32 once and return its batch rows with `unbind`.
+- Kept the variable-length `query_minlen` slicing path unchanged.
+
+### What was verified
+- All 34 ColBERT window-optimization tests passed.
+- Black, Python compilation, and `git diff --check` passed.
+
+### Evaluation comparability
+- Returned row shapes, values, dtype, device, and query ordering are unchanged.
+
+### Open issues
+- None.
+
+### Next steps
+- None for this cleanup.
+
+## 2026-07-24 — Remove region-profile initialization hook
+
+### Objective
+- Remove a no-op base hook used only to initialize one rerank profile counter.
+
+### What was changed
+- Deleted `_initialize_region_profile` from the sliding-region base and
+  rerank-and-region subclass.
+- Removed its call from the shared compression flow.
+- Changed `rerank_kept_chunk_count` to use `_profile_add`, which initializes
+  and accumulates a missing profile key directly.
+- Updated the region-flow test to validate lazy counter creation.
+
+### What was verified
+- No `_initialize_region_profile` reference remains.
+- All 16 ColBERT region-spec tests passed.
+- Black, Python compilation, and `git diff --check` passed.
+
+### Evaluation comparability
+- The profile counter value, rerank gating, region selection, and evaluation
+  outputs are unchanged.
+
+### Open issues
+- None.
+
+### Next steps
+- None for this cleanup.
+
+## 2026-07-24 — Audit legacy retrieval metadata after key-module removal
+
+### Objective
+- Verify that removing the metadata-key constants did not expose unmigrated
+  `window_token_start` / `window_token_end` records.
+
+### What was verified
+- Scanned all 86 Chroma DBs under `/mnt/nvme1/datasets` read-only.
+- No DB contains either old `window_token_start` or `window_token_end` metadata.
+- All 14 DBs with a current `build_manifest.json` have exactly one
+  `source_token_start` and `source_token_end` row for every
+  `cacheables_json` retrieval record.
+- The current HotpotQA, 2Wiki, MuSiQue, Qasper, ConditionalQA, and DAPR NQ-open
+  manifested DBs are aligned with the current metadata schema.
+
+### Open issues
+- Seventy-two older DBs have no build manifest and therefore cannot be used by
+  current ColBERT runtime/materialization paths that require provenance.
+- Thirty-four of those legacy DBs store `cacheables_json` but no retrieval-level
+  source-span metadata. They cannot support source-span evidence coverage
+  without being rebuilt; this is independent of the removed constants module.
+
+### Evaluation comparability
+- No DB or source file was modified during this audit.
+
+### Next steps
+- Rebuild a manifest-less legacy DB only if it must be brought back into an
+  active experiment; do not add runtime compatibility fallbacks.
+
+## 2026-07-24 — Audit CUDA synchronization around model timing
+
+### Objective
+- Check whether asynchronous CUDA work is omitted or assigned to the wrong
+  inference timing component.
+
+### Findings
+- Single-GPU prefill and decode model work is not omitted: both windows
+  synchronize before their end timestamps.
+- The synchronize immediately before decode is redundant because prefill has
+  just synchronized and no CUDA work occurs between the two calls.
+- `prefill` is broader than pure model-forward latency. Its timer starts before
+  CPU tokenization, host-to-device transfer, attention/position construction,
+  and input-length extraction.
+- In cache-on mode, cache loading, rotary shifting, concatenation, and padding
+  launch CUDA work before `generate_response`. `engine.py` ends `cache_time`
+  without a CUDA synchronize. The synchronize at the start of
+  `generate_response` then waits for any outstanding cache work before the
+  prefill timestamp starts. Consequently that wait is excluded from both
+  `cache_time` and `prefill` and is absorbed by `generate_extra_time`.
+- Total batch wall time remains correct; the issue is component attribution.
+- A multi-GPU 4-bit `device_map="auto"` deployment would need per-device
+  synchronization or CUDA events. The current no-argument synchronize only
+  guarantees synchronization of the current CUDA device.
+
+### What was changed
+- No source or evaluation behavior was changed during this audit.
+
+### Next steps
+- If component timing accuracy is required, synchronize cache GPU work at the
+  end of the cache-time window and define whether `prefill` means pure model
+  execution or end-to-end preparation plus first-token generation before
+  changing instrumentation.
+
+## 2026-07-24 — Remove redundant prefill/decode synchronization
+
+### Objective
+- Remove the duplicate CUDA synchronization immediately after the already
+  synchronized prefill boundary.
+
+### What was changed
+- Deleted the decode-start `torch.cuda.synchronize()` call from
+  `LLMModel.generate_response`.
+- Kept the prefill-end and decode-end synchronization calls unchanged.
+
+### What was verified
+- Black, Python compilation, and `git diff --check` passed.
+
+### Evaluation comparability
+- Prefill and decode timing boundaries are unchanged: decode now starts
+  immediately after the synchronized prefill timestamp.
+- Generation outputs and evaluation logic are unchanged.
+
+### Open issues
+- The previously documented cache-on attribution and multi-GPU timing concerns
+  remain intentionally unchanged because those modes are not currently used.
+
+### Next steps
+- None for the active single-GPU cache-off path.
+
+## 2026-07-24 — Remove unused query vector from region selection
+
+### Objective
+- Remove a parameter that was forwarded into region selection but never used.
+
+### What was changed
+- Removed `query_vector` from `_region_sentence_indices_to_keep`.
+- Removed the now-unused forwarding parameter from
+  `_select_sliding_regions_with_scores`, `_select_sliding_regions`, and their
+  call sites.
+- Kept query vectors in the preceding ColBERT region-scoring path.
+
+### What was verified
+- All 16 ColBERT region-spec tests passed.
+- Black, Python compilation, and `git diff --check` passed.
+
+### Evaluation comparability
+- Region scores, candidate order, deduplication, token-budget selection, and
+  output construction are unchanged.
+
+### Open issues
+- None.
+
+### Next steps
+- None for this cleanup.
+
+## 2026-07-24 — Make ColBERT candidate-ID validation mandatory
+
+### Objective
+- Prevent incomplete or stale ColBERT candidate stores from passing
+  materialization through an optional validation switch.
+
+### What was changed
+- Renamed `validate_colbert_window_artifact_against_db` to
+  `validate_colbert_candidate_ids_against_db` to describe its actual scope.
+- Removed the `validate_against_db` entrypoint option and
+  `COLBERT_VALIDATE_AGAINST_DB` shell variable.
+- Candidate-ID validation now always runs after ColBERT materialization and
+  region-sidecar construction.
+- Removed the unused text-mismatch result fields; the artifact does not store
+  source text, so the validator checks exact candidate-ID alignment and
+  conflicting duplicate DB IDs.
+- Added tests for exact alignment, missing/extra ID rejection, mandatory
+  invocation, and absence of the removed option.
+
+### What was verified
+- All unittest-compatible test files passed individually (46 tests total),
+  including 18 focused DB-cacheable and materialization-entrypoint tests.
+- Black, Python compilation, shell syntax validation, and `git diff --check`
+  passed.
+
+### Evaluation comparability
+- Candidate construction, embeddings, retrieval, compression, prompts,
+  metrics, and output formats are unchanged.
+- A materialization with missing or extra candidate IDs can no longer bypass
+  the existing reproducibility check.
+
+### Open issues
+- `test/test_db_build_manifest.py` uses pytest-style functions, but pytest is
+  not installed in the current environment; this pre-existing test file was
+  not executed.
+
+### Next steps
+- Keep candidate-ID validation mandatory while the builder continues recording
+  per-document failures and proceeding with the remaining documents.
+
+## 2026-07-24 — Profile runtime cacheable JSON deserialization at batch 90
+
+### Objective
+- Measure whether parsing Chroma `cacheables_json` metadata is material at the
+  intended large evaluation batch size.
+
+### Measurement setup
+- Dataset: LongBench HotpotQA.
+- DB: `sent-default-512-splitlong180`, retrieval chunk size 512.
+- Method: `colbert_sliding_region`, `RETAIN_TOKEN_RATIO=0.15`, `TOP_K=20`.
+- Batch size: 90; two distinct full batches after a one-query retrieval and
+  compression warm-up.
+- LLM loading and inference were not run.
+- The persisted ColBERT artifact is still v1 while runtime requires v2. A
+  process-local, read-only v1 data adapter was therefore used solely to expose
+  its existing vectors and region specs to the current compression code. No
+  source or dataset artifact was modified.
+
+### Results
+- Batch 1: 1,800 chunks / 23,301 cacheable occurrences.
+  - Retrieval: 1.6310 s.
+  - `cacheables_json` deserialization: 0.5982 s (6.65 ms/query,
+    36.7% of retrieval).
+  - Compression: 1.1659 s.
+  - Total retrieval + compression: 2.7969 s; deserialization was 21.4%.
+- Batch 2: 1,800 chunks / 22,375 cacheable occurrences.
+  - Retrieval: 1.3441 s.
+  - `cacheables_json` deserialization: 0.1393 s (1.55 ms/query,
+    10.4% of retrieval).
+  - Compression: 1.3771 s.
+  - Total retrieval + compression: 2.7212 s; deserialization was 5.1%.
+- Across both batches, deserialization totaled 0.7375 s for 180 queries
+  (4.10 ms/query), but this average combines the first-batch cold metadata
+  effect with the subsequent warm batch.
+
+### What was verified
+- Each batch returned exactly 1,800 retrieval chunks.
+- Current ColBERT scoring and selection completed for all 180 queries without
+  LLM inference.
+
+### Evaluation comparability
+- This was a timing-only run and produced no evaluation result or artifact
+  mutation.
+
+### Open issues
+- The HotpotQA splitlong180 ColBERT artifact has
+  `colbert_window_artifact_v1` / `colbert_window_data_v1`; current runtime
+  accepts only v2, so normal evaluation still requires rebuilding or an
+  explicitly approved migration.
+
+### Next steps
+- Treat warm-batch JSON deserialization as roughly 1.5 ms/query under this
+  setup, while accounting separately for a much larger first-batch cold cost.
+
+## 2026-07-24 — Remove retrieval metadata key module
+
+### Objective
+- Remove the unnecessary module that only wrapped three current metadata key
+  strings after the legacy DB migration had already completed.
+
+### What was changed
+- Deleted `src/retrieval_metadata.py`.
+- Replaced its constants with the unchanged current keys directly in retrieval
+  chunk construction, fixed-size preprocessing, and evidence coverage:
+  `parent_doc_id`, `source_token_start`, and `source_token_end`.
+- Added no legacy key fallback or migration behavior.
+
+### What was verified
+- No import or constant-name reference to `retrieval_metadata` remains.
+- Materialization-entrypoint and evidence-coverage tests passed (17 tests).
+- Black, Python compilation, file-removal validation, and `git diff --check`
+  passed.
+
+### Evaluation comparability
+- Persisted metadata keys and their values are unchanged, so DB construction,
+  retrieval, source-span evidence coverage, and evaluation results remain
+  directly comparable.
+
+### Open issues
+- None.
+
+### Next steps
+- None for this cleanup.
+
+## 2026-07-24 — Review batch scaling of ColBERT sliding-region compression
+
+### Objective
+- Identify result-preserving ways to reduce Python-level per-query overhead as
+  evaluation batch size grows.
+
+### What was changed
+- No runtime or evaluation code was changed.
+
+### What was verified
+- Query encoding is already batched, but region preparation, MaxSim scoring,
+  sorting, selection, and output construction still run once per query.
+- The current vectorized region scorer deduplicates sentence vectors only
+  within one query; it does not batch MaxSim across queries.
+- ColBERT metadata rows and region payloads are preloaded at artifact
+  initialization, so runtime artifact lookup is dictionary/memory-map view
+  construction rather than repeated SQLite querying.
+- Region selection remains inherently sequential because overlap removal and
+  the add-then-check token budget depend on the regions selected earlier.
+
+### Open issues
+- A bucketed or microbatched MaxSim kernel could reduce Python and BLAS dispatch
+  overhead, but may change last-bit floating-point results and increases peak
+  memory through padded FP32 document tensors and similarity matrices.
+
+### Next steps
+- If implementation is requested, first introduce a query-independent prepared
+  region representation while retaining the current per-query FP32 scoring and
+  selection exactly; then benchmark a separate microbatched MaxSim experiment
+  with region-rank and budget-boundary equivalence checks.
+
+## 2026-07-24 — Benchmark and reject prepared-region precomputation
+
+### Objective
+- Measure whether moving query-independent sliding-region membership into a
+  chunk-cached prepared representation improves large-batch CPU compression.
+
+### What was changed
+- Temporarily implemented chunk-local compact sentence indices and a flattened
+  prepared scoring input.
+- Reverted the implementation and its focused unit test after the paired
+  benchmark showed a consistent slowdown.
+- Final runtime and evaluation code are unchanged.
+
+### What was verified
+- Setup: HotpotQA `sent-default-512-splitlong180`, `top_k=20`, two batches of
+  90 queries, 16 PyTorch CPU threads, with retrieval results and CPU query
+  vectors fixed before comparing implementations.
+- The existing v1 artifact was exposed through a process-local read-only
+  diagnostic adapter; no dataset artifact was modified and no v1 runtime
+  compatibility path was added.
+- Old and prepared implementations produced exactly equal MaxSim score lists
+  and exactly equal region rankings for all 180 queries.
+- Paired medians for batch 1 (1,800 chunks / 12,412 regions):
+  - preparation: `0.06700 s` old vs `0.07837 s` prepared (`+16.97%`);
+  - preparation plus MaxSim: `0.21598 s` old vs `0.22629 s` prepared
+    (`+4.78%`).
+- Paired medians for batch 2 (1,800 chunks / 11,854 regions):
+  - preparation: `0.06469 s` old vs `0.07613 s` prepared (`+17.68%`);
+  - preparation plus MaxSim: `0.21042 s` old vs `0.21910 s` prepared
+    (`+4.13%`).
+- After reverting, all 34 ColBERT window-optimization tests and all 16
+  region-spec tests passed. Black, Python compilation, and `git diff --check`
+  passed.
+
+### Evaluation comparability
+- No evaluation result was generated.
+- The attempted optimization was fully reverted, so scoring, ordering, budget
+  selection, output construction, and experiment comparability are unchanged.
+
+### Open issues
+- The prepared representation replaced inexpensive tuple/hash work with extra
+  dataclass construction, per-region metadata, and a second flattening pass;
+  it did not remove MaxSim computation or the query-level control flow.
+
+### Next steps
+- Do not reintroduce this prepared-region design.
+- If further batch scaling work is requested, test a bounded microbatched
+  MaxSim kernel directly, including exact region-rank and budget-boundary
+  checks and peak-memory measurement.
+
+## 2026-07-24 — Clarify runtime token-budget ownership
+
+### Objective
+- Distinguish the compressor `TokenBudgetMixin` from ColBERT artifact window
+  and region budgets.
+
+### What was changed
+- No code was changed.
+
+### What was verified
+- `TokenBudgetMixin` is used only by online dense and ColBERT selection paths.
+- It resolves exactly one of `RETAIN_TOKEN_RATIO` and `FINAL_TOKEN_BUDGET`,
+  counts prompt-visible tokens with the evaluated LLM tokenizer, deduplicates
+  repeated cacheable IDs, and caches token lengths.
+- ColBERT artifact materialization does not use this mixin. Its
+  `window_token_budget` controls offline ColBERT document windows and the
+  materialized region topology, independently of the final online prompt
+  budget.
+
+### Open issues
+- None.
+
+### Next steps
+- Keep the offline window budget and online final selection budget separate in
+  naming and experiment documentation.
+
+## 2026-07-24 — Audit unused and stale code under test
+
+### Objective
+- Separate definitely unused test helpers/imports from manual research scripts
+  and tests that are present but not collected.
+
+### What was changed
+- No source or test code was changed.
+
+### What was verified
+- `python -m unittest discover -s test` passed all 129 collected tests.
+- Four top-level helpers have no references anywhere in current Python source:
+  `_find_support_flags`, `score_map`, `fact_recall`, and the older
+  `load_gold_by_query` in `test/eval_retrieval_and_compression.py`.
+- Definite unused imports include `defaultdict` in
+  `analyze_no_harm_dropped_sentences.py`, `os` and `fire` in
+  `check_sentence_split_offsets.py`, `os` in
+  `eval_retrieval_and_compression.py`, and `sys` in
+  `prepare_lb200_original_evidence_datasets.py`.
+- Three pytest-style files contain ten top-level tests that unittest discovery
+  does not collect: `test_cacheable_payload.py`,
+  `test_colbert_manifest_reference.py`, and `test_db_build_manifest.py`.
+  Pytest is not installed in the current environment.
+- Five old analysis/replay scripts still depend on removed
+  `COMPARE_EMBED_*`, `GLOBAL_TOP_R`, or `colbert_window` compressor APIs:
+  `analyze_raw_title_fusion.py`, `analyze_llm_evidence_fusion.py`,
+  `analyze_supporting_fact_fusion.py`,
+  `analyze_no_harm_dropped_sentences.py`, and
+  `rebuild_2wiki_prompt_cacheable_diff.py`.
+- `diagnose_musique_rag.py` still inspects the removed
+  `compare_embed/compare_embed.pt` artifact layout.
+- `test/__pycache__` contains 59 compiled files whose corresponding Python
+  source no longer exists; the full generated directory is about 2.5 MiB.
+- Of 46 non-`test_*` scripts, 43 have no references from `run/`, docs, or the
+  README. These are manual research utilities and cannot be classified as dead
+  solely from repository references.
+
+### Open issues
+- The project currently mixes unittest tests, uncollected pytest-style tests,
+  active evaluation entrypoints, historical analysis scripts, and manual
+  profiling tools under one directory.
+
+### Next steps
+- A safe first cleanup is the four dead helpers, five unused imports, stale
+  local variables, and generated `__pycache__`.
+- Decide separately whether to migrate or delete the six scripts tied to
+  removed artifact/compressor APIs.
+- Convert the ten pytest-style tests to unittest or add pytest to the supported
+  test environment so they are not silently skipped.
+
+## 2026-07-24 — Remove definitely unused test code
+
+### Objective
+- Perform only the first, low-risk step of the test-code cleanup.
+
+### What was changed
+- Removed four unreferenced helpers:
+  `_find_support_flags`, `score_map`, `fact_recall`, and the superseded
+  `load_gold_by_query` from the test evaluation entrypoint.
+- Removed five unused imports across four scripts.
+- Removed or simplified four unused local variables: `top_key`,
+  `fixed_artifact_dir`, `processed_queries`, and an unused dataset tuple item.
+- Did not change historical scripts tied to removed APIs, pytest-style tests,
+  or generated `__pycache__`.
+
+### What was verified
+- Black passed for all 11 changed files.
+- All changed files passed Python compilation.
+- An AST import audit found no remaining unused imports in the changed files.
+- `git diff --check` passed.
+- Full unittest discovery passed all 129 collected tests.
+
+### Evaluation comparability
+- Only code with no runtime references and unused local names/imports was
+  removed. Evaluation data handling, retrieval, scoring, metrics, output
+  formats, and active control flow are unchanged.
+
+### Open issues
+- Ten pytest-style tests remain uncollected by the supported unittest command.
+- Historical scripts and stale generated bytecode remain for later steps.
+
+### Next steps
+- Remove stale generated `test/__pycache__` in a separate step, or first decide
+  whether the historical scripts tied to removed APIs should be migrated or
+  deleted.
+
+## 2026-07-24 — Remove generated test bytecode
+
+### Objective
+- Perform the second isolated test-cleanup step without touching Python source.
+
+### What was changed
+- Deleted `test/__pycache__`, containing 145 generated `.pyc` files and using
+  approximately 2.5 MiB.
+- The directory and all files were Git-untracked and already excluded by
+  `.gitignore`.
+
+### What was verified
+- Ran full unittest discovery with `PYTHONDONTWRITEBYTECODE=1`; all 129
+  collected tests passed.
+- Verified that `test/__pycache__` was not recreated.
+- `git diff --check` passed.
+
+### Evaluation comparability
+- No source, evaluation logic, artifact, or result file was changed.
+
+### Open issues
+- Historical scripts tied to removed APIs remain.
+- Ten pytest-style tests remain uncollected by unittest discovery.
+
+### Next steps
+- Review the historical scripts one at a time and decide whether each should be
+  migrated to current APIs or deleted.
+
+## 2026-07-24 — Remove obsolete raw/title fusion diagnostic
+
+### Objective
+- Review and process one historical script tied to removed selection APIs.
+
+### What was changed
+- Deleted `test/analyze_raw_title_fusion.py`.
+
+### Why it was deleted instead of migrated
+- The script implemented a completed 2026-06-16 diagnostic comparing raw and
+  title-prefixed dense artifacts under count-based `GLOBAL_TOP_R`.
+- Its original results and interpretation remain preserved in this handoff.
+- Its two required compare-embedding artifact families no longer exist in the
+  current dataset tree, and the current dense compressor uses a different
+  artifact/configuration contract.
+- Replacing `GLOBAL_TOP_R` with a token budget would define a new experiment
+  rather than restore the original diagnostic.
+- No active run script, documentation entrypoint, or current Python source
+  referenced the script.
+
+### What was verified
+- No non-handoff reference to the deleted filename remains.
+- Full unittest discovery passed all 129 collected tests with bytecode writing
+  disabled.
+- `test/__pycache__` remained absent and `git diff --check` passed.
+
+### Evaluation comparability
+- No active evaluation flow or result was changed. Historical measurements
+  remain documented, but the obsolete diagnostic can no longer be rerun from
+  this checkout.
+
+### Open issues
+- Four runtime-incompatible analysis/replay scripts and one obsolete
+  compare-artifact inspector remain to be reviewed.
+- Ten pytest-style tests remain uncollected.
+
+### Next steps
+- Review `test/analyze_llm_evidence_fusion.py` next.
+
+## 2026-07-24 — Verify MiniLM 256/512 sequence-length behavior
+
+### Objective
+- Verify whether `all-MiniLM-L6-v2` is limited to 256 tokens or can technically
+  process 512, including the exact Chroma ONNX embedding path used by this
+  project.
+
+### What was changed
+- No source, configuration, database, artifact, or evaluation output was
+  changed.
+
+### What was verified
+- The official Sentence Transformers artifact sets `max_seq_length` to 256,
+  while the underlying transformer configuration has 512 position embeddings.
+- Chroma's `ONNXMiniLM_L6_V2` path explicitly truncates and pads to 256 by
+  default.
+- A read-only CPU execution test using the exact installed Chroma ONNX model
+  produced a 384-dimensional embedding at both sequence lengths after changing
+  both tokenizer truncation/padding and `max_tokens()` to 512:
+  - default encoded length: 256
+  - modified encoded length: 512
+  - cosine between the two embeddings for a 400-word input: 0.7671
+- Therefore the ONNX graph technically accepts 512 positions, but all existing
+  databases built with the unchanged Chroma default embedded only the first
+  256 WordPieces of longer chunks.
+
+### Evaluation comparability
+- No evaluation logic or results changed. Rebuilding a database with a
+  512-token MiniLM setting would create a different retriever, so its results
+  would not be directly attributable only to the compressor and must be
+  reported as a separate retrieval configuration.
+
+### Open issues
+- Technical support for 512 does not establish retrieval quality at 512. The
+  model card configuration deliberately uses 256, and the effect must be
+  measured on the target retrieval datasets.
+
+### Next steps
+- Before changing production code, compare default-256 and explicit-512
+  MiniLM retrieval using separately rebuilt databases and the same qrels.
+
+## 2026-07-24 — Measure MiniLM-visible portion of HotpotQA 512-token chunks
+
+### Objective
+- Quantify how many original Llama tokens from the existing HotpotQA
+  512-token retrieval chunks are represented before Chroma's default MiniLM
+  tokenizer truncates at 256 WordPieces.
+
+### What was changed
+- No code, database, artifact, configuration, or evaluation result was changed.
+
+### What was verified
+- Read all 5,807 chunks from the existing
+  `longbench-hotpotqa/sent-default-512-splitlong180` Chroma database.
+- Restricted the measurement to the 4,099 complete 512-Llama-token chunks,
+  drawn from 1,045 source documents.
+- Reconstructed every chunk from its original source document and recorded
+  source token span. All 4,099 reconstructed texts exactly matched the text
+  stored in Chroma.
+- Used the installed Chroma `ONNXMiniLM_L6_V2` tokenizer exactly as configured:
+  its 256 positions contain `[CLS]`, 254 content WordPieces, and `[SEP]`.
+- Mapped the last visible MiniLM character offset back onto the original Llama
+  token slice, rather than re-tokenizing shortened text.
+- Original Llama tokens fully covered by MiniLM:
+  - mean 265.74 / 512 (51.90%)
+  - min 210
+  - p05 245
+  - p10 249
+  - p25 256
+  - p50 264
+  - p75 272
+  - p90 282
+  - p95 289
+  - max 475
+- The unusually high maximum is a corpus/tokenizer-specific outlier; the
+  central 90% spans 245–289 original Llama tokens.
+
+### Evaluation comparability
+- This is a read-only diagnostic. It confirms that the existing 512-chunk
+  MiniLM retrieval index normally represents only about the first half of each
+  returned chunk, although the full stored chunk is passed downstream.
+
+### Open issues
+- This measurement does not itself determine the effect on retrieval recall.
+  Relevant evidence may occur before or after the MiniLM-visible prefix.
+
+### Next steps
+- Measure qrel/evidence position within each retrieved chunk, or rebuild a
+  separate explicit-512 MiniLM database and compare retrieval outcomes.
+
+## 2026-07-24 — Validate DAPR-NQ ColBERT artifact and benchmark metadata access
+
+### Objective
+- Finish validating the DAPR-NQ ColBERT candidate store.
+- Measure eager in-memory metadata dictionaries against query-time batched
+  SQLite access before changing the production reader.
+
+### What was changed
+- Added the experiment-only harness
+  `test/benchmark_colbert_metadata_access.py`.
+- Production `ColBERTWindowData` was not changed; it still eagerly preloads
+  cacheable rows and region payloads.
+
+### What was verified
+- Candidate-store ID validation passed:
+  - DB cacheable occurrences: 8,898,231
+  - unique DB cacheable IDs: 8,421,292
+  - artifact cacheable IDs: 8,421,292
+  - duplicate DB occurrences: 476,939
+  - missing artifact IDs: 0
+  - extra artifact IDs: 0
+- Artifact contents:
+  - 108,626 source documents
+  - 235,093,387 ColBERT center tokens
+  - 600,655 coarse chunks with region metadata
+  - 5,050,371 region specs
+  - 9,895 centers truncated at the ColBERT 180-WordPiece limit
+  - no failed documents
+- A/B workload:
+  - first 32 DAPR-NQ queries
+  - top-k 20
+  - CPU query encoding
+  - batch sizes 1, 8, and 32
+  - 10 repetitions; the first repetition was classified as cold
+- Eager and lazy modes produced identical output fingerprints for every batch.
+- Eager initialization: 27.63 s and +3.34 GiB RSS.
+- Batched-SQLite initialization: 1.11 s and +0.14 GiB RSS.
+- Warm latency p50, eager versus SQLite:
+  - batch 1: 24.57 ms versus 25.86 ms
+  - batch 8: 103.75 ms versus 121.51 ms
+  - batch 32: 367.65 ms versus 425.54 ms
+- Warm mean latency increased with SQLite by 6.5%, 23.8%, and 13.4% for
+  batch sizes 1, 8, and 32, respectively.
+- Results:
+  - `outputs/analysis/nq_colbert_metadata/eager.json`
+  - `outputs/analysis/nq_colbert_metadata/lazy.json`
+
+### Evaluation comparability
+- The benchmark changes no retrieval, compression, or scoring logic.
+- The lazy reader exists only inside the benchmark harness. Production results
+  remain directly comparable because production behavior was not modified.
+
+### Open issues
+- Query latency is the primary requirement, so the measured SQLite design
+  should not replace eager dictionaries despite its large initialization and
+  RSS advantages.
+- The ConditionalQA MiniLM/E5-small/BGE-small retrieval grid has not run. Its
+  base-environment GPU execution request was rejected, and no partial index or
+  result was created.
+
+### Next steps
+- Keep eager metadata preload for the current production path.
+- Run the ConditionalQA embedder-by-chunk-size grid in the base environment:
+  passage embedding on GPU, runtime query embedding on CPU.
+
+## 2026-07-24 — Benchmark HotpotQA JSON versus SQLite metadata preload
+
+### Objective
+- Compare JSON-to-dict and SQLite-to-dict initialization on a small existing
+  artifact before extrapolating metadata format behavior to DAPR-NQ.
+
+### What was changed
+- Added the experiment-only script
+  `test/benchmark_hotpotqa_metadata_format.py`.
+- Created benchmark copies under
+  `outputs/analysis/hotpotqa_metadata_format_benchmark/`.
+- No production artifact or runtime loader was changed.
+
+### What was verified
+- Used the existing splitlong180 HotpotQA artifact:
+  - 73,085 cacheables
+  - 5,807 retrieval chunks with region specs
+- Exhaustively verified equality of cacheable rows, region payloads, and all
+  73,085 window-membership payloads after conversion.
+- Twenty independent-process warm-load repetitions:
+  - legacy full JSON:
+    - 23.20 MiB
+    - mean load 196.49 ms
+    - mean RSS delta 61.19 MiB
+  - current full SQLite persistence followed by dict preload:
+    - 17.84 MiB
+    - mean load 171.64 ms
+    - mean RSS delta 46.48 MiB
+  - runtime-only compact JSON containing exactly `id_to_row` and
+    `region_payloads_by_chunk`:
+    - 4.78 MiB
+    - mean load 90.89 ms
+    - mean RSS delta 28.26 MiB
+- Result:
+  `outputs/analysis/hotpotqa_metadata_format_benchmark/results.json`.
+
+### Evaluation comparability
+- This is a format/loading microbenchmark only. Retrieval and compression
+  output are unchanged.
+
+### Open issues
+- Full SQLite is better than the old monolithic JSON, but a separate
+  runtime-only JSON sidecar is substantially smaller and faster on HotpotQA.
+- Standard JSON loading may have a higher transient peak at NQ scale because
+  the raw JSON string and decoded dictionaries overlap. The HotpotQA process
+  baseline obscures a reliable peak-RSS comparison, so NQ peak remains an
+  extrapolation rather than a measurement.
+
+### Next steps
+- If optimizing runtime initialization, keep SQLite as a build/validation
+  artifact and benchmark an NQ runtime-only JSON sidecar before changing the
+  production loader.
+
+## 2026-07-24 — Finalize split ColBERT metadata and ConditionalQA embedder grid
+
+### Objective
+- Replace runtime SQLite metadata lookup with split runtime JSON files eagerly
+  loaded into dictionaries, while retaining SQLite only as temporary build
+  metadata.
+- Migrate existing ColBERT artifacts without changing their candidate or
+  region mappings.
+- Compare MiniLM, E5-small-v2, and BGE-small-en-v1.5 over ConditionalQA fixed
+  chunk sizes 128, 256, and 512 at top-k 10 and 20.
+
+### What was changed
+- Added split ColBERT metadata format v3:
+  - `cacheable_rows.json` for runtime cacheable-ID-to-vector-row lookup.
+  - `region_payloads.json` for runtime coarse-chunk region lookup.
+  - `window_ids.json` for offline region construction only.
+- Added SHA-256 verification for every split metadata file.
+- Changed finalized runtime loading to eagerly decode only cacheable rows and
+  region payloads into dictionaries; token vectors remain memory-mapped.
+- Kept `.build_metadata.sqlite3` only during artifact construction and delete
+  it after validated split-JSON export.
+- Added a one-time legacy migration entry point and removed runtime legacy
+  readers.
+- Added a reproducible ConditionalQA dense-embedder retrieval analysis using
+  GPU passage encoding and CPU query encoding.
+
+### What was verified
+- Migrated and independently loaded 11 artifacts:
+  - ten ConditionalQA/LongBench artifacts.
+  - DAPR-NQ with 8,421,292 cacheables and 600,655 region payloads.
+- DAPR-NQ split files:
+  - `cacheable_rows.json`: 330,583,082 bytes.
+  - `region_payloads.json`: 410,848,086 bytes.
+  - build-only `window_ids.json`: 1,408,555,124 bytes.
+- The old DAPR-NQ SQLite file was removed only after exact row, region,
+  count, hash, and DB-manifest validation.
+- New DAPR-NQ artifact-only initialization measurement:
+  - 22.23 seconds wall time.
+  - 4,542,072 KiB maximum physical RAM occupied by the process
+    (approximately 4.33 GiB).
+  - This is not an exact apples-to-apples timing comparison with the earlier
+    whole-compressor SQLite benchmark.
+- Focused ColBERT tests: 62 passed, 4 warnings, and 38 subtests.
+- Preprocess unit tests in the base environment: 10 passed.
+- `git diff --check` and Black formatting checks passed.
+- ConditionalQA fixed-chunk integrity:
+  - 128: 8,668 chunks, maximum source length 127 tokens.
+  - 256: 4,478 chunks, maximum source length 255 tokens.
+  - 512: 2,400 chunks, maximum source length 511 tokens.
+  - 652 documents; zero duplicate spans, gaps/overlaps, or source-text
+    mismatches for every chunk size.
+- ConditionalQA retrieval used 271 queries and exact DAPR source-span labels.
+- Highest measured evidence recall was BGE-small-en-v1.5 at chunk 512/top-k 20:
+  - character recall 0.937282.
+  - token recall 0.937628.
+  - mean context length 9,084.03 Llama-3.1-8B tokens.
+- Full result:
+  `outputs/analysis/conditionalqa_embedder_retrieval/results.json`.
+
+### Evaluation comparability
+- Metadata v3 changes storage and initialization only. Exact migrated mappings
+  were validated, so old and new retrieval/compression results remain directly
+  comparable when all experiment inputs are otherwise identical.
+- The ConditionalQA embedder grid builds new indexes using each model's
+  SentenceTransformers pooling, documented prefixes, normalized embeddings,
+  and documented maximum sequence length. It is not directly comparable to an
+  older index built with a different pooling rule, prefix, truncation length,
+  or insertion order.
+
+### Open issues
+- Passage embedding batch size was 256. It left GPU memory underused, but the
+  nine index builds had already completed when this was noticed. A larger
+  batch should be selected from an explicit peak-memory measurement before the
+  next large build rather than assumed safe.
+- Split runtime JSON reduces initialization time but raises DAPR-NQ process
+  memory relative to the prior SQLite-query benchmark. Query-time SQLite is
+  intentionally not a production option because query latency is the primary
+  requirement.
+
+### Next steps
+- For the next GPU artifact/index build, probe increasing passage batches
+  (for example 512, 1024, then higher) on the longest configured input and use
+  the largest batch with safe memory headroom.
+- Use BGE-small-en-v1.5 as the strongest of the three measured ConditionalQA
+  vanilla retrieval baselines unless downstream QA results reveal a different
+  trade-off.
+
+## 2026-07-24 — Measure E5-small-v2 versus BGE-small-en-v1.5 CPU query encoding
+
+### Objective
+- Determine whether BGE-small-en-v1.5's higher ConditionalQA retrieval recall
+  carries a meaningful runtime query-encoding penalty relative to E5-small-v2.
+
+### What was changed
+- No production or evaluation code was changed.
+
+### What was verified
+- Both locally cached SentenceTransformers checkpoints contain 33,360,000
+  parameters and use the same encoder dimensions:
+  - BERT encoder with 12 layers.
+  - hidden size 384, 12 attention heads, and intermediate size 1,536.
+  - maximum position embeddings 512 and output embedding dimension 384.
+- Workload:
+  - all 271 ConditionalQA queries.
+  - each model's configured query prefix.
+  - CPU query encoding with normalized embeddings.
+  - PyTorch intra-op and inter-op thread counts both 32.
+  - model loading excluded, one warmup, five measured repetitions.
+- Median milliseconds per query, E5 versus BGE:
+  - batch 1: 9.511 versus 9.799.
+  - batch 8: 3.915 versus 4.284.
+  - batch 32: 3.219 versus 3.140.
+- BGE's instruction adds six WordPiece tokens relative to E5 on this workload:
+  - E5 mean/p50/p95/max lengths: 62.75/59/100/151.
+  - BGE mean/p50/p95/max lengths: 68.75/65/106/157.
+  - neither model truncates any of the 271 queries at length 512.
+
+### Evaluation comparability
+- This is a timing diagnostic only. It does not change retrieval, compression,
+  prompt construction, or metrics.
+- Absolute timings are specific to the current CPU and 32-thread setting.
+  Relative timings use identical queries and measurement procedure.
+
+### Open issues
+- The five-repetition differences are small enough that they should not be
+  presented as a stable speed ranking without a controlled CPU-affinity and
+  contention benchmark.
+- GPU passage-index construction time was not separately recorded in the
+  completed ConditionalQA grid.
+
+### Next steps
+- Prefer BGE-small-en-v1.5 on the current evidence-recall results: no material
+  query-encoding cost penalty was measured.
+
+## 2026-07-24 — HotpotQA E5-small-v2 versus BGE-small-v1.5 vanilla evaluation
+
+### Objective
+- Build strict fixed-chunk HotpotQA retrieval DBs for both small embedders at
+  chunk sizes 128, 256, and 512.
+- Compare end-to-end vanilla QA at top-k 10 and 20 using the paper's
+  Llama-3.1-8B model.
+
+### What was changed
+- Added production Chroma backends:
+  - `bge_small_v1_5`
+  - `e5_small_v2`
+- Corrected the shared dense encoder to use model-specific behavior:
+  - BGE-small-v1.5: CLS pooling and the BGE retrieval query instruction.
+  - E5-small-v2: masked mean pooling and `query: ` / `passage: ` prefixes.
+- Unknown dense checkpoints no longer silently inherit the BGE-small query
+  instruction.
+- Chroma's shared HNSW configuration is deep-copied for every collection
+  creation. This prevents Chroma from injecting one collection's embedding
+  function into the class-level dictionary and contaminating the next build.
+- Added:
+  - `test/build_hotpotqa_embedder_vanilla_dbs.py`
+  - `test/test_dense_embedding_backends.py`
+  - `run/grid_search/grid_hotpotqa_embedder_vanilla.yaml`
+
+### What was verified
+- GPU corpus embedding used batch size 1,024.
+- DB chunk counts for each embedder:
+  - chunk 128: 20,678.
+  - chunk 256: 10,722.
+  - chunk 512: 5,818.
+- Normalized exhaustive metadata comparison against each source MiniLM DB
+  passed for all six DBs. IDs, documents, chunk metadata, and cacheable payload
+  semantics are identical. Re-serialization only adds two null optional
+  cacheable fields.
+- CPU runtime query retrieval opened and queried all six DBs successfully.
+- Dense-backend unit tests: 5 passed.
+- Dense-backend plus DB-manifest pytest selection: 9 passed with 5 dependency
+  warnings.
+- Preprocess entrypoint unit tests: 10 passed.
+- Black and `git diff --check` passed.
+- Final evaluation settings:
+  - 200 LongBench-HotpotQA queries.
+  - Llama-3.1-8B-Instruct, FP16.
+  - no KV-cache reuse and no compression.
+  - batch size 4 for all final cases.
+  - official HotpotQA EM/F1 evaluator.
+  - actual model input lengths recorded.
+- Final results:
+
+| Embedder | Chunk | K | Mean input tokens | EM | F1 |
+|---|---:|---:|---:|---:|---:|
+| BGE-small-v1.5 | 128 | 10 | 1,291.65 | 0.365 | 0.500475 |
+| BGE-small-v1.5 | 128 | 20 | 2,501.53 | 0.385 | 0.528944 |
+| BGE-small-v1.5 | 256 | 10 | 2,438.58 | 0.420 | 0.559307 |
+| BGE-small-v1.5 | 256 | 20 | 4,761.85 | 0.440 | 0.567690 |
+| BGE-small-v1.5 | 512 | 10 | 4,293.74 | 0.440 | 0.569748 |
+| BGE-small-v1.5 | 512 | 20 | 8,523.98 | 0.445 | 0.581424 |
+| E5-small-v2 | 128 | 10 | 1,289.56 | 0.365 | 0.502879 |
+| E5-small-v2 | 128 | 20 | 2,425.89 | 0.430 | 0.563566 |
+| E5-small-v2 | 256 | 10 | 2,481.18 | 0.420 | 0.554665 |
+| E5-small-v2 | 256 | 20 | 4,894.67 | 0.420 | 0.551212 |
+| E5-small-v2 | 512 | 10 | 4,495.99 | 0.440 | 0.559505 |
+| E5-small-v2 | 512 | 20 | 9,084.99 | 0.470 | 0.590960 |
+
+- Final output directory:
+  `outputs/grid_07/hotpotqa-e5small-bgesmall-vanilla-bsz4-0724`.
+- A preliminary batch-1 run completed three cases before being stopped for
+  speed. It is stored separately under
+  `outputs/grid_07/hotpotqa-e5small-bgesmall-vanilla-0724` and must not be
+  mixed with the final batch-4 table.
+- Paired-query bootstrap 95% intervals for E5-minus-BGE F1 included zero for
+  every matched chunk/K condition. The largest point estimate was +0.03462 at
+  chunk 128/top-k 20, with interval [-0.01285, 0.08205].
+
+### Evaluation comparability
+- E5 and BGE use identical source chunk IDs/texts, insertion order, insertion
+  batch size, HNSW parameters, LLM, prompt, and evaluator. Only the embedding
+  model's documented pooling, prefixes, and resulting vectors differ.
+- The new results are not comparable to the July 7 BGE-small analysis as an
+  identical retriever condition because the older code incorrectly used mean
+  pooling for BGE-small.
+- The final batch-4 table must not be combined with the preliminary batch-1
+  results. A small BGE-128/K10 F1 difference was observed between batch sizes.
+
+### Open issues
+- Vanilla performance alone does not determine which retriever gives the
+  largest subchunk-over-vanilla gain. Subchunk retrieval/compression must be
+  evaluated with each retriever's own top-k results.
+- E5 is non-monotonic at chunk 256/top-k 20: adding retrieved context lowered
+  F1 despite increasing input length. This should be analyzed as a possible
+  distractor or prompt-position effect before using it as a paper trend.
+
+### Next steps
+- Compare the input-length/F1 Pareto fronts:
+  - E5 is strongest around 2.4K tokens through chunk 128/top-k 20.
+  - BGE is strongest around 4.3K tokens through chunk 512/top-k 10.
+  - E5 has the highest absolute point at 9.1K tokens, but uses about 561 more
+    tokens than BGE's chunk 512/top-k 20 point.
+- If selecting the paper retriever, run the corresponding subchunk conditions
+  before deciding; BGE currently has the cleaner monotonic vanilla trend.
+
+## 2026-07-24 — Clarify Chroma retrieval backend terminology and HNSW settings
+
+### Objective
+- Eliminate ambiguity between Chroma retrieval embedding backends and the
+  downstream dense context-compression method.
+- Record the effective HNSW settings for each retrieval implementation.
+
+### What was changed
+- Documented in `docs/codebase_guide.md` and `docs/eval_protocol.md` that every
+  `CHROMA_EMBED_BACKEND` choice performs dense vector retrieval.
+- Defined the two implementation families precisely:
+  - `default`/`chroma_default`: Chroma ONNX `all-MiniLM-L6-v2`.
+  - `bge_m3`, `bge_small_v1_5`, and `e5_small_v2`: the project's
+    `DenseTextEmbedder`/SentenceTransformers adapter.
+- Recorded that the ONNX MiniLM path omits an explicit HNSW configuration and
+  therefore uses Chroma 1.5.7 defaults: `ef_construction=100`,
+  `ef_search=100`, and `M=16` (`max_neighbors=16`).
+- Recorded that the SentenceTransformers paths explicitly use
+  `ef_construction=200`, `ef_search=200`, and `M=32`
+  (`max_neighbors=32`).
+- Added a source comment at the HNSW configuration declaration explaining that
+  it applies only to the SentenceTransformers choices.
+
+### What was verified
+- Traced both branches through `ChromaDB._get_chroma_client`.
+- Confirmed the installed Chroma version is 1.5.7 and inspected its effective
+  default HNSW values.
+- `git diff --check` passed.
+
+### Evaluation comparability
+- Documentation and a source comment changed; retrieval, compression,
+  prompting, scoring, and output behavior are unchanged.
+
+### Open issues
+- The source constant name `DEFAULT_COLLECTION_CONFIGURATION` can be
+  misinterpreted as applying to `CHROMA_EMBED_BACKEND=default`, although its
+  new adjacent comment states the actual scope. It was not renamed in this
+  documentation-only change.
+
+### Next steps
+- Use “Chroma default MiniLM backend” and “SentenceTransformers retrieval
+  backend” in future discussion. Reserve “dense compressor” for
+  `COMPRESS_METHOD=dense`.
+
+## 2026-07-24 — Register official NQ-open answer evaluation
+
+### Objective
+- Add NQ-open answer scoring to `src/acc_metric.py` without changing any
+  existing dataset evaluator.
+
+### What was changed
+- Added `NQOpenOfficialEvaluator` and registered `dapr-nq-open` plus the
+  `nq-open` alias.
+- Ported normalized exact match and max-over-answer-alias scoring from the
+  official Facebook Research FiD/DPR evaluator at commit
+  `fe769f30e3714e22476910ee39ea0054dd7921de`.
+- Kept maximum token-overlap F1 as an explicitly auxiliary diagnostic. The
+  upstream NQ-open evaluator reports exact match only.
+- Added `test/test_nq_open_metric.py`.
+- Documented the metric and the 2,390-query DAPR-NQ test/NQ-open dev
+  intersection in `docs/eval_protocol.md`.
+
+### What was verified
+- NQ-open evaluator tests: 5 passed.
+- Existing ConditionalQA evaluator regression tests: 7 passed.
+- All 2,390 local NQ-open answer records have non-empty answer lists.
+- Scoring each record with its first stored answer produced exact match and
+  auxiliary token F1 of 1.0 for all 2,390 records.
+- Black formatting completed.
+
+### Evaluation comparability
+- Existing dataset evaluators and their scoring behavior are unchanged.
+- There were no prior registered `dapr-nq-open` answer results, so this change
+  does not invalidate an older NQ-open result series.
+- The `exact_match` output is the official metric. The `f1` output is
+  auxiliary and must not be reported as an official NQ-open score.
+
+### Open issues
+- None for evaluator registration.
+
+### Next steps
+- Use `DATASET=dapr-nq-open` for NQ-open answer evaluation and report
+  normalized exact match as the primary answer metric.
+
+## 2026-07-24 — Add DAPR-NQ BGE RAG evaluation grid
+
+### Objective
+- Prepare the end-to-end RAG generation grid corresponding exactly to the
+  DAPR-NQ evidence-only comparison.
+
+### What was changed
+- Added `run/grid_search/grid_dapr_nq_bge_rag.yaml`.
+- Configured Llama-3.1-8B-Instruct in FP16 with evaluation batch size 16,
+  2,390 queries, a 20-token generation limit, no reusable KV cache, and no
+  answer cleaner.
+- Added six BGE-small-v1.5 vanilla cases:
+  fixed chunk sizes 128/256/512 crossed with top-k 10/20.
+- Added eight sentence-512/splitlong180 sliding-region cases:
+  retained-token ratios 0.15/0.25/0.5/0.75 crossed with top-k 10/20.
+- Kept the ColBERT query setting aligned with the evidence grid:
+  fixed maximum length 32 and right-side truncation.
+
+### What was verified
+- YAML parsing passed.
+- Exactly 14 unique cases were found: six vanilla and eight subchunk cases.
+- Evaluation batch size and total query count resolve to 16 and 2,390.
+- `git diff --check` passed for the new grid.
+
+### Evaluation comparability
+- The grid uses the same retrieval DB names, BGE backend, top-k values,
+  subchunk artifact, retained ratios, and ColBERT query setting as the
+  evidence-only grid.
+- It adds LLM generation and NQ-open answer scoring; evidence-only and RAG
+  metrics measure different outcomes and must not be merged as the same metric.
+
+### Open issues
+- The grid has not yet been executed.
+- Batch size 16 is user-selected; the longest vanilla top-k 20 case may require
+  an actual GPU memory check when the run starts.
+
+### Next steps
+- After all referenced DBs and the ColBERT artifact are complete, launch:
+  `python run/grid_search/eval.py run/grid_search/grid_dapr_nq_bge_rag.yaml`.
+
+## 2026-07-24 — Chain DAPR-NQ RAG evaluation into the active pipeline
+
+### Objective
+- Continue automatically from the ongoing DAPR-NQ BGE construction and
+  evidence evaluation into the 14-case RAG generation grid without another
+  permission transition.
+
+### What was changed
+- Extended `run/run_dapr_nq_bge_evidence_pipeline.sh` to run
+  `grid_dapr_nq_bge_rag.yaml` after the evidence grid.
+- Added an exact successful-case-count check after each grid because the grid
+  runner itself continues past individual failed cases.
+- The RAG grid is launched through `run/run_grid.sh` with GPU 0, cooperative
+  lock waiting, GPU-idle waiting, and no NVIDIA compute-mode mutation.
+- Stopped only the old waiting supervisor; the active sentence-512 BGE DB
+  construction was not interrupted.
+- Restarted the expanded pipeline under one approved execution. Its exec
+  session ID is `49003`.
+
+### What was verified
+- Shell syntax validation passed.
+- Both evidence and RAG grids contain exactly 14 cases.
+- `git diff --check` passed for the pipeline and RAG grid.
+- The expanded pipeline is running and currently waiting for the active
+  sentence-512 BGE DB manifest.
+
+### Evaluation comparability
+- No evaluation condition changed. This update changes only orchestration and
+  adds failure gating between the already defined evidence and RAG grids.
+
+### Open issues
+- Completion still depends on the current DB build and every subsequent grid
+  case succeeding.
+- RAG batch size 16 has not yet been measured on the longest vanilla case.
+
+### Next steps
+- Monitor exec session `49003`; no additional approval should be required for
+  child commands in this running pipeline.
+
+## 2026-07-24 — Preserve the original DAPR-NQ MiniLM DB
+
+### Objective
+- Remove the old MiniLM DB deletion from the DAPR-NQ pipeline and make the
+  now-non-destructive pipeline eligible for a scoped persistent approval.
+
+### What was changed
+- Removed deletion of
+  `/mnt/nvme1/datasets/dapr-nq-open/sent-default-512/db` from
+  `run/run_dapr_nq_bge_evidence_pipeline.sh`.
+- Stopped only the prior waiting supervisor session `49003`; the active BGE DB
+  construction was not interrupted.
+- Restarted the revised full pipeline in exec session `17618`.
+- Requested the scoped persistent approval prefix
+  `bash run/run_dapr_nq_bge_evidence_pipeline.sh`.
+
+### What was verified
+- The original MiniLM DB directory still exists.
+- The revised pipeline contains no `rm`, `rmdir`, `unlink`, or `truncate`
+  command.
+- Shell syntax validation and `git diff --check` passed.
+
+### Evaluation comparability
+- No DB, retrieval, compression, generation, or scoring condition changed.
+- This change only preserves an otherwise-unused prior MiniLM DB.
+
+### Open issues
+- Whether the approval rule was stored persistently depends on the user's
+  approval choice in the permission dialog; the tool result does not expose
+  that selection.
+
+### Next steps
+- Monitor exec session `17618` through DB construction, evidence evaluation,
+  and RAG evaluation.
+
+## 2026-07-25 — DAPR-NQ pipeline stopped at evidence validation
+
+### Objective
+- Check whether the chained DAPR-NQ DB, evidence, and RAG pipeline completed.
+
+### What was changed
+- No code or evaluation setting was changed.
+
+### What was verified
+- ColBERT artifact cloning and candidate/region validation completed.
+- All three vanilla BGE DBs completed:
+  - chunk 128: 2,248,787 embeddings.
+  - chunk 256: 1,148,143 embeddings.
+  - chunk 512: 601,747 embeddings.
+- All 14 evidence cases failed source-span text validation; the pipeline's
+  success gate then stopped execution before RAG.
+- The failures cover five document/token spans. Direct inspection of
+  `doc_dev-71.txt:1778-1905` showed the DB chunk begins with Unicode replacement
+  character `�`, while the corresponding original source character is `ʉ`.
+- The fixed-token chunk boundary split the tokenizer's byte-token sequence for
+  that Unicode character. Decoding the sliced token IDs therefore produced
+  `�`, so the evaluator correctly rejected the DB text as unequal to its
+  declared source span.
+- No RAG result file was created.
+
+### Evaluation comparability
+- There are no valid DAPR-NQ evidence or RAG results from this run.
+- The completed DBs must not be used for exact source-span coverage until the
+  boundary-decoding corruption is addressed and the rebuilt text is validated.
+
+### Open issues
+- Decide whether to construct fixed chunks from original character offsets or
+  adjust token boundaries so that multi-byte characters are never split.
+- Determine whether all sentence-512 materialization paths need the same
+  source-text integrity correction before reusing the cloned ColBERT artifact.
+
+### Next steps
+- Fix and unit-test source-faithful chunk serialization, then rebuild the
+  affected DBs and rerun evidence evaluation before RAG.
+
+## 2026-07-25 — Determine DAPR-NQ rebuild scope
+
+### Objective
+- Determine whether Unicode/source-span corruption affects one fixed DB or the
+  full DAPR-NQ evaluation suite.
+
+### What was changed
+- No code or data was changed.
+
+### What was verified
+- Every vanilla chunk size failed at a different selected source span:
+  - chunk 128: `doc_dev-71.txt:1778-1905`.
+  - chunk 256: `doc_dev-2318.txt:1530-1785` or
+    `doc_dev-71.txt:2295-2550`.
+  - chunk 512: `doc_dev-1613.txt:9198-9709`.
+- DB chunks containing Unicode replacement character `�`:
+  - vanilla 128: 2,063 of 2,248,787.
+  - vanilla 256: 994 of 1,148,143.
+  - vanilla 512: 451 of 601,747.
+  - sentence-512 BGE: 464 of 600,655.
+  - original sentence-512 MiniLM: 464 of 600,655.
+- Original source documents contain only seven `�` occurrences across four
+  files, so the DB counts overwhelmingly reflect materialization artifacts,
+  although exact subtraction is not valid because one source occurrence can
+  appear in more than one chunk.
+- All eight sentence-512/subchunk cases failed at
+  `doc_dev-219.txt:207-294`. This is an additional alignment problem: the
+  source tokenizer's final token spans the text `"It`, while the parsed
+  sentence ends after `"`. Token-only metadata therefore claims that `It` is
+  included even though selected sentence text omits it.
+
+### Evaluation comparability
+- For the current DAPR-NQ suite, all three vanilla DBs and the sentence-512 BGE
+  DB require rebuilding after a source-faithful boundary fix.
+- Because sentence cacheable text/span metadata changes, the cloned ColBERT
+  artifact and its region metadata also require rebuilding.
+- The original MiniLM DB needs rebuilding only if it will be used again, but it
+  is not valid as a source-faithful reference in its current form.
+
+### Open issues
+- Source character spans must become authoritative for both fixed chunks and
+  parsed sentence units; token spans alone cannot exactly represent every
+  character boundary.
+
+### Next steps
+- Implement one shared character-safe boundary representation and test fixed,
+  sentence, long-unit fallback, retrievable-window, and ColBERT materialization
+  paths before rebuilding data.
+
+## 2026-07-25 — Audit HotpotQA DB source-text fidelity
+
+### Objective
+- Determine whether the token/character boundary defects found in DAPR-NQ also
+  exist in the already-built LongBench-HotpotQA DBs.
+
+### What was changed
+- No repository code or dataset was changed.
+
+### What was verified
+- Full local source-span/text comparison, ignoring whitespace only:
+  - sentence-512 splitlong180, BGE and MiniLM:
+    6/5,807 retrievable chunks and 8/73,085 unique cacheables mismatch.
+  - sentence-512 splitlong512:
+    6/5,807 retrievable chunks and 2/72,555 unique cacheables mismatch.
+  - fixed 128, both BGE and E5:
+    24/20,678 unique chunks mismatch.
+  - fixed 256, both BGE and E5:
+    8/10,722 unique chunks mismatch.
+  - fixed 512, both BGE and E5:
+    4/5,818 unique chunks mismatch.
+- Replacement-character-bearing chunks:
+  - sentence-512 splitlong180: 7 retrievable and 7 cacheable.
+  - fixed 128/256/512: 25/9/5 cacheables.
+- The HotpotQA source corpus itself contains two replacement characters in one
+  file, so replacement-character counts alone are not mismatch counts; the
+  source-span comparison above is authoritative.
+
+### Evaluation comparability
+- Existing HotpotQA DBs are not byte-for-byte/source-faithful and cannot be
+  guaranteed correct under the new invariant.
+- This does not by itself prove that every prior QA result changed: ordinary QA
+  scoring does not use source spans, and only queries retrieving/choosing an
+  affected chunk can be impacted.
+- A source-faithful rebuild can slightly change embeddings and approximate
+  retrieval ranks, so old and rebuilt runs are not guaranteed to be identical.
+
+### Open issues
+- Audit prior result top-k/selected contexts to measure how many evaluated
+  queries actually touched an affected chunk.
+- Audit 2Wiki, MuSiQue, and other DBs built through the same splitter before
+  claiming source fidelity.
+
+### Next steps
+- Fix the shared splitter first; then decide whether to rebuild HotpotQA based
+  on the affected-query audit and the paper's reproducibility standard.
+
+## 2026-07-25 — Separate text corruption from metadata-only mismatch
+
+### Objective
+- Clarify whether the HotpotQA fidelity defects affect embeddings, prompt text,
+  or only evidence span evaluation.
+
+### What was changed
+- No code or data was changed.
+
+### What was verified
+- Of the eight splitlong180 cacheable mismatches:
+  - six Hebrew long-unit chunks in `doc_390.txt` contain introduced `�`
+    characters; their stored text is not a verbatim substring of the source.
+  - two English sentence chunks in `doc_887.txt` are verbatim source text, but
+    token-span metadata crosses the `"All` token boundary and claims extra or
+    missing characters.
+- Therefore there are two distinct effects:
+  - actual stored-text corruption changes embeddings built from that text and
+    changes prompt text if the chunk is retrieved/selected.
+  - metadata-only mismatch leaves embeddings and prompt text unchanged but
+    makes source-span evidence evaluation invalid.
+
+### Evaluation comparability
+- Fixed vanilla mismatches are actual chunk-text corruption, so both dense
+  retrieval embeddings and vanilla prompt text can be affected.
+- In sentence/subchunk mode, corrupted retrievable coarse text affects dense
+  retrieval embeddings; corrupted selected cacheable text affects ColBERT
+  embeddings and the final prompt.
+- A sentence such as the `"It` example whose text is correct but span metadata
+  is wrong affects evidence scoring only.
+
+### Open issues
+- The prior HotpotQA output files do not directly establish whether any of the
+  actually corrupted chunks entered each query's retrieved or selected
+  context.
+
+### Next steps
+- Audit historical retrieval/selection traces or replay retrieval to quantify
+  affected queries before assigning an impact to prior QA scores.
+
+## 2026-07-25 — Trace `chunk_start`/`chunk_end` consumers
+
+### Objective
+- Identify every functional use of cacheable source-token spans.
+
+### What was changed
+- No code or data was changed.
+
+### What was verified
+- The fields encode a half-open source-token interval
+  `[chunk_start, chunk_end)`.
+- Direct consumers are:
+  - cacheable-to-retrievable-window overlap assignment during DB construction.
+  - deterministic source-order sorting for artifact construction and runtime
+    region output.
+  - fixed-chunk ColBERT centered-window context extraction.
+  - propagation of a selected region's combined source span.
+  - source-span evidence reconstruction and validation.
+  - fixed retrievable token-count/source metadata construction.
+- Dense embedding receives `chunk.text`, not these span fields.
+- Regular subchunk ColBERT encoding receives cacheable text, with spans used
+  only indirectly for initial source ordering.
+- Prompt construction receives cacheable text and does not read the span
+  fields.
+
+### Evaluation comparability
+- A metadata-only span mismatch can invalidate evidence evaluation without
+  changing embeddings or prompt text.
+- Actual text corruption changes embeddings and prompt text independently of
+  whether the stored span is correct.
+
+### Open issues
+- Replace token-only provenance with exact character spans while preserving the
+  ordering and overlap operations that currently depend on token spans.
+
+### Next steps
+- Add character spans as the authoritative provenance representation and keep
+  token spans only for token-budget/window operations where they are valid.
+
+## 2026-07-25 — Record technical communication requirements
+
+### Objective
+- Make technical explanations consistently engineering-oriented and logically
+  explicit.
+
+### What was changed
+- Added standing communication rules to `AGENTS.md`.
+- Technical explanations must identify concrete fields, functions, inputs,
+  transformations, invariants, and outputs.
+- Anthropomorphic or metaphorical descriptions of code and data are
+  prohibited.
+- Causal chains must identify the incorrect operation, affected downstream
+  component, and observable result.
+
+### What was verified
+- The new rules are stored in the repository-level agent instructions rather
+  than as a session-only preference.
+
+### Open issues
+- None.
+
+### Next steps
+- Apply these rules to all subsequent analysis, implementation reports, and
+  experiment interpretation.
+## 2026-07-25 — Replace source-span evidence reconstruction with context-text scoring
+
+### Objective
+- Make retrieval and compression evidence evaluation measure the text actually
+  visible in the final context, without using chunk IDs or source-position
+  metadata.
+
+### What was changed
+- Replaced `source_span_coverage` with `text_evidence_coverage`.
+- Replaced `SourceSpanCoverageScorer` with `TextEvidenceCoverageScorer`.
+- Retrieval scoring now compares concatenated retrieved `doc.text` directly
+  against each `evidence_text`.
+- Compression scoring now compares concatenated selected cacheable text
+  directly against each `evidence_text`.
+- Preserved the existing output families: character recall, token recall,
+  passage-threshold recall, any/all/worst-passage recall, and conditional
+  retention.
+- Character recall is now exact character-level LCS recall after removing
+  whitespace. Token recall is token-level LCS recall using `MODEL_NAME`.
+- Conditional retention is compressed LCS overlap divided by retrieved LCS
+  overlap, capped at the retrieved overlap; zero-retrieval-overlap passages are
+  excluded.
+- Removed the evidence evaluator's dependencies on original document files, DB
+  tokenizers, `chunk_start/end`, source token spans, and source character spans.
+- Updated the DAPR-NQ evidence grid, grid-summary parser, ConditionalQA analysis
+  script, unit tests, and `docs/eval_protocol.md`.
+
+### What was verified
+- Seven text-evidence and grid-summary tests passed.
+- Six output-naming tests passed.
+- Python compilation passed for all modified Python execution paths.
+- Retrieval-evaluation CLI construction and shell syntax passed.
+- Black formatting and `git diff --check` passed.
+
+### Evaluation comparability
+- Old `source_span_coverage` results and new `text_evidence_coverage` results
+  are not directly comparable.
+- The old metric measured coverage of labeled source positions. The new metric
+  measures textual overlap in the exact retrieved or compressed context visible
+  to the LLM.
+- No retrieval, compression, prompt construction, or LLM answer metric was
+  changed.
+
+### Open issues
+- Character-level LCS can match non-contiguous characters. This definition is
+  now explicit, but any later change to substring, n-gram, or exact-containment
+  matching would be another evaluation-protocol change.
+
+### Next steps
+- Rerun the failed DAPR-NQ evidence grid with
+  `EVIDENCE_METRIC_MODE=text_evidence_coverage`.
+
+## 2026-07-25 — Stop propagating unused end spans to region output
+
+### Objective
+- Remove the unused `chunk_end` value from runtime cacheables synthesized by
+  sliding-region selection.
+
+### What was changed
+- `_make_region_run_cacheables()` now copies only the first selected
+  subchunk's `chunk_start`, which remains the source-order key.
+- It no longer copies the last selected subchunk's `chunk_end`.
+- `_build_region_document()` no longer uses `chunk_end` as a secondary sort
+  key; it sorts by `chunk_start` and stable input order.
+- Added a test asserting that synthesized region-run cacheables have
+  `chunk_end=None` while preserving selected text and source order.
+
+### What was verified
+- All 34 ColBERT window optimization tests passed.
+- Python compilation, Black formatting, and `git diff --check` passed.
+
+### Open issues
+- `chunk_start` remains required by the current runtime output ordering.
+
+### Next steps
+- No artifact or DB rebuild is required. The change affects only transient
+  runtime output metadata and does not change scoring, selection, or prompt
+  text.
+
+## 2026-07-25 — Regression and integration verification after evidence/region changes
+
+### Objective
+- Verify the text-evidence evaluator replacement and region-output
+  `chunk_end` removal across unit, static, randomized, and real-DB execution
+  paths.
+
+### What was changed
+- No production code was changed during this verification.
+
+### What was verified
+- The complete `test/test_*.py` suite passed: 142/142 tests.
+- Black check passed for all modified Python files.
+- Python compilation passed for all modified execution and test paths.
+- Retrieval-evaluation shell syntax passed.
+- The bit-parallel LCS implementation matched a conventional dynamic-program
+  LCS implementation on 2,000 deterministic random sequence pairs.
+- The DAPR-NQ evidence YAML parsed successfully, contained 14 cases, and set
+  `EVIDENCE_METRIC_MODE=text_evidence_coverage`.
+- Static inspection confirmed that the evidence scorer and its execution path
+  contain no references to chunk/source token or character spans.
+- A real one-query DAPR-NQ vanilla-128/top-k-10 integration run completed
+  successfully against the existing BGE-small DB. It wrote a
+  `text_evidence_coverage` summary and detail record with no source-span fields.
+- `git diff --check` passed.
+
+### Open issues
+- The first sandboxed integration attempt could not open Chroma because Chroma
+  requested write-capable DB access. The same command completed successfully
+  with the approved scoped execution permission.
+- Test execution emitted existing non-fatal warnings about unavailable NVML and
+  converting a read-only NumPy array to a PyTorch tensor.
+
+### Next steps
+- The 14-case DAPR-NQ evidence grid can now be rerun under the new metric.
+
+## 2026-07-25 — Replace non-contiguous LCS with exact evidence containment and rerun NQ
+
+### Objective
+- Make complete evidence-text containment the primary retrieval/compression
+  metric and rerun the 14-case DAPR-NQ grid.
+
+### What was changed
+- Replaced the discarded non-contiguous LCS scorer with
+  `text_evidence_exact`.
+- Primary character metric:
+  `evidence_char_exact_recall`, the fraction of gold passages whose complete
+  whitespace-normalized character sequence occurs contiguously in context.
+- Primary query-completeness metric:
+  `all_evidence_char_exact`, the fraction of queries for which every gold
+  passage is exactly contained.
+- Added tokenizer-specific exact containment as a secondary metric.
+- Character and token partial recall now use only the single longest exact
+  contiguous substring; disconnected matches are never combined.
+- Token matching normalizes whitespace and prepends one common leading space
+  before independently tokenizing gold and context. This removes the artificial
+  first-token mismatch between a standalone passage and its occurrence inside
+  context.
+- Updated grid-summary extraction, CSV fields, tests, and
+  `docs/eval_protocol.md`.
+- Used a new run name,
+  `dapr-nq-bge-evidence-exact-boundary-0725`, so discarded LCS outputs were not
+  reused.
+
+### What was verified
+- The complete unit suite passed: 143/143 tests.
+- The suffix-automaton longest-common-substring implementation matched a
+  brute-force reference on 5,000 deterministic random sequence pairs.
+- All 14 DAPR-NQ cases completed successfully.
+- Character and boundary-normalized token exact results were identical in all
+  14 aggregate rows.
+- DAPR-NQ ColBERT query content lengths over 2,390 queries were mean 9.87,
+  p50 9, p90 13, p95 14, p99 18, and max 22 WordPieces. No query exceeded the
+  q32 content capacity of 29 WordPieces, so no query was truncated.
+
+### Main results
+- Vanilla 128 K=10: 1,256.1 tokens, character exact recall 0.2776.
+- Vanilla 128 K=20: 2,518.1 tokens, character exact recall 0.2951.
+- Vanilla 256 K=10: 2,461.7 tokens, character exact recall 0.5279.
+- Vanilla 256 K=20: 4,931.9 tokens, character exact recall 0.5643.
+- Vanilla 512 K=10: 4,676.8 tokens, character exact recall 0.6936.
+- Vanilla 512 K=20: 9,334.7 tokens, character exact recall 0.7432.
+- Subchunk K=10 R=0.15: 804.5 tokens, character exact recall 0.5075.
+- Subchunk K=10 R=0.25: 1,295.6 tokens, character exact recall 0.5721.
+- Subchunk K=10 R=0.5: 2,524.9 tokens, character exact recall 0.6522.
+- Subchunk K=10 R=0.75: 3,752.3 tokens, character exact recall 0.6956.
+- Subchunk K=20 R=0.15: 1,541.7 tokens, character exact recall 0.5944.
+- Subchunk K=20 R=0.25: 2,525.5 tokens, character exact recall 0.6591.
+- Subchunk K=20 R=0.5: 4,983.9 tokens, character exact recall 0.7225.
+- Subchunk K=20 R=0.75: 7,441.9 tokens, character exact recall 0.7525.
+
+### Evaluation comparability
+- Source-span reconstruction results and the short-lived non-contiguous LCS
+  results are invalid for this metric and not directly comparable.
+- The new results use only the exact context text visible to the LLM and gold
+  evidence text.
+- The character exact metric is the primary cross-model metric. Token exact is
+  secondary because it remains tokenizer-specific even after boundary
+  normalization.
+
+### Open issues
+- The existing NQ DBs contain a small fraction of chunks with replacement
+  characters from the known token-boundary serialization problem. This run
+  intentionally evaluated those DBs as requested.
+
+### Next steps
+- Use the exact-containment results to choose sub-1,000 and approximately
+  2,500-token RAG generation points for the end-to-end NQ grid.
+
+## 2026-07-25 — Start DAPR-NQ batch-size-16 RAG grid
+
+### Objective
+- Run end-to-end NQ-open answer generation for the same 14 vanilla/subchunk
+  conditions used in the completed exact-evidence grid.
+
+### What was changed
+- No code or evaluation configuration was changed.
+- Started `run/grid_search/grid_dapr_nq_bge_rag.yaml` through
+  `run/run_grid.sh` with the GPU 0 cooperative lock.
+
+### What was verified
+- GPU 0 was idle before launch.
+- The grid uses Llama-3.1-8B-Instruct FP16, `EVAL_BSZ=16`, 2,390 queries,
+  `MAX_NEW_TOKENS=20`, NQ-open normalized EM, and auxiliary token F1.
+- Vanilla 128 K=10 completed with EM 0.3866108787 and F1 0.5151023910 in
+  865.6 seconds.
+- Vanilla 128 K=20 is currently running with approximately 29GB GPU memory.
+
+### Open issues
+- The complete 14-case grid is expected to require multiple hours.
+- A batch-size-1 latency grid is desired later and must use a separate run name
+  and remain distinct from this batched-serving condition.
+
+### Next steps
+- Let the active batch-size-16 grid finish, validate 14 successful rows, and
+  summarize quality, context length, and latency.
+
+## 2026-07-25 — Continue NQ RAG grid with batch size 4 for long contexts
+
+### Objective
+- Preserve the two completed short-context batch-size-16 results and run all
+  remaining longer-context cases at batch size 4 in the same grid.
+
+### What was changed
+- Changed the grid-wide `EVAL_BSZ` from 16 to 4.
+- Added explicit `EVAL_BSZ=16` overrides only to Vanilla 128 K=10 and K=20.
+- Kept the same run name and result file as requested; each row records its
+  actual `EVAL_BSZ`.
+
+### What was verified
+- Vanilla 128 K=10 completed at batch 16: EM 0.3866108787, F1 0.5151023910.
+- Vanilla 128 K=20 completed at batch 16: EM 0.4410041841, F1 0.5605797741.
+- The batch-16 runner was stopped immediately after it started Vanilla 256
+  K=10; no result row was written for that interrupted attempt.
+- The revised runner acquired the GPU lock, skipped both completed batch-16
+  cases, and started Vanilla 256 K=10 with `EVAL_BSZ=4`.
+
+### Evaluation comparability
+- Answer-quality metrics remain comparable across rows.
+- Latency and throughput must be interpreted with the recorded batch size:
+  the first two rows use batch 16 and the remaining rows use batch 4.
+- These mixed-batch rows must not be plotted as one uniform batch-size latency
+  curve without explicitly distinguishing the batch-size conditions.
+
+### Open issues
+- The remaining 12 cases require multiple hours.
+
+### Next steps
+- Let the active mixed-batch grid finish and validate all 14 successful rows.
+
+## 2026-07-25 — Resume only unfinished DAPR-NQ RAG cases with tuned batch sizes
+
+### Objective
+- Stop the slow fixed-batch continuation and rerun only unfinished DAPR-NQ
+  RAG cases with batch sizes chosen from the observed input lengths and prior
+  GPU-capacity measurements.
+
+### What was changed
+- Stopped the active grid and a second duplicate wrapper waiting for the same
+  cooperative GPU lock.
+- Changed `run/grid_search/grid_dapr_nq_bge_rag.yaml` to the new run name
+  `dapr-nq-bge-rag-tuned-bsz-0725`.
+- Removed the four already completed cases: Vanilla 128 K=10/K=20 and Vanilla
+  256 K=10/K=20.
+- Assigned explicit batch sizes to the remaining ten cases:
+  - Vanilla 512: K=10 uses 12; K=20 uses 4.
+  - Subchunk K=10, R=0.15/0.25/0.5/0.75 use 88/56/28/16.
+  - Subchunk K=20, R=0.15/0.25/0.5/0.75 use 44/28/12/8.
+- Preserved the old run directory and its interrupted 1,092-row Vanilla 512
+  K=10 output instead of deleting or overwriting it.
+
+### What was verified
+- The old run has four successful `results.jsonl` rows, and each corresponding
+  prediction file contains all 2,390 examples.
+- YAML parsing and an exact ten-case configuration assertion passed.
+- The replacement grid acquired the GPU 0 cooperative lock and started Vanilla
+  512 K=10 with `EVAL_BSZ=12`.
+- The live evaluation process uses the new output directory and currently
+  occupies approximately 40,898 MiB of GPU memory.
+- The first 48 predictions were written without an OOM during the launch
+  verification.
+
+### Evaluation comparability
+- Retrieval, prompts, generation settings, evaluator, and dataset handling were
+  not changed, so answer-quality metrics remain comparable.
+- Timing and throughput must be interpreted using each row's recorded
+  `EVAL_BSZ`; the completed old rows and the new rows do not form a uniform
+  batch-size latency condition.
+
+### Open issues
+- The tuned batch sizes are conservative estimates rather than exhaustive
+  per-case capacity probes. Long-tail inputs may still cause an OOM.
+- The interrupted old Vanilla 512 K=10 prediction file is intentionally kept
+  only as provenance and must not be treated as a completed result.
+
+### Next steps
+- Monitor the ten-case run for OOMs and validate ten successful result rows
+  under `outputs/grid_07/dapr-nq-bge-rag-tuned-bsz-0725`.
+
+## 2026-07-26 — DAPR-NQ gold-evidence oracle and DAPR-MS MARCO feasibility
+
+### Objective
+- Measure 1B/8B NQ-open answer quality when only labeled DAPR evidence passages
+  are placed in the prompt.
+- Verify whether DAPR-MS MARCO can be joined to official QA answers and whether
+  its parent documents are long enough for 512-token coarse retrieval.
+
+### What was changed
+- Added `src/oracle_evidence.py`, a read-only exact-query evidence source that
+  bypasses Chroma and compression.
+- Added `run/eval_gold_evidence.sh` and
+  `run/grid_search/grid_dapr_nq_gold_evidence_oracle.yaml`.
+- Added `test/test_oracle_evidence.py`.
+- Documented the separate oracle condition in `docs/eval_protocol.md` and
+  `docs/codebase_guide.md`.
+- Added `test/analyze_dapr_msmarco.py` for reproducible answer-join and
+  parent-length auditing.
+
+### What was verified
+- All 2,390 NQ query strings exactly match the evidence-label order.
+- The oracle grid produced two successful 2,390-row prediction files.
+- Related oracle, NQ metric, and evidence tests passed: 15/15.
+- DAPR-MS MARCO has 2,722 queries. All 2,722 query IDs join to official
+  MS MARCO v2.1 validation, all question strings match exactly, and all have a
+  non-empty official answer list.
+- Full-corpus Llama-3.1-8B tokenizer statistics over 1,359,163 reconstructed
+  parent documents:
+  - mean 1,901.70 tokens
+  - p50 951, p75 1,816, p90 3,792, p95 6,530, p99 16,032
+  - maximum 446,042
+  - 77.675% exceed 512 tokens
+- The audit used `title + blank line + DAPR passages joined by blank lines`.
+- Free space remained 146GB because Hugging Face streaming did not persist the
+  multi-gigabyte corpus locally.
+
+### Oracle results
+- Both models used the unchanged prompt, `MAX_NEW_TOKENS=20`, cache-off
+  inference, official NQ-open normalized EM, and auxiliary token F1.
+- Mean full model input length was 221.1071 tokens for both models.
+- Llama-3.1-8B-Instruct, batch 64: EM 0.0778243, F1 0.3417700.
+- Llama-3.2-1B-Instruct, batch 128: EM 0.5397490, F1 0.6610129.
+- The 8B model generated 10.44 whitespace-delimited words on average versus
+  2.79 for 1B, frequently continuing after the correct short answer despite
+  the concise-answer system instruction. Therefore the 8B oracle score is
+  strongly affected by output-format behavior and is not a clean measure of
+  evidence sufficiency alone.
+
+### Evaluation comparability
+- Oracle EM/F1 uses the same prompt and answer evaluator as normal NQ runs, but
+  retrieval and compression are bypassed. Its latency is not comparable to
+  end-to-end RAG latency.
+- No titles, neighboring text, or parent-document text are added to the oracle
+  evidence.
+- The DAPR-MS MARCO audit changes no dataset or evaluation behavior.
+
+### Open issues
+- DAPR-MS MARCO answers are official and perfectly joinable, but the task mix
+  contains 1,456 DESCRIPTION queries out of 2,722. Its suitability as a
+  concise factoid-QA main benchmark still requires judgment.
+- The full test suite could not be collected in the non-vLLM `sglang`
+  environment because it lacks DeepSpeed and third-party ColBERT test
+  dependencies. All directly related tests passed.
+
+### Next steps
+- Decide whether to use DAPR-MS MARCO despite its description-heavy QA mix.
+- Before interpreting the 8B oracle as a reader upper bound, decide whether to
+  add a separately named output-format-controlled condition; do not overwrite
+  the current protocol.
+
+## 2026-07-26 — Diagnose long 8B oracle generations
+
+### Objective
+- Determine whether the abnormally long 8B gold-evidence oracle outputs were
+  caused by the decode path recognizing only one of Llama's configured EOS
+  token IDs.
+
+### What was changed
+- Added `test/diagnose_oracle_eos.py`, a diagnostic that reproduces an original
+  oracle batch and captures generated token IDs before special-token removal.
+- Added an optional comparison against one standard, uninterrupted
+  `model.generate()` call.
+- No model, prompt, generation, or evaluation behavior was changed.
+
+### What was verified
+- All 64 predictions in the original first 8B oracle batch were reproduced
+  exactly.
+- None of those 64 raw 20-token generations contained any of Llama's configured
+  EOS IDs: `128001`, `128008`, or `128009`.
+- The first query produced the same repeated 20-token answer at batch size 64
+  and batch size 1.
+- The first query also produced exactly the same raw token sequence with the
+  project's two-stage generation path and a standard one-shot
+  `model.generate()` call.
+
+### Open issues
+- The long-output anomaly is not caused by an ignored EOS token, batch padding
+  for the first reproduced query, or the project's two-stage generation path.
+- The current decode code still narrows the configured EOS list in some paths,
+  but that separate defect did not cause the reproduced oracle anomaly.
+- The remaining controlled difference is the oracle context itself: a short
+  set of labeled passages without title or neighboring/retrieved passages.
+
+### Next steps
+- Compare the same queries under gold evidence alone versus gold evidence plus
+  title and/or controlled additional passages without changing the reported
+  oracle protocol.
+
+## 2026-07-26 — Compare 8B oracle context variants
+
+### Objective
+- Test whether the long 8B oracle outputs are changed by adding the gold title,
+  the full gold parent document, or the original Vanilla-512 K=10 retrieval
+  context.
+
+### What was changed
+- Extended `test/diagnose_oracle_eos.py` with a read-only context-comparison
+  mode.
+- No production prompt, generation, or evaluation behavior was changed.
+
+### What was verified
+- Compared 11 long-output cases from the beginning of the oracle run at batch
+  size 1.
+- Evidence-only regenerated all 11 saved long oracle predictions exactly.
+- Adding only the gold document title did not produce a clean short answer in
+  any of the 11 cases.
+- Using the full gold parent document produced clearly concise outputs in 6
+  cases and shortened one additional case, but remained verbose in 4 cases.
+- Using each query's exact saved Vanilla-512 K=10 contexts reproduced the saved
+  concise vanilla behavior in all 11 cases.
+- Example query `how many episodes are in chicago fire season 4` was separately
+  verified to repeat identically under batch sizes 64 and 1 and under both
+  two-stage and one-shot generation.
+
+### Open issues
+- The anomaly is driven by context composition: short qrel passage-only prompts
+  cause the 8B model to continue without EOS, while the longer normal RAG
+  contexts generally cause concise termination.
+- Title omission alone does not explain the anomaly.
+- These results do not justify changing the established prompt protocol
+  silently; a separately named controlled reader condition is needed if the
+  oracle is retained.
+
+### Next steps
+- If a pure length effect must be isolated from content, append a fixed,
+  query-independent distractor set to the same gold passages and sweep target
+  prompt lengths while keeping the gold text unchanged.
+
+## 2026-07-26 — Compare 1B and 8B oracle termination behavior
+
+### Objective
+- Explain why the same sparse evidence-only prompts appear well behaved for 1B
+  but produce long continuations for 8B.
+
+### What was changed
+- Extended the read-only oracle diagnostic to report raw decoded text,
+  postprocessing changes, EOS incidence, and summary-only output.
+- No production or evaluation behavior was changed.
+
+### What was verified
+- On the first original 1B batch (128 queries), 95/128 generations contained an
+  EOS token and 32/128 saved predictions were shortened by the existing model
+  postprocessor.
+- Example 1B raw output was
+  `23\nQuestion: when did season 4 ...`; the postprocessor cut at the newline
+  and stored only `23`.
+- On the first original 8B batch (64 queries), only 4/64 generations contained
+  EOS and only 2/64 were shortened by the same postprocessor.
+- All regenerated saved outputs matched exactly.
+
+### Open issues
+- Sparse context is a trigger condition, not a sufficient cross-model
+  explanation. Llama-3.2-1B-Instruct and Llama-3.1-8B-Instruct have different
+  post-training and termination behavior under this raw prompt.
+- The apparently clean 1B oracle output is partly due to actual EOS generation
+  and partly due to newline/marker postprocessing; it is not evidence that 1B
+  raw generation always terminates cleanly.
+
+### Next steps
+- Treat the current 1B/8B oracle comparison as model-specific pipeline behavior,
+  not a monotonic reader-capacity comparison.
+- If the oracle is used as a reader upper bound, define a separate controlled
+  output protocol and rerun all compared methods under that same protocol.
+
+## 2026-07-26 — Isolate the 8B oracle prompt-format failure
+
+### Objective
+- Test whether the abnormal short-context behavior comes from the current raw
+  prompt serialization rather than evidence sparsity or generation code.
+
+### What was changed
+- Added diagnostic-only instruction-first and official tokenizer chat-template
+  prompt variants to `test/diagnose_oracle_eos.py`.
+- Verified that the chat string is tokenized to exactly the same IDs as
+  `tokenizer.apply_chat_template(..., tokenize=True)`, avoiding a duplicated
+  BOS token.
+- No production prompt or evaluation behavior was changed.
+
+### What was verified
+- For 11 long-output 8B oracle cases, the current raw evidence-only prompt
+  remained verbose in 11/11 cases.
+- Merely moving the instruction before the evidence fixed only a subset.
+- Official Llama chat serialization produced concise 2–3 word outputs in all
+  11/11 cases using the same evidence and questions.
+- The representative `23 episodes` case changed from repeated output under the
+  current raw prompt to the concise `23 episodes` under official chat
+  serialization.
+
+### Open issues
+- The established project prompt is intentionally cache-oriented
+  (`[chunks][instruction][query]`) but is not the official serialization used
+  to post-train Llama Instruct checkpoints.
+- Long normal RAG contexts often mask this incompatibility, whereas short
+  evidence-only prompts expose it.
+- Changing only the oracle to chat serialization would destroy prompt-protocol
+  comparability with Vanilla/subchunk results. Changing all methods would be a
+  new evaluation protocol and may conflict with the cache-prefix design.
+
+### Next steps
+- Decide whether the oracle should be dropped, reported explicitly as using the
+  existing raw prompt, or rerun together with every compared method under a
+  separately named prompt protocol.
+
+## 2026-07-26 — Test cache-oriented user-only chat serialization
+
+### Objective
+- Test an official chat serialization that preserves the project's chunk-first
+  order:
+  `[BOS + user header][passages][instruction][question][EOT + assistant header]`.
+
+### What was changed
+- Added the diagnostic-only `chat_user_only_chunk_first` prompt variant to
+  `test/diagnose_oracle_eos.py`.
+- Added a prompt-format-only mode to avoid rerunning unrelated long-context
+  controls.
+- No production prompt, cache artifact, or evaluation behavior was changed.
+
+### What was verified
+- The first 16 8B oracle queries were evaluated at batch size 1.
+- Current raw chunk-first prompting remained verbose or repetitive.
+- The user-only chunk-first chat variant produced concise answers for all
+  16/16 queries; the only eight-word output was the legitimately multi-location
+  answer for `where do characters live in this is us`.
+- Representative outputs included:
+  - `23` instead of repeated `23 episodes`
+  - `Timothy B. Schmit`
+  - `Hold On`
+  - `January 2, 1971`
+- Its token length matched the standard system/user chat condition in these
+  cases and added about 31 role-boundary tokens relative to the raw prompt.
+
+### Open issues
+- This is a 16-query termination/format diagnostic, not a replacement QA result.
+- A full comparison must use the same serialization for oracle, Vanilla, and
+  subchunk conditions.
+- KV materialization would need to account for the fixed `BOS + user header`
+  prefix; existing raw-prefix KV artifacts are not automatically equivalent.
+
+### Next steps
+- If approved, add a separately named prompt protocol and run a small matched
+  Vanilla/subchunk/oracle quality check before rebuilding or changing any main
+  experiment.
+
+## 2026-07-26 — Full standard-chat DAPR-NQ oracle rerun
+
+### Objective
+- Rerun the complete 2,390-query 8B and 1B gold-evidence oracle with the
+  tokenizer's standard system/user chat template.
+
+### What was changed
+- Added the explicit prompt formats `raw_chunk_first` (unchanged default) and
+  `chat_system_user` to `PromptProcessor`/`LLMModel`.
+- Added the cache-off-only `prompt_format` evaluation argument.
+- Updated `run/eval_gold_evidence.sh` to pass explicit `PROMPT_FORMAT`.
+- Changed the oracle grid to the distinct run name
+  `dapr-nq-gold-evidence-oracle-chat-0726` with
+  `PROMPT_FORMAT=chat_system_user`.
+- Added prompt-format unit tests and documented the separate protocol.
+
+### What was verified
+- 11 related prompt/oracle/NQ evaluator tests passed in the non-vLLM `sglang`
+  environment.
+- For both Llama-3.1-8B-Instruct and Llama-3.2-1B-Instruct, actual prompt token
+  IDs exactly matched `tokenizer.apply_chat_template(..., tokenize=True,
+  add_generation_prompt=True)`.
+- Both full prediction files contain exactly 2,390 rows.
+- Standard-chat oracle results:
+  - 8B, batch 64: EM 0.6644351, auxiliary F1 0.7580131, mean input 252.1105.
+  - 1B, batch 128: EM 0.4761506, auxiliary F1 0.5976371, mean input 252.1105.
+- Output-format diagnostics:
+  - 8B raw -> chat: mean output words 10.44 -> 2.67; at least 12 words
+    51.0% -> 1.34%.
+  - 1B raw -> chat: mean output words 2.79 -> 2.21; at least 12 words
+    2.05% -> 1.38%.
+
+### Evaluation comparability
+- The standard-chat oracle is a new prompt protocol and is not directly
+  comparable to raw-prompt Vanilla/subchunk answer-quality results.
+- The old raw oracle files remain unchanged under
+  `dapr-nq-gold-evidence-oracle-0726`.
+- The default prompt format remains `raw_chunk_first`; no existing main run was
+  silently changed.
+
+### Open issues
+- Standard chat fixes the 8B output-format failure but lowers 1B answer quality
+  relative to its raw-prompt oracle:
+  - 8B raw: EM 0.0778243, F1 0.3417700.
+  - 1B raw: EM 0.5397490, F1 0.6610129.
+- A matched standard-chat Vanilla/subchunk rerun would be required before using
+  the new oracle as their reader upper bound.
+
+### Next steps
+- Decide whether to adopt standard chat as a new full evaluation protocol or
+  retain raw chunk-first prompting and omit the oracle upper-bound comparison.
+
+## 2026-07-26 — Prepare standard-chat 1B DAPR-NQ RAG grid
+
+### Objective
+- Apply the standard system/user chat prompt to the existing 14-case
+  `grid_dapr_nq_bge_rag_sllm.yaml` suite without overwriting raw-prompt results.
+
+### What was changed
+- Changed the grid run name to `dapr-nq-bge-rag-sllm-chat-0726`.
+- Added `PROMPT_FORMAT=chat_system_user` under `eval_fixed_env`.
+- Updated `run/eval.sh` to pass explicit `PROMPT_FORMAT` to the evaluation
+  entrypoint and include non-default prompt formats in standalone output
+  suffixes.
+- Kept `raw_chunk_first` as the default and kept the grid cache-off.
+
+### What was verified
+- Shell syntax validation passed.
+- YAML parsing verified the new run name, standard-chat prompt, cache-off mode,
+  and all 14 original evaluation cases.
+- Three prompt-format unit tests passed in the non-vLLM `sglang` environment.
+
+### Evaluation comparability
+- This grid is a new prompt protocol and must not be merged with or directly
+  compared as though it were the earlier raw-prompt sLLM run.
+- DBs, retrieval settings, compression settings, model, and case batch sizes
+  are unchanged.
+
+### Open issues
+- The grid has been prepared but not launched.
+
+### Next steps
+- Launch `run/grid_search/grid_dapr_nq_bge_rag_sllm.yaml` when requested and
+  compare its 1B standard-chat results with the standard-chat 1B oracle.
+
+## 2026-07-26 — Clarify corpus terminology
+
+### Objective
+- Prevent unexplained use of `shared corpus` and `pooled corpus` in dataset
+  recommendations.
+
+### What was changed
+- Added explicit definitions to `docs/glossary.md`.
+- Recorded that user-facing discussion must explain either term on first use
+  and identify exactly which documents are included.
+
+### What was verified
+- For the proposed NewsQA conversion, the intended meaning is one vector DB
+  containing all 12,744 CNN source articles, searched by every evaluation
+  question.
+
+### Open issues
+- This NewsQA setup is a derived retrieval benchmark; original NewsQA gives
+  each question its associated article and does not define retrieval over the
+  complete article collection.
+
+### Next steps
+- Use plain descriptions before introducing corpus shorthand in future dataset
+  discussions.
+
+## 2026-07-26 — Clarify dataset-selection criteria
+
+### Objective
+- Record the user's exact criteria for recommending datasets for the current
+  fixed-chunk versus fine-grained evidence-selection experiment.
+
+### What was changed
+- Documentation only; no code, dataset, or evaluation behavior was changed.
+
+### What was verified
+- The required dataset-selection criteria are:
+  - factoid question answering;
+  - sufficiently long source documents to construct coarse 512-token retrieval
+    chunks;
+  - annotated answer evidence at any granularity, not necessarily passage
+    level, so fine-grained evidence selection can be evaluated;
+  - final answer strings for answer-quality evaluation as well as retrieval
+    evaluation;
+  - support for comparing fixed chunks and the proposed fine-grained chunk
+    compression under the same conditions;
+  - concise-answer tasks.
+- Using the full document corpus to avoid gold-document leakage is not one of
+  the user's dataset-selection criteria. It was a separate implementation and
+  evaluation-fairness requirement applied when constructing the local
+  DAPR-NQ/NQ-open dataset.
+
+### Open issues
+- Dataset recommendations should be reassessed against only the criteria above;
+  separate corpus-construction safeguards must not be presented as user
+  selection criteria.
+
+### Next steps
+- Apply these exact criteria if the user requests a new dataset search or
+  recommendation comparison.
+
+## 2026-07-26 — Reassess benchmark recommendations using corrected criteria
+
+### Objective
+- Recommend benchmarks using only the user's corrected criteria: factoid
+  question answering, long source documents suitable for 512-token coarse
+  chunks, annotated evidence, final answer strings, matched fixed/subchunk
+  comparison, and concise answers.
+
+### What was changed
+- Documentation only; no code, dataset, evaluation protocol, or experiment
+  artifact was changed.
+
+### What was verified
+- MultiHop-RAG is the closest direct match:
+  - 609 English news articles, each at least 1,024 tokens and 2,046.5 tokens on
+    average;
+  - 2,556 queries with exact supporting evidence sentences from two to four
+    articles for non-null queries;
+  - answers constrained to a single entity, yes/no, a temporal indicator, or
+    an insufficient-information response;
+  - a self-contained shared corpus that can be split into 512-token chunks for
+    matched fixed-chunk and fine-grained-selection comparisons.
+- MultiHop-RAG's main limitation is provenance: GPT-4 generated the claims,
+  questions, and answers; only a subset received manual review. It contains
+  301 null queries, which require an explicit reporting decision.
+- Original Natural Questions is the strongest human-annotated complement:
+  each example contains an entire Wikipedia page, a long-answer region, and
+  short-answer or yes/no annotations. Its natural user questions and exact
+  token offsets are valuable for evidence-selection evaluation.
+- Original Natural Questions is not a ready-made shared-corpus RAG benchmark:
+  the task supplies one page per question. Treating paired pages as
+  within-document retrieval is faithful but does not test corpus-level
+  retrieval; pooling pages into a corpus is a separately documented
+  adaptation.
+- QASPER has entire research papers and evidence annotations but is not
+  restricted to concise factoid questions. A factoid/extractive subset would
+  be a custom evaluation subset.
+- IIRC supplies concise span, boolean, and numeric answers plus linked evidence,
+  but its released task is organized around a source paragraph and selected
+  linked-document snippets rather than guaranteed long source documents.
+- TriviaQA has long evidence documents and concise trivia answers, but its
+  evidence documents are distant supervision rather than reliable
+  fine-grained gold evidence labels.
+
+### Open issues
+- Decide whether the main benchmark should prioritize direct protocol fit
+  (MultiHop-RAG) or fully human-authored provenance (original Natural
+  Questions).
+- Before adopting MultiHop-RAG, audit the released evidence strings against the
+  article text and measure document/query token distributions with the exact
+  project tokenizer.
+- Any Natural Questions corpus pooling or subset filtering must be named and
+  documented as a new evaluation condition.
+
+### Next steps
+- Recommended validation sequence:
+  1. run a small MultiHop-RAG integrity and tokenizer-statistics audit;
+  2. run a matched fixed-512 versus proposed-method pilot;
+  3. use an original-Natural-Questions short-answer subset as a human-annotated
+     complementary evaluation if corpus construction is acceptable.
+
+## 2026-07-26 — Add retrieval-difficulty requirement to dataset criteria
+
+### Objective
+- Correct the dataset-selection criteria and recommendations after the user
+  added that initial retrieval must be sufficiently difficult, usually through
+  a large document collection.
+
+### What was changed
+- Documentation only; no code, dataset, evaluation protocol, or artifact was
+  changed.
+
+### Corrected criteria
+- Factoid question answering.
+- Source documents long enough for coarse 512-token retrieval chunks.
+- Sufficiently difficult initial retrieval; a large document collection is a
+  common, but not mandatory, way to obtain this difficulty.
+- Gold answer evidence is preferred but optional and may use any granularity.
+- Final answer strings are required.
+- Fixed-chunk and proposed fine-grained compression must be comparable under
+  identical conditions.
+- Answers must be concise.
+
+### What was verified
+- The previous first recommendation, MultiHop-RAG, has only 609 source
+  documents. Its documents and evidence annotations fit evidence compression,
+  but its corpus is weak for the newly stated retrieval-difficulty criterion.
+- KILT provides one fixed 2019-08-01 Wikipedia knowledge source containing
+  5,903,530 full pages represented as paragraph lists. Its open-domain QA tasks
+  include:
+  - HotpotQA fullwiki: 5,600 dev questions, short answers, and supporting
+    sentences from two required Wikipedia pages;
+  - Natural Questions: 2,837 dev questions after retaining short answers and
+    discarding answers longer than five tokens; long- and short-answer spans
+    are mapped as provenance;
+  - TriviaQA: 5,359 dev questions with extractive answers and mapped answer
+    spans, but the original evidence construction is distant supervision.
+- KILT therefore gives the strongest literal fit for difficult retrieval plus
+  concise QA and provenance. KILT HotpotQA is the best multi-hop candidate;
+  KILT Natural Questions is the best human-query single-hop complement.
+- KILT's 34.76-GiB raw knowledge-source file and 5.9M pages imply a much larger
+  preprocessing/indexing commitment than the current DAPR-NQ corpus. Exact
+  512-token chunk counts and vector-index cost require a tokenizer audit before
+  committing to a build.
+- The existing local DAPR-NQ/NQ-open intersection remains the most practical
+  fit:
+  - 108,626 long parent documents;
+  - 600,655 measured non-overlapping 512-token chunks;
+  - 2,390 concise official NQ-open QA examples;
+  - DAPR passage qrels for preferred evidence evaluation.
+  Its corpus is smaller than KILT but already large enough to make retrieval a
+  substantive experiment.
+- Original TriviaQA has 95,956 QA pairs, 662,659 automatically gathered
+  evidence documents, and an average document length of 2,895 words. It meets
+  scale, length, and concise-answer requirements, but the documents are distant
+  supervision and are not guaranteed to contain complete answer evidence.
+
+### Recommendation
+- Best literal benchmark: KILT HotpotQA fullwiki.
+- Best human-authored single-hop complement: KILT Natural Questions.
+- Best practical benchmark with current artifacts: the local
+  DAPR-NQ/NQ-open intersection.
+- Large alternative when gold evidence is optional: TriviaQA, preferably the
+  KILT Wikipedia-aligned version for a fixed reproducible corpus.
+
+### Open issues
+- Measure the project-tokenizer page-length distribution for KILT gold pages;
+  full Wikipedia pages are available, but not every page is guaranteed to
+  exceed 512 project tokens.
+- Estimate KILT fixed-512 Chroma and ColBERT artifact sizes before selecting it;
+  do not start a full build from the recommendation alone.
+- KILT maps older datasets to one Wikipedia snapshot and discards examples
+  whose provenance cannot be aligned. Results must be named as KILT variants,
+  not the original full datasets.
+
+### Next steps
+- If the user wants to adopt a new benchmark, perform a read-only feasibility
+  audit comparing KILT HotpotQA, KILT Natural Questions, and KILT TriviaQA
+  query counts, gold-page token lengths, expected chunk counts, storage cost,
+  and compatibility with the current local dataset interface.
+
+## 2026-07-26 — Reassess DAPR-MS MARCO as the main QA benchmark
+
+### Objective
+- Determine whether DAPR-MS MARCO is a practical alternative after DAPR-NQ
+  proved difficult and KILT-scale corpora were judged too large.
+
+### What was changed
+- Re-ran the existing answer-only feasibility audit and wrote its temporary
+  output under `/tmp`.
+- No repository code, dataset, evaluation protocol, or persistent experiment
+  artifact was changed.
+
+### What was verified
+- All 2,722 DAPR-MS MARCO queries still join exactly by ID and question text to
+  a non-empty official MS MARCO v2.1 validation answer list.
+- Official query-type counts are:
+  - DESCRIPTION: 1,456;
+  - NUMERIC: 644;
+  - ENTITY: 284;
+  - PERSON: 174;
+  - LOCATION: 164.
+- The four clearly factoid-oriented labels total 1,266 queries.
+- Primary official answer lengths over all 2,722 queries are:
+  - mean 15.68 whitespace-delimited words;
+  - median 12.5;
+  - p75 21, p90 32, maximum 101;
+  - only 485 answers are at most five words;
+  - only 1,132 answers are at most ten words.
+- Only 555 queries have a non-empty `wellFormedAnswers` field. The ordinary
+  `answers` field is complete but often sentence-length.
+- Previously measured corpus scale remains:
+  - 1,359,163 parent documents;
+  - mean 1,901.70 Llama-3.1-8B tokens per document;
+  - 77.675% exceed 512 tokens.
+- This is materially larger than DAPR-NQ: approximately 2.58B parent-document
+  tokens versus 278.69M, a 9.27x token-volume ratio. A non-overlapping
+  512-token build therefore has a theoretical floor of about 5.05M chunks
+  before per-document rounding, versus DAPR-NQ's measured 600,655 chunks.
+- A same-design ColBERT artifact would be on the order of several hundred
+  gigabytes if it scaled approximately with DAPR-NQ's stored center-token
+  volume. This is an estimate, not a measured DAPR-MS MARCO artifact size.
+
+### Conclusion
+- Full DAPR-MS MARCO satisfies long-document, difficult-retrieval, answer-label,
+  passage-qrel, and matched-method-comparison requirements.
+- It does not satisfy the concise-answer criterion as a whole and is
+  substantially more expensive than DAPR-NQ, not a cheaper substitute.
+- A separately named factoid subset based on ENTITY, LOCATION, NUMERIC, and
+  PERSON is potentially viable, but its per-type answer lengths and answer
+  grounding must be audited first. It would still require searching the full
+  1.36M-document corpus to preserve the original retrieval condition.
+
+### Open issues
+- Per-query-type answer-length and gold-passage answer-containment statistics
+  have not been measured.
+- Reducing the document collection for feasibility would define a different,
+  easier retrieval protocol and must not be done silently.
+
+### Next steps
+- Do not start a full DAPR-MS MARCO build from the current evidence.
+- If the factoid subset remains of interest, first run an answer/evidence audit
+  for the 1,266 non-DESCRIPTION queries and estimate exact 512-token chunk and
+  artifact sizes from a fixed-seed sample.
+
+## 2026-07-26 — Rank the remaining DAPR datasets under feasibility constraints
+
+### Objective
+- Determine whether any DAPR dataset other than Natural Questions or MS MARCO
+  meets the user's long-document, difficult-retrieval, evidence-aware,
+  concise-answer QA criteria at a lower preprocessing cost.
+
+### What was changed
+- Documentation only; no code, dataset, evaluation protocol, or artifact was
+  changed.
+
+### What was verified
+- DAPR contains five full datasets:
+  - MS MARCO: 1,359,163 documents and 2,722 test queries;
+  - Natural Questions: 108,626 documents and 3,610 test queries;
+  - MIRACL: 5,758,285 documents and 799 test queries;
+  - Genomics: 162,259 documents and 62 test queries;
+  - ConditionalQA: 652 documents and 271 test queries.
+- MIRACL exceeds even MS MARCO in document count and DAPR does not provide a
+  directly usable concise QA-answer endpoint for it.
+- Genomics has a potentially manageable document collection but only 62 test
+  queries and is an information-retrieval relevance task, not a concise
+  answer-generation benchmark.
+- NQ-hard contains 479 deliberately selected Natural Questions cases for which
+  all tested passage retrievers had zero nDCG@10 and the relevant passages
+  required document context. It reuses the full 108,626-document NQ corpus, so
+  it reduces query count but not preprocessing or index cost. It is a stress
+  subset, not an appropriate primary benchmark.
+- ConditionalQA is the only substantially cheaper DAPR candidate:
+  - 652 parent documents;
+  - 271 test queries;
+  - 2,400 measured fixed-512 chunks in the local DB;
+  - DAPR passage qrels and official answer strings are available;
+  - DAPR reports passage-only ColBERTv2 nDCG@10 of 21.6, lower than its 46.6
+    on Natural Questions, showing empirical retrieval difficulty despite the
+    small document collection.
+- ConditionalQA does not cleanly meet the requested answer protocol:
+  - 143/271 questions have yes/no gold answers;
+  - 58/271 require two to five distinct answers;
+  - the current one-string shortest-answer prompt cannot represent the full
+    official multi-answer output;
+  - only 213 queries have exactly one official answer, and only 128 are
+    extractive rather than yes/no.
+- The small 271-query scale produces wide paired confidence intervals in
+  existing fixed-chunk comparisons, limiting its value as the sole main paper
+  benchmark.
+
+### Conclusion
+- No remaining DAPR dataset fully satisfies all requested criteria while also
+  being materially easier to preprocess than DAPR-NQ.
+- ConditionalQA is the only useful low-cost option, but only as:
+  - a secondary evidence-compression benchmark under the full official
+    multi-answer protocol; or
+  - an explicitly named 213-query single-answer diagnostic subset.
+- It should not be presented as a large-corpus retrieval benchmark or as the
+  sole factoid-QA benchmark.
+
+### Open issues
+- Whether yes/no conditional policy questions count as sufficiently factoid for
+  the intended paper claim is a research-scope decision.
+- Using the 213-query single-answer subset would require a newly documented
+  evaluation condition; existing full-271 results must remain distinct.
+
+### Next steps
+- If staying strictly within DAPR, choose between:
+  1. retaining DAPR-NQ as the main benchmark and reducing implementation cost
+     without changing its corpus;
+  2. using ConditionalQA only as a lightweight secondary benchmark;
+  3. relaxing the DAPR-only constraint and searching for a medium-scale
+     long-document QA corpus.
+
+## 2026-07-26 — Clarify answer supervision in original Genomics
+
+### Objective
+- Distinguish the absence of final QA answer strings from the presence of
+  answer-related relevance annotations in the original TREC Genomics data.
+
+### What was changed
+- Documentation only; no code, dataset, or evaluation behavior was changed.
+
+### What was verified
+- DAPR Genomics combines the TREC 2006 and 2007 Genomics passage-retrieval
+  tasks.
+- The original tasks provide biomedical topic questions and require systems to
+  retrieve passages from full-text journal articles that contain answers.
+- Expert judges label passage relevance:
+  - TREC 2006 also groups relevant passages into answer aspects identified by
+    one or more Medical Subject Headings terms;
+  - TREC 2007 uses entity-oriented questions and evaluates passage relevance,
+    entity/aspect coverage, and document retrieval.
+- The word `answer` in the task descriptions often refers to an
+  answer-containing passage or a covered biological aspect/entity. The
+  released task is evaluated with passage/aspect/document retrieval metrics.
+- Neither the original TREC task nor the DAPR conversion supplies one
+  canonical concise final-answer string or an ordinary answer-alias list per
+  question that can be scored directly with Exact Match or token F1.
+
+### Conclusion
+- It is inaccurate to say that original Genomics has no answer supervision at
+  all.
+- It is accurate to say that it has no directly usable final QA answer-string
+  endpoint for the project's generation evaluation.
+- Constructing answer strings from aspect/entity annotations or passages would
+  create a new custom dataset and scoring protocol requiring biomedical
+  validation.
+
+### Next steps
+- Keep Genomics classified as a retrieval/evidence-selection benchmark unless
+  the user explicitly approves building and validating a new biomedical answer
+  generation target.
+
+## 2026-07-26 — Search for feasible non-DAPR long-document QA datasets
+
+### Objective
+- Identify alternatives that retain long-source factual question answering and
+  nontrivial retrieval while avoiding the preprocessing cost of DAPR-NQ and
+  the corpus size of KILT.
+
+### What was changed
+- Documentation only; no code, dataset, index, prompt, metric, or evaluation
+  behavior was changed.
+
+### What was verified
+- MultiHop-RAG is a naturally pooled retrieval-augmented generation benchmark:
+  - 609 English news documents, each at least 1,024 tokens and averaging
+    2,046.5 tokens;
+  - 2,556 questions, with evidence drawn from two to four documents;
+  - concise answer types including entities, yes/no, temporal comparisons, and
+    insufficient-information cases;
+  - sentence-level supporting evidence;
+  - published retrieval results remain imperfect even with reranking
+    (Hits@10 0.7467 and Hits@4 0.6625 in the reported setup).
+  Its main limitation is that questions and answers were generated with GPT-4
+  and only a subset received manual review.
+- UDA-Benchmark NqText is a lightweight human-annotated alternative:
+  - 645 long Wikipedia documents and 2,477 extractive QA examples;
+  - source documents average approximately 6,100 words and 14.9 pages;
+  - answer strings and evidence-oriented annotations are available;
+  - published segment-retrieval scores are nontrivial, including a
+    longest-common-subsequence evidence score of 49.1 at rank 1 and 77.3 at
+    rank 10 for all-MiniLM-L6 on the reported sample.
+- The published UDA retrieval experiment retrieves segments within each known
+  source document. Pooling all 645 NqText documents into one shared index would
+  therefore be a new project-specific cross-document retrieval protocol, not a
+  direct reproduction of the official benchmark.
+- UDA PaperText is another long-document option, with 1,087 research papers
+  and 2,804 QA examples, but it mixes extractive, yes/no, and free-form
+  questions and is less cleanly factoid.
+- DocFinQA has 801 very long financial filings and 7,437 concise-answer
+  questions, but many answers require numerical programs and table-aware
+  evidence handling. It does not match the current text-only sentence-unit
+  method without changing the research scope.
+- IIRC uses linked Wikipedia documents and provides concise span, boolean, and
+  numeric answers, but its released retrieval setting begins from a source
+  paragraph and follows linked documents rather than searching a clean pooled
+  corpus of long documents.
+- TechQA supplies a large real technical-document corpus and answer spans, but
+  has only 1,400 questions across all splits, often uses long answers, and its
+  801,998-document corpus does not solve the current resource constraint.
+
+### Conclusion
+- MultiHop-RAG is the strongest direct fit under the current constraints:
+  it has a shared corpus, long documents, explicit evidence, concise answers,
+  and empirically difficult multi-document retrieval at modest corpus size.
+- UDA NqText is the strongest complementary human-annotated option, but should
+  be described as a custom pooled-corpus adaptation if all documents are
+  indexed together.
+- Only these two are serious current-scope candidates; DocFinQA is better
+  reserved for a future structure-aware table-and-text extension.
+
+### Open issues
+- MultiHop-RAG's synthetic question and answer construction may limit claims
+  about natural user queries.
+- UDA NqText requires an audit of the released evidence fields and a clearly
+  documented pooled-corpus construction protocol.
+- Published retrieval scores use different models and protocols from the
+  project's Chroma/all-MiniLM-L6 setup and do not directly establish local
+  retrieval difficulty.
+
+### Next steps
+- Before committing to either dataset, run a read-only data audit for:
+  tokenizer-measured document and chunk counts, evidence containment after
+  512-token chunking, duplicate documents or questions, answer-length
+  distribution, and a small fixed-chunk retrieval baseline using the project's
+  current retriever.
+
+## 2026-07-26 — Reassess candidates with corpus size as a hard constraint
+
+### Objective
+- Reassess the previous recommendation after determining that a 609-document
+  corpus is too small for the intended large-corpus retrieval claim.
+
+### What was changed
+- Documentation only; no code, data, or evaluation behavior was changed.
+
+### What was verified
+- MultiHop-RAG can be empirically difficult because each question requires
+  multiple evidence documents, but its 609-document corpus does not provide
+  enough distractor-document scale for a strong large-corpus retrieval claim.
+- TriviaQA's Wikipedia reading-comprehension split contains long source
+  documents and concise human-authored trivia answers:
+  - 61,888 train questions with 110,648 document instances;
+  - 7,993 development questions with 14,229 document instances;
+  - 7,701 test questions with 13,661 document instances;
+  - the full TriviaQA collection averages 2,895 words per evidence document;
+  - answer aliases support Exact Match and token F1 evaluation.
+- TriviaQA does not provide manually marked answer spans. The original baseline
+  approximates an answer span using the first answer-string match, and the
+  automatically gathered evidence is noisy; a manual audit found some examples
+  without valid evidence or with incomplete answer keys.
+- Pooling the Wikipedia development documents into one shared retrieval corpus
+  would create an approximately 14,000-document-instance medium-scale
+  condition before deduplication. This is a reproducible project adaptation,
+  not the original per-question reading-comprehension protocol.
+- HotpotQA fullwiki supplies concise answers and sentence-level supporting
+  facts under an official global-retrieval setting, but searches more than five
+  million Wikipedia paragraphs. It is computationally less suitable than the
+  desired middle-scale option.
+
+### Conclusion
+- MultiHop-RAG should be demoted to a small-corpus secondary diagnostic if
+  corpus scale is a required part of the research claim.
+- TriviaQA-Wikipedia development documents pooled into a shared index are the
+  strongest currently identified medium-scale candidate, subject to a local
+  audit of unique-document count and retrieval difficulty.
+- There is no verified turnkey benchmark found so far that simultaneously
+  provides an official 10,000–100,000-long-document global corpus,
+  sentence-level gold evidence, concise answers, and low preprocessing cost.
+
+### Open issues
+- TriviaQA document counts are document associations or instances; the number
+  of unique pages after deduplication must be measured from the release.
+- Retrieval difficulty under the project's all-MiniLM-L6 fixed-512 setup is
+  unknown and must not be inferred from the original reading-comprehension
+  results.
+- Using answer-string occurrences as fine-evidence labels can introduce false
+  positives when the same string occurs in an unrelated context.
+
+### Next steps
+- Audit TriviaQA-Wikipedia development data before implementation:
+  unique document count, token and chunk counts, answer containment, duplicate
+  answer occurrences, and fixed-chunk Recall@K.
+- If the pooled corpus remains too easy, compare it with a deterministic
+  10,000–50,000-document DAPR-NQ subset that retains every evaluated gold
+  document and samples distractors with an explicit seed; label that condition
+  as a custom corpus-size ablation rather than an official benchmark.
+
+## 2026-07-26 — Correct the scope of the TriviaQA recommendation
+
+### Objective
+- Resolve the apparent conflict between full TriviaQA release statistics and
+  the previously proposed approximately 14,000-document condition.
+
+### What was changed
+- Documentation only; no code, data, or evaluation behavior was changed.
+
+### What was verified
+- The earlier approximately 14,000 figure refers specifically to the
+  Wikipedia reading-comprehension development split: 7,993 questions and
+  14,229 question-associated document instances.
+- It does not describe the full TriviaQA reading-comprehension release or the
+  unfiltered open-domain release.
+- The original paper reports, by reading-comprehension domain:
+  - Wikipedia: 61,888/7,993/7,701 train/dev/test questions and
+    110,648/14,229/13,661 document instances;
+  - Web: 76,496/9,951/9,509 train/dev/test questions and
+    528,979/68,621/65,059 document instances.
+- The 662,659 document count is the sum of the Web-domain document instances
+  across those three splits. The paper also reports 95,956 filtered QA pairs
+  and an average evidence-document length of 2,895 words.
+- The official release page describes the unfiltered release as 110,000-plus
+  QA pairs and approximately 740,000 evidence documents and explicitly says it
+  is more appropriate for information-retrieval-style QA because documents
+  without the answer string are retained.
+- Pooling only the 14,229 Wikipedia development document instances is a custom
+  corpus construction. Those documents were gathered in association with the
+  evaluation questions and, in the reading-comprehension release, filtered
+  based on answer-string occurrence. It is not an official open-domain
+  retrieval corpus and its retrieval difficulty is unverified.
+
+### Conclusion
+- The full-release description and the earlier 14,229-document statement are
+  not numerically inconsistent; they refer to different configurations.
+- For choosing an existing open-domain benchmark, the full unfiltered
+  TriviaQA statistics are the relevant ones.
+- The previous recommendation presented the custom Wikipedia-development
+  pooling option too strongly. Under the user's requirement for a substantial,
+  naturally distractor-rich retrieval corpus, TriviaQA is either:
+  - large and expensive in its unfiltered form; or
+  - medium-sized only after a custom, potentially selection-biased reduction.
+- TriviaQA should therefore not currently be presented as a clean turnkey
+  solution to the resource-versus-retrieval-difficulty tradeoff.
+
+### Open issues
+- Exact unique-document counts after URL or Wikipedia-page deduplication must
+  be measured from the release; reported counts are document instances.
+- The unfiltered release has no human-annotated supporting spans, and
+  answer-string occurrence is not guaranteed to be valid evidence.
+
+### Next steps
+- Do not implement the 14,229-document pooled condition as an official
+  TriviaQA benchmark without explicit approval and protocol documentation.
+- Continue searching for a naturally medium-scale corpus, or explicitly choose
+  a reproducible corpus-size ablation of an established large benchmark.
+
+## 2026-07-26 — NewsQA RAG precedent and original TriviaQA statistics
+
+### Objective
+- Verify whether NewsQA has been converted into a corpus-retrieval RAG task in
+  prior work and establish primary-source corpus statistics for original
+  TriviaQA.
+
+### What was changed
+- Documentation only; no code, dataset, index, prompt, metric, or evaluation
+  behavior was changed.
+
+### What was verified
+- Siriwardhana et al., TACL 2023 converted NewsQA into a RAG setup by splitting
+  10,000 NewsQA articles into 85,000 passages of 100 words and indexing them as
+  one knowledge base. Their experiment used 100,000 QA pairs split into 90,000
+  train, 5,000 validation, and 5,000 test examples.
+- The official Microsoft NewsQA statistics are broader: 12,744 stories,
+  119,633 QA pairs, and 616 words per article on average. The TACL setup is
+  therefore a filtered/rounded experimental construction rather than the full
+  official NewsQA collection.
+- The original TriviaQA reading-comprehension release reports 95,956 unique QA
+  pairs, 662,659 evidence-document records, and 2,895 words per evidence
+  document on average.
+- TriviaQA also releases an unfiltered open-domain version with 110,495 QA
+  pairs and approximately 740,000 evidence-document records. Unlike the
+  reading-comprehension version, documents are not removed merely because they
+  lack the answer string.
+- The official TriviaQA document count is not documented as a count of
+  deduplicated URLs/pages. A project-wide retrieval corpus must measure unique
+  document identifiers or URLs after download before estimating DB and ColBERT
+  artifact sizes.
+
+### Open issues
+- The exact usable NewsQA question count under the project's preprocessing
+  policy depends on which official split and consensus/answerability filters
+  are selected.
+- TriviaQA supplies automatically gathered evidence documents rather than
+  manually annotated supporting spans for the full dataset.
+
+### Next steps
+- If either dataset is selected, first audit the raw release for unique
+  documents, split-level question counts, answerability, duplicate URLs, and
+  tokenizer-specific document-length percentiles before materialization.
+
+## 2026-07-26 — Test-split statistics for NewsQA and original TriviaQA
+
+### Objective
+- Separate test-query counts, test-associated documents, full-corpus document
+  counts, and document-length statistics for the two candidate datasets.
+
+### What was changed
+- Documentation only; no code, dataset, index, prompt, metric, or evaluation
+  behavior was changed.
+
+### What was verified
+- The standard processed NewsQA split has 5,126 test questions. Because NewsQA
+  is split by article, those questions are associated with 637 test articles.
+  The complete collection contains 12,744 articles. Official full-collection
+  length statistics are 616 words and 30.7 sentences per article on average;
+  official numeric test-only percentiles are not reported.
+- TriviaQA unfiltered has 10,832 test question records. The full unfiltered
+  release reports approximately 740,000 evidence-document records, but neither
+  a deduplicated unique-document count nor test-only document-length
+  percentiles are reported.
+- TriviaQA RC's combined test representation has 17,210 evaluation records:
+  7,701 Wikipedia-domain questions with 13,661 documents and 9,509 Web-domain
+  questions with 65,059 documents. The two domain counts must not be treated as
+  17,210 unique questions because a question can appear in both domains.
+- Across all RC splits, TriviaQA reports 662,659 evidence-document records and
+  an average document length of 2,895 words. This average is not a
+  tokenizer-specific or test-only measurement.
+
+### Open issues
+- For storage and artifact planning, TriviaQA must be downloaded and
+  deduplicated by stable document identifier or URL before its actual retrieval
+  corpus size is known.
+- Tokenizer-specific p50/p75/p90/p95 length distributions are not available
+  from the official aggregate statistics for either candidate's test corpus.
+
+### Next steps
+- If the user selects one candidate, compute test-only and full-corpus
+  tokenizer length distributions directly from the exact release used by the
+  preprocessing pipeline.
+
+## 2026-07-26 — NewsQA local-conversion feasibility audit
+
+### Objective
+- Determine whether NewsQA can be prepared in the project's local dataset
+  format using all articles as retrieval documents and only standard test
+  questions.
+
+### What was changed
+- Documentation only; no converter, dataset, metric, index, prompt, or
+  evaluation behavior was changed.
+
+### What was verified
+- No NewsQA source files currently exist under `/mnt/nvme1/datasets`.
+- The intended derived RAG collection is feasible:
+  - 12,744 full NewsQA articles as retrieval documents;
+  - 5,126 standard processed test-question records before any answerability
+    filtering;
+  - exact official answer spans can provide text evidence labels tied to each
+    question's original article.
+- The official NewsQA repository does not redistribute the CNN article text.
+  It compiles the dataset from a separately accepted NewsQA annotation archive
+  and the CNN stories distributed for the DeepMind CNN/DailyMail dataset.
+- An unofficial Hugging Face redistribution contains article text and the
+  5,126 test records, but retains only a reduced schema. It must not silently
+  replace the official source because it loses richer consensus and validation
+  annotations.
+- The current evaluator registry has no NewsQA-specific official scorer.
+
+### Open issues
+- The user must choose the source:
+  official compiled NewsQA inputs supplied locally, or explicit approval to use
+  the reduced unofficial Hugging Face redistribution.
+- NewsQA contains questions without a usable answer span and questions marked
+  bad. Retaining all 5,126 test records requires an explicit no-answer
+  prediction and scoring policy; restricting to answerable consensus questions
+  produces a smaller custom factoid subset. This must not be chosen silently.
+- The exact compiled article text must be preserved for evidence-span
+  alignment. Prepending a derived title or rebuilding text with different
+  whitespace would invalidate official character offsets.
+- Using all 12,744 articles with only test questions is a documented custom
+  full-corpus RAG adaptation, not the original reading-comprehension protocol
+  or the exact 10,000-article TACL RAG construction.
+
+### Next steps
+- After the source and answerability policy are approved, implement a minimal
+  converter with a manifest, exact-span validation, source-ID preservation,
+  duplicate checks, and unit tests before writing the dataset.
+
+## 2026-07-26 — Correction: official NewsQA test answerability policy
+
+### Objective
+- Verify the exact filtering used to produce the standard 5,126-question
+  NewsQA test split after an earlier unverified warning about no-answer cases.
+
+### What was changed
+- Documentation only; no dataset or evaluation behavior was changed.
+
+### What was verified
+- The official `Maluuba/newsqa` `split_dataset.py` reads every question's
+  pipe-separated `answer_char_ranges` and removes a row only when every
+  annotation is `None`.
+- The same official function then asserts exactly 92,549 train, 5,166 dev, and
+  5,126 test rows.
+- Therefore, the standard 5,126 test rows already exclude questions for which
+  all answerers supplied no text span. They may retain annotation disagreement
+  or individual `None` annotations when another annotator supplied a span.
+
+### Correction
+- The previous handoff entry incorrectly stated that retaining all 5,126 test
+  rows required a new no-answer scoring policy and suggested an
+  answerable-consensus subset. That suggestion was not based on the official
+  split code and must not be followed.
+- A faithful conversion must retain all 5,126 official test rows and preserve
+  every official non-`None` answer annotation. It must not impose an additional
+  consensus filter.
+
+### Next steps
+- Obtain the officially compiled NewsQA source files, convert the complete
+  5,126-row test split without additional filtering, validate every recorded
+  answer span against the exact article text, and record source checksums in the
+  dataset manifest.
+
+## 2026-07-26 — NewsQA source-archive audit and consensus-label caveat
+
+### Objective
+- Validate the user-provided official archives before implementing the local
+  NewsQA RAG conversion.
+
+### What was changed
+- Documentation only; no dataset converter or evaluation behavior was changed.
+- The official `Maluuba/newsqa` repository was cloned at commit
+  `d5bb9e9640e2ed7a31e209393376549d737d276b` for source inspection.
+
+### What was verified
+- `/mnt/nvme1/datasets/newsqa-data-v1.zip` contains the official 119,633-row
+  annotation CSV with 12,744 distinct story IDs.
+- `/mnt/nvme1/datasets/cnn_stories.tgz` contains 92,579 CNN story files, and
+  every one of the 12,744 annotated NewsQA story IDs is present.
+- `/mnt/nvme1/datasets/cnn.tgz` is the separate DeepMind question archive and
+  is not required for reconstructing NewsQA article text.
+- The official test-story list contains 637 stories. Those stories have 5,971
+  raw question rows; applying the official all-annotations-`None` exclusion
+  produces exactly 5,126 test rows.
+- `(story_id, question)` is unique for all 5,126 retained test rows.
+
+### Important label caveat
+- Of the official 5,126 retained test rows, 4,293 have a text-span consensus:
+  2,307 from the original answer annotations and 1,986 after validation.
+- The remaining 833 rows have no consensus text span:
+  241 have a raw `None` plurality, 256 have validated no-answer consensus, 36
+  have validated bad-question consensus, and 300 have no validated majority.
+- The official tokenizer does not remove those 833 rows. Its
+  `valid_span_rack_from_string` path returns no validated span and then falls
+  back to `refine_answers` over the raw answer annotations, selecting a
+  heuristic raw span. Thus the official 5,126-example extractive test target is
+  reproducible, but evidence labels for those 833 examples are weaker than
+  human-consensus evidence.
+
+### Open issues
+- A faithful local dataset should retain all 5,126 questions and record whether
+  each answer/evidence target is consensus-backed or official-fallback-backed.
+  Whether paper results should additionally report the 4,293 consensus-backed
+  subset is an evaluation choice and must not be made silently.
+- The official preprocessing environment is Python 2.7 plus the pinned Stanford
+  tokenizer. The repository provides a Dockerfile, so its final fallback spans
+  can be reproduced without porting the heuristic into project code.
+
+### Next steps
+- Confirm that the local dataset should retain all 5,126 official rows while
+  preserving `label_status`, raw annotations, and official fallback targets;
+  then run the pinned official preprocessing pipeline and build the project
+  converter around its outputs.
+
+## 2026-07-26 — Add fact-only research and custom-setting disclosure rules
+
+### Objective
+- Prevent subjective recommendations and undisclosed custom benchmark settings
+  in future research responses.
+
+### What was changed
+- Added two communication requirements to `AGENTS.md`:
+  - research and lookup responses must contain verified facts without
+    subjective judgment, recommendation, or preference unless the user
+    explicitly requests interpretation or a recommendation;
+  - every custom dataset subset, corpus construction, preprocessing rule, or
+    evaluation protocol must be labeled as custom on first mention and must
+    not be presented as an official benchmark setting.
+
+### What was verified
+- The new requirements are present under `Communication rules`.
+- No source code, dataset, experiment configuration, or evaluation behavior was
+  changed.
+
+### Open issues
+- None.
+
+### Next steps
+- Apply these disclosure and evidence rules to all subsequent dataset research
+  and benchmark comparisons.
+
+## 2026-07-26 — Evaluate TechQA against the current dataset criteria
+
+### Objective
+- Determine whether the official TechQA task is suitable for the project's
+  long-document factual QA and retrieval-compression evaluation.
+
+### What was changed
+- Documentation only; no code, dataset, corpus, or evaluation behavior was
+  changed.
+
+### What was verified
+- TechQA contains real technical-support questions from IBM forums and
+  manually adjudicated answer spans in IBM Technotes.
+- The labeled splits contain:
+  - 600 training questions: 450 answerable and 150 unanswerable;
+  - 310 development questions: 160 answerable and 150 unanswerable;
+  - 490 blind evaluation questions with a similar answerability ratio.
+- The companion corpus contains 801,998 unique Technotes.
+- The official task is machine reading comprehension, not full-corpus
+  open-domain retrieval:
+  - each question is supplied with 50 candidate Technote identifiers;
+  - those candidates were retrieved from the 801,998-document collection with
+    Elasticsearch;
+  - when the relevant Technote was absent, one candidate was replaced with the
+    relevant Technote;
+  - official systems are scored only within the 50 supplied candidates.
+- TechQA answers are not generally concise factoid strings:
+  - training answers average 48.1 whitespace-separated tokens and have a
+    maximum of 302;
+  - development answers average 41.2 tokens and have a maximum of 137;
+  - the task includes procedures, causes, and solutions to technical problems.
+- The official answer representation includes a Technote identifier and start
+  and end character offsets, so it provides direct span-level evidence.
+- IBM's current official repository states that the leaderboard has been
+  sunset and that train and development data plus the 800,000-plus Technotes
+  remain available.
+
+### Conclusion
+- TechQA meets the real-question, large-document-collection, and explicit
+  answer-span criteria.
+- It does not meet the requested concise factoid-answer criterion.
+- Its official retrieval condition covers 50 preselected candidates rather
+  than the full 801,998-document corpus.
+- Indexing all 801,998 Technotes and retrieving from them would be a custom
+  open-domain TechQA protocol, not the official benchmark.
+- With the leaderboard sunset, the directly usable labeled public evaluation
+  set is the 310-question development split, only 160 of which are answerable.
+  This is too small for a primary answerable-QA evaluation.
+
+### Open issues
+- The official paper does not report a corpus-wide Technote token-length
+  distribution, so compatibility with repeated 512-token chunking must be
+  measured from the release rather than assumed.
+
+### Next steps
+- Do not select TechQA as the primary benchmark under the current criteria.
+- Consider it only if the research scope is explicitly expanded to long
+  procedural answers, unanswerable detection, and a custom full-corpus
+  retrieval setting.
+
+## 2026-07-26 — Diagnose flat NewsQA 400-query RAG results
+
+### Objective
+- Determine whether the low, nearly flat QA scores are caused by the
+  seed-42 400-query sample or indicate that a full 4,293-query run is
+  unnecessary.
+
+### What was changed
+- No code, dataset, prompt, grid, metric, or output was changed.
+- Performed read-only, custom diagnostic analyses over the completed seven
+  RAG outputs. These diagnostics are not new official evaluation results.
+
+### What was verified
+- The seven 400-query F1 scores range only from 0.2473 to 0.2655.
+- Paired bootstrap 95% intervals for every condition difference relative to
+  vanilla-512 include zero. Matched-efficiency comparisons also include zero:
+  - subchunk 0.15 versus vanilla-128: delta -0.0018,
+    interval [-0.0297, 0.0259];
+  - subchunk 0.5 versus vanilla-256: delta +0.0014,
+    interval [-0.0225, 0.0250];
+  - subchunk 0.75 versus vanilla-512: delta +0.0091,
+    interval [-0.0100, 0.0288].
+- The active sample closely matches the full 4,293 consensus population on
+  directly checked length statistics:
+  - question mean: 6.748 versus 6.726 whitespace-separated tokens;
+  - normalized answer mean: 4.035 versus 3.832 tokens;
+  - both have answer median 2, answer 90th percentile 9, question median 6,
+    and question 90th percentile 10.
+- A custom same-400 normalized-answer containment diagnostic found the gold
+  answer string in the delivered contexts for only 49.5% to 56.0% of
+  questions, depending on condition.
+- Conditional QA F1 is 0.431 to 0.502 when the normalized gold answer is
+  present in the delivered context, but only 0.017 to 0.039 when absent.
+- Increasing retained context raises answer containment but lowers conditional
+  answer extraction quality. This opposing movement explains much of the flat
+  aggregate F1:
+  - subchunk 0.15: containment 0.495, contained-case F1 0.502;
+  - subchunk 0.75: containment 0.560, contained-case F1 0.438;
+  - vanilla-128: containment 0.518, contained-case F1 0.477;
+  - vanilla-512: containment 0.550, contained-case F1 0.431.
+- Across all seven conditions, 43.75% of questions receive zero F1 under every
+  condition, and 59.75% receive the same per-example F1 under all conditions.
+- The completed full 5,126-question raw-span evidence experiment shows the same
+  modest context-retention range at K=20:
+  - exact character evidence recall ranges from 0.4720 to 0.5441;
+  - subchunk 0.15 uses about 1,101 context tokens versus vanilla-128's 2,237
+    while obtaining 0.4720 versus 0.4843 exact character recall;
+  - subchunk 0.75 uses about 5,251 tokens versus vanilla-512's 6,657 while both
+    obtain approximately 0.5441 exact character recall.
+- Scoring each prediction against any preserved raw annotator span instead of
+  the official single-consensus target is a custom diagnostic and raises F1
+  by approximately 0.038 to 0.044, but scores remain low and flat. The official
+  single-consensus metric was not changed.
+- The run name ends in `-chat`, but the actual run manifest and current YAML
+  record `PROMPT_FORMAT=raw_chunk_first`, not `chat_system_user`.
+- Previous measured DAPR-NQ 8B gold-evidence results showed a large
+  prompt-serialization effect: raw F1 0.3418 versus standard-chat F1 0.7580.
+  This does not establish the size of the effect on NewsQA, but verifies that
+  prompt format can dominate this model's answer extraction behavior.
+- `MAX_NEW_TOKENS=20` is not the main population-wide explanation: only 6 of
+  the active 400 normalized gold answers exceed 20 whitespace-separated
+  tokens.
+
+### Conclusion
+- There is no measured evidence that the 400-query sample is unusually biased
+  on the checked question/answer length properties or retrieval-difficulty
+  pattern.
+- Expanding the unchanged raw-prompt protocol to all 4,293 questions would
+  mainly narrow confidence intervals. It would not directly resolve the low
+  F1 or the opposing retrieval-versus-reader effects.
+- The current run is not the intended chat-template condition implied by its
+  name and the earlier handoff entry. It should not be used to decide whether
+  NewsQA is unsuitable until prompt format is controlled.
+- The evidence-only experiment remains meaningful as a context-efficiency
+  result: several subchunk settings retain similar evidence recall with
+  materially fewer context tokens. The present QA experiment does not yet
+  demonstrate a corresponding answer-quality separation.
+
+### Open issues
+- The cause of the contained-case F1 decline with longer context is not yet
+  isolated among raw prompt serialization, reader distraction, answer-label
+  ambiguity, and generation behavior.
+- The full-population effect size under standard chat is unknown.
+
+### Next steps
+- Before a full 4,293-query run, execute a separately named, matched
+  400-query `chat_system_user` diagnostic using the same seven conditions.
+- Also run a small custom gold-evidence reader diagnostic on the same 400
+  questions under raw and chat formats to separate retrieval failure from
+  answer-extraction failure.
+- Proceed to the full population only if the controlled 400-query run produces
+  an acceptable reader ceiling or a practically relevant condition difference.
+
+## 2026-07-26 — Partial diagnosis of NewsQA chat2 RAG run
+
+### Objective
+- Inspect whether the corrected `chat_system_user` run resolves the low and
+  flat NewsQA QA results.
+
+### What was changed
+- No code, configuration, dataset, metric, running process, or output was
+  changed.
+- Performed read-only, custom paired diagnostics on completed cases only.
+
+### What was verified
+- The manifest and event log record `PROMPT_FORMAT=chat_system_user`.
+- At inspection time, four of seven cases had completed successfully; subchunk
+  0.25 was still running. The remaining incomplete cases were excluded.
+- Completed standard-chat results are:
+  - vanilla-128: EM 0.1850, F1 0.2930;
+  - vanilla-256: EM 0.1700, F1 0.2685;
+  - vanilla-512: EM 0.1725, F1 0.2651;
+  - subchunk 0.15: EM 0.1825, F1 0.2759.
+- Relative to the previous raw-prompt run on the same 400 questions:
+  - vanilla-128 F1 increased by 0.0275, with paired bootstrap 95% interval
+    [0.0084, 0.0474];
+  - vanilla-256 increased by 0.0099, interval [-0.0108, 0.0311];
+  - vanilla-512 increased by 0.0177, interval [-0.0059, 0.0420];
+  - subchunk 0.15 increased by 0.0122, interval [-0.0101, 0.0346].
+- Chat improves contained-case reader F1 but does not remove the
+  retrieval-versus-context-length tradeoff:
+  - vanilla-128: gold containment 0.5175, contained-case F1 0.5274;
+  - vanilla-256: containment 0.5225, contained-case F1 0.4933;
+  - vanilla-512: containment 0.5500, contained-case F1 0.4727;
+  - subchunk 0.15: containment 0.4950, contained-case F1 0.5395.
+- Among the completed chat cases, vanilla-128 is highest. Paired differences
+  remain uncertain:
+  - subchunk 0.15 minus vanilla-128: -0.0171, interval
+    [-0.0486, 0.0145];
+  - vanilla-256 minus vanilla-128: -0.0245, interval
+    [-0.0514, 0.0014];
+  - vanilla-512 minus vanilla-128: -0.0279, interval
+    [-0.0598, 0.0030].
+
+### Conclusion
+- This is a partial result, not a completed seven-condition conclusion.
+- Standard chat provides a modest absolute improvement, statistically clear
+  only for vanilla-128 in the raw-versus-chat comparison at this sample size.
+- The completed results still do not show a practically relevant QA separation
+  between fixed chunks and subchunk compression.
+- The main limitation remains that only approximately half of questions have
+  the normalized consensus answer in the delivered context, while longer
+  context lowers reader F1 even when the answer is present.
+
+### Open issues
+- Subchunk 0.25, 0.5, and 0.75 final results were unavailable at inspection
+  time.
+- No predefined non-inferiority margin exists, so similar F1 with fewer tokens
+  cannot yet be reported as a formal non-inferiority result.
+
+### Next steps
+- Let the current run finish; do not launch another run based on the partial
+  outputs.
+- After completion, recompute the seven-condition paired intervals and decide
+  whether the result supports only an efficiency-preservation claim or no
+  answer-quality claim.
+
+### Raw-versus-chat interpretation
+
+- The earlier run named `newsqa-bge-rag-consensus-bsz-0726-chat` actually used
+  `raw_chunk_first`; `chat2` is the corrected `chat_system_user` run. Their
+  manifests otherwise differ only in creation time.
+- The raw condition is numerically favorable as an input-efficiency result:
+  subchunk K=20/R=0.15 obtains F1 `0.26371` at 1,163.2 tokens versus
+  vanilla-128/K=20 F1 `0.26550` at 2,305.8 tokens, approximately 49.6% shorter
+  with a `-0.00180` F1 difference.
+- This is not a demonstrated quality improvement or formal non-inferiority
+  result. No non-inferiority margin was predefined.
+- In DAPR-NQ, raw prompting also gives high retrieved-context QA values, but
+  the raw gold-evidence oracle is anomalously poor for 8B (F1 `0.34177`)
+  compared with the matched standard-chat oracle (F1 `0.75801`). Thus raw
+  prompting is sensitive to context serialization and should not be treated as
+  interchangeable with standard chat.
+- If `raw_chunk_first` is reported, identify it as a cache-friendly,
+  system-specific prompt layout and keep it separate from the standard
+  instruction-model chat protocol. Do not select it post hoc solely because it
+  yields a more favorable method curve.
+
+## 2026-07-26 — Delete NewsQA dataset and retrieval artifacts
+
+### Objective
+- Remove the NewsQA dataset and all retrieval/ColBERT artifacts at the user's
+  explicit request.
+
+### What was changed
+- Permanently deleted `/mnt/nvme1/datasets/newsqa`, which occupied 5.6 GiB.
+- The deleted directory contained:
+  - NewsQA documents, questions, answers, and dataset metadata;
+  - vanilla BGE-small-v1.5 databases for 128, 256, and 512-token chunks;
+  - the sentence/subchunk BGE-small-v1.5 database;
+  - the associated ColBERT artifact stored under that database.
+- Preserved experiment outputs under `outputs/grid_07`, source code, tests,
+  grid YAML files, and documentation because they were not included in the
+  deletion request.
+
+### What was verified
+- `/mnt/nvme1/datasets/newsqa` no longer exists.
+- The completed/partial NewsQA RAG and evidence-result directories remain
+  present under `outputs/grid_07`.
+
+### Open issues
+- Any NewsQA process that attempts another case after the deletion will no
+  longer be able to read its dataset or retrieval database.
+- Reproducing the NewsQA experiments requires reconstructing the dataset and
+  rebuilding the databases and ColBERT artifact.
+
+### Next steps
+- Treat all earlier handoff entries describing materialized NewsQA data and
+  artifacts as historical; the deletion recorded here is the current state.
+
+### 2026-07-27 reconstruction audit
+
+- The deleted dataset directory itself is not recoverable from a remaining
+  local copy.
+- The project-side reconstruction code, focused tests, grid files, completed
+  RAG outputs, and raw-evidence outputs remain available.
+- The official Maluuba repository clone remains at
+  `/mnt/nvme1/dongseob/tmp/newsqa-official/maluuba/newsqa`.
+- The previously supplied source archives are no longer present anywhere
+  checked under `/mnt/nvme1` or `/home/dongseob`:
+  - `/mnt/nvme1/datasets/newsqa-data-v1.zip`
+  - `/mnt/nvme1/datasets/cnn_stories.tgz`
+  - `/mnt/nvme1/datasets/cnn.tgz`
+- Only `newsqa-data-v1.zip` and `cnn_stories.tgz` are required to reconstruct
+  the current project dataset; `cnn.tgz` was previously verified to be a
+  separate DeepMind question archive and is not used for NewsQA article
+  reconstruction.
+- Reacquiring the two required archives is sufficient to regenerate:
+  - 12,744 documents;
+  - 4,293 official single-consensus QA pairs;
+  - the exact seed-42 400-pair active subset;
+  - all four BGE databases and the ColBERT candidate artifact.
+- A rebuilt approximate HNSW graph is not assumed bit-identical. Validate the
+  rebuilt top-k document IDs against the preserved 400-query evaluation
+  outputs before comparing new 1B results with the old 8B results.
+- `/mnt/nvme1` currently has approximately 107 GB free; the deleted NewsQA
+  directory occupied about 5.6 GiB, so reconstruction capacity is sufficient.
+
+## 2026-07-26 — Evaluate NarrativeQA against the current dataset criteria
+
+### Objective
+- Determine whether NarrativeQA is a suitable replacement benchmark after
+  deleting NewsQA.
+
+### What was changed
+- Documentation only; no dataset was downloaded and no code, index, artifact,
+  or evaluation behavior was changed.
+
+### What was verified
+- NarrativeQA contains 1,572 books/movie scripts by the official split table
+  and 46,765 human-written QA pairs:
+  - train: 1,102 documents and 32,747 QA pairs;
+  - validation: 115 documents and 3,461 QA pairs;
+  - test: 355 documents and 10,557 QA pairs.
+- Full stories are extremely long:
+  - mean train/validation/test lengths are
+    62,528/62,743/57,780 paper tokens;
+  - maximum lengths exceed 400,000 tokens.
+- Questions and answers were written from Wikipedia plot summaries, not by
+  reading the full stories. Questions average 9.8 tokens and answers average
+  4.73 tokens. Two reference answers are provided.
+- Answers are free-form and are not restricted to story spans:
+  - 44.05% occur as exact spans in summaries;
+  - only 29.57% occur as exact spans in full stories.
+- The dataset intentionally includes non-local narrative questions about
+  characters, events, causes, methods, descriptions, and temporal relations.
+  It is not a pure factoid-QA dataset.
+- The original full-story task supplies the question's corresponding story.
+  It does not require retrieving the correct document from all 1,572 stories.
+- The original full-story baseline performs passage retrieval within the known
+  story using 200-word chunks and then answers from the retrieved passages.
+- NarrativeQA does not provide manually annotated supporting spans in the full
+  stories. The paper constructs approximate span targets by choosing spans
+  with the highest ROUGE-L overlap with the reference answer.
+- Official generation metrics are BLEU-1, BLEU-4, METEOR, and ROUGE-L over two
+  references, rather than Exact Match and token F1.
+- The official repository provides document metadata, URLs, summaries, and QA
+  records. Full story text is obtained through a download script from external
+  book/script sources; the repository does not package all full texts directly.
+
+### Conclusion
+- NarrativeQA meets the long-original-document, many-QA, and short-answer
+  properties.
+- It does not meet the requested pure factoid-task or explicit-gold-evidence
+  properties.
+- Its official retrieval task measures passage selection inside a known very
+  long story, not corpus-wide document retrieval.
+- Pooling all stories into one shared retrieval database would be a custom
+  open-corpus NarrativeQA protocol and must not be described as the official
+  benchmark.
+- Under the current research question, NarrativeQA is not a direct replacement
+  for NewsQA as a primary factual RAG benchmark. It can serve as a separate
+  long-narrative compression benchmark if the claim is expanded to abstractive,
+  non-local story understanding.
+
+### Open issues
+- Exact availability and byte-level reproducibility of every externally hosted
+  story must be audited before preprocessing.
+- A project tokenizer would produce a different chunk count from the paper's
+  token statistics.
+- Without gold supporting spans, evidence-selection quality cannot be directly
+  evaluated under the current exact/partial evidence metric.
+
+### Next steps
+- Do not download or materialize NarrativeQA without an explicit selection
+  request.
+- If selected, preserve the official known-story full-text setting and use the
+  official two-reference generation metrics unless the user explicitly
+  approves a separately named custom retrieval/evaluation protocol.
+
+## 2026-07-26 — Reassess NarrativeQA after relaxing evidence/factoid criteria
+
+### Objective
+- Reassess NarrativeQA after the user clarified that gold-evidence evaluation
+  is already covered by Natural Questions and that a non-factoid QA task is
+  acceptable if it meaningfully tests coarse retrieval followed by fine
+  selection.
+
+### What was changed
+- Documentation only; no dataset, code, index, artifact, or evaluation
+  behavior was changed.
+
+### What was verified
+- The official NarrativeQA full-story task gives the system the corresponding
+  story and requires retrieval inside that very long story.
+- The original paper's full-story pipeline retrieves 200-word chunks using the
+  question, concatenates selected chunks in temporal order, and then applies
+  the answer model.
+- This official task structure directly supports a method comparison in which
+  both baselines retrieve fixed 512-token coarse chunks and the proposed method
+  performs additional fine selection inside the same retrieved coarse chunks.
+- Test stories average 57,780 paper tokens. A simple division gives
+  approximately 113 non-overlapping 512-token units per average test story and
+  approximately 40,000 units over all 355 test stories; these are estimates,
+  not project-tokenizer measurements.
+- The original paper explicitly describes within-story passage retrieval as
+  difficult because story passages are mutually similar, questions are short,
+  and referenced entities can occur many times.
+- Official QA evaluation supplies two free-form reference answers and uses
+  BLEU-1, BLEU-4, METEOR, and ROUGE-L.
+
+### Revised conclusion
+- Once explicit gold evidence and pure factoid QA are no longer required,
+  NarrativeQA becomes a serious candidate for the compression method.
+- Its strongest alignment is not corpus-wide document retrieval; it is
+  long-document passage retrieval followed by fine-grained context selection.
+- The hypothesis that fine selection can help is technically plausible:
+  retrieved 512-token regions may contain a small relevant event plus large
+  amounts of surrounding narrative text, which fine selection can remove.
+  This is an inference to be tested, not a verified performance result.
+- The same property creates a failure mode: description, cause, method, and
+  multi-event questions may need dispersed context, so aggressive local
+  selection may remove necessary narrative relations. This makes NarrativeQA a
+  useful stress test rather than a guaranteed favorable benchmark.
+
+### Evaluation boundary
+- Keeping retrieval restricted to the question's official story is the
+  official full-story task.
+- Pooling all 1,572 stories and requiring global document retrieval remains a
+  custom protocol and is not required to test the current compression method.
+- Without gold spans, claims must be based on official two-reference QA
+  metrics plus measured context tokens, latency, and memory; no evidence-recall
+  claim should be made on NarrativeQA.
+
+### Next steps
+- If the user selects NarrativeQA, first audit full-story availability and
+  reproduce the official train/validation/test document mapping.
+- Run a small official known-story pilot comparing fixed-512 and
+  coarse-512-plus-fine-selection under identical top-K and generation
+  settings before materializing a full experiment.
+
+## 2026-07-26 — NarrativeQA small-chunk retrieval hypothesis
+
+### Objective
+- Record the expected interaction between NarrativeQA's long narratives and
+  fixed 128/256/512-token retrieval chunks.
+
+### What was changed
+- Documentation only; no experiment was run and no evaluation protocol was
+  changed.
+
+### Verified calculations
+- Using the paper's mean test-story length of 57,780 tokens, simple
+  non-overlapping division gives approximately:
+  - 452 units at 128 tokens;
+  - 226 units at 256 tokens;
+  - 113 units at 512 tokens.
+- At fixed top-K=20, the maximum raw retrieved content before prompt overhead
+  is approximately:
+  - 2,560 tokens for fixed-128;
+  - 5,120 tokens for fixed-256;
+  - 10,240 tokens for fixed-512.
+- These are paper-token estimates. Project-tokenizer counts and splitter
+  boundary effects remain unmeasured.
+
+### Inference
+- Fixed 128/256 chunks may retrieve poorly on NarrativeQA because questions
+  paraphrase plot summaries, relevant entities recur throughout a story, and a
+  small local chunk may omit the surrounding event or relationship needed for
+  semantic matching.
+- Coarse 512-token retrieval followed by fine selection is therefore a
+  plausible fit: the coarse unit supplies event-level retrieval signal, while
+  fine selection can remove surrounding narrative text before generation.
+- This remains a hypothesis and is not a measured NarrativeQA result.
+
+### Evaluation risk
+- Comparing all chunk sizes at the same top-K simultaneously changes:
+  - retrieval-unit granularity;
+  - number of candidate units among which each gold region competes;
+  - total retrieved token budget.
+- A better result for 512-token retrieval under fixed top-K would therefore
+  not by itself prove that coarse semantic retrieval is superior.
+
+### Next steps
+- If a pilot is approved, report both:
+  - fixed top-K comparisons, matching the existing project protocol; and
+  - token-budget-matched comparisons, adjusting K so fixed baselines deliver
+    approximately equal pre-generation content.
+- Keep the proposed method and fixed-512 baseline on exactly the same coarse
+  retrieval results so their difference isolates fine selection.
+## 2026-07-26 — Build NewsQA BGE retrieval databases only
+
+### Objective
+- Reconstruct the 12,744 NewsQA CNN article documents and build the four dense
+  retrieval databases needed for the vanilla/subchunk evidence-recall grid.
+- Keep question, answer, consensus, and evidence-label policy completely out of
+  this DB-only step.
+
+### What was changed
+- Added `test/prepare_newsqa_documents.py`, a document-only converter that:
+  - reads the 12,744 unique story IDs from the official NewsQA annotation CSV;
+  - extracts only those CNN stories from `cnn_stories.tgz`;
+  - applies the newline, special-decoding, copyright-tail, and pre-`@highlight`
+    article reconstruction rules from the official Maluuba NewsQA loader;
+  - writes only `documents/` and a source manifest under
+    `/mnt/nvme1/datasets/newsqa`.
+- Added `test/test_prepare_newsqa_documents.py`.
+- Did not create or modify question, answer, or evidence-label files.
+- Built these BGE-small-en-v1.5 databases with GPU passage embedding and batch
+  size 5,461:
+  - `vanilla-bge-small-v1.5-128`
+  - `vanilla-bge-small-v1.5-256`
+  - `vanilla-bge-small-v1.5-512`
+  - `sent-bge-small-v1.5-512-splitlong180`
+
+### What was verified
+- The reconstructed corpus contains exactly 12,744 non-empty document files.
+- Three official NewsQA test-story prefixes and three published repository-test
+  character-offset examples match exactly.
+- The focused converter unit test and Black check passed.
+- Every DB manifest records BGE-small-en-v1.5, CUDA build embedding, batch size
+  5,461, and the intended splitter/length settings.
+- Chroma collection counts are:
+  - vanilla-128: 84,678
+  - vanilla-256: 45,451
+  - vanilla-512: 25,651
+  - sentence-512/splitlong180: 25,621
+- Every DB contains all 12,744 parent documents, unique retrieval IDs, no empty
+  stored text, and contiguous coarse source-token ranges.
+- The sentence DB has 393,381 unique subchunks. All source spans are at most 180
+  Llama tokens. Twenty-two unique subchunks become 181 or 182 tokens only after
+  the runtime-visible trailing blank-line formatting is retokenized.
+- Sentence subchunks crossing a fixed 512-token coarse boundary are referenced
+  by both adjacent coarse chunks: 405,731 stored occurrences for 393,381 unique
+  IDs. This is the existing intentional overlap behavior, not duplicate
+  subchunk identity.
+
+### Open issues
+- The document converter reproduces the official Python-2 loader rules in
+  Python 3 and validates known official examples, but it does not execute the
+  original Python-2 loader itself.
+- NewsQA test questions, answers, and evidence labels remain intentionally
+  unmaterialized. Their policy must be decided separately before evaluation.
+- The ColBERT artifact for the sentence-512 DB has not been built.
+
+### Next steps
+- Decide and document the NewsQA answer/evidence-label policy independently of
+  these databases.
+- Build the ColBERT candidate artifact from
+  `sent-bge-small-v1.5-512-splitlong180` only after that separate decision or an
+  explicit artifact-build request.
+
+## 2026-07-26 — Build the NewsQA ColBERT candidate artifact
+
+### Objective
+- Build and validate the ColBERT candidate artifact for the existing NewsQA
+  `sent-bge-small-v1.5-512-splitlong180` database.
+
+### What was changed
+- Materialized
+  `/mnt/nvme1/datasets/newsqa/sent-bge-small-v1.5-512-splitlong180/colbert_window`
+  with the official `colbert-ir/colbertv2.0` checkpoint on CUDA.
+- Used build batch size 1,024, ColBERT document maximum length 180, subchunks as
+  center units, and a region token budget of 180.
+- Generated the compact fp16 vectors, offsets, cacheable-row metadata,
+  document-window metadata, and per-coarse-chunk region payloads.
+- No source or evaluation code was changed in this step.
+
+### What was verified
+- All 12,744 input documents completed with no failed documents.
+- The artifact contains 393,381 unique subchunks, 8,631,660 ColBERT token
+  vectors of dimension 128, and 212,536 region specifications for 25,621
+  coarse chunks.
+- DB/artifact ID validation passed:
+  - DB subchunk occurrences: 405,731
+  - unique DB subchunk IDs: 393,381
+  - artifact subchunk IDs: 393,381
+  - missing IDs: 0
+  - extra IDs: 0
+- The DB-manifest hash and all three JSON metadata hashes exactly match the
+  hashes recorded in the artifact manifests.
+- The vector file size exactly matches
+  `8,631,660 tokens × 128 dimensions × 2 fp16 bytes`.
+- Artifact build time was 504.14 seconds and region-spec construction took
+  13.31 seconds. Total artifact disk usage is 2.3 GiB.
+
+### Open issues
+- Twelve centers reached ColBERT's 180-WordPiece truncation limit. This is
+  possible because the source subchunk limit is measured with the Llama
+  tokenizer rather than the ColBERT WordPiece tokenizer.
+- NewsQA question, answer, and evidence-label files remain intentionally
+  unmaterialized.
+
+### Next steps
+- Decide and document the NewsQA question/answer/evidence-label policy before
+  running retrieval or answer-generation evaluation.
+
+## 2026-07-26 — Reaffirm official-benchmark-first experiment discipline
+
+### Objective
+- Record the user's explicit constraint after an attempted NewsQA evaluation
+  change exceeded the requested scope.
+
+### What was changed
+- Reverted the attempted NewsQA-specific label-ID alignment, automatic
+  consensus-subset aggregation, converter, tests, and grid before any dataset
+  label files or experiment outputs were created.
+- Did not change `docs/eval_protocol.md` for NewsQA.
+
+### What was verified
+- The interrupted converter command created no NewsQA question or evidence
+  files. Only the pre-existing document-corpus manifest remains under
+  `newsqa/dataset_info`.
+
+### Required experiment discipline
+- Follow the original dataset's official split, preprocessing, labels, and
+  evaluation guidance as the default.
+- Do not introduce a custom subset, filter, label reinterpretation, record
+  alignment rule, or metric change without explicit user approval.
+- When a possible issue is found, record and report it first; do not alter the
+  experiment protocol autonomously.
+- For NewsQA, the consensus-derived subset is a very low-priority diagnostic
+  only. Consider it later only if the full official result is anomalous.
+- The repeated NewsQA question strings are currently a known issue only. Do not
+  change evaluation behavior for them unless the user explicitly requests a
+  solution.
+
+### Open issues
+- The official NewsQA test query/evidence files still need to be materialized
+  without adding a custom consensus policy or changing the evaluator.
+
+### Next steps
+- Inspect and execute the official NewsQA preprocessing path first, then adapt
+  only its official test output into the existing local file layout needed by
+  the unchanged retrieval/evidence evaluator.
+
+## 2026-07-26 — NewsQA raw-span evidence grid and DAPR-NQ 400-query subset
+
+### Objective
+- Evaluate NewsQA retrieval/compression using only the official raw character
+  annotations.
+- Prepare a reproducible 400-query DAPR-NQ subset for chat-template RAG runs.
+
+### What was changed
+- Added `test/prepare_newsqa_raw_evidence.py` and its focused unit test.
+- Materialized all 5,126 official NewsQA test questions and all 16,640
+  non-`None` spans from the CSV `answer_char_ranges` field without consensus
+  selection, fallback selection, span refinement, deduplication, or
+  tokenization.
+- Preserved a complete 5,126-row evidence file and wrote a 5,106-record
+  query-keyed adapter for the unchanged evaluator. The known 20 repeated rows
+  across 15 repeated question strings use the final official-row label for the
+  shared string; this was recorded as known noise rather than addressed by an
+  evaluation-code change.
+- Added and ran `grid_newsqa_bge_evidence.yaml` over 14 configurations.
+- Added `test/sample_paired_qa_subset.py`.
+- Renamed the 2,390-row DAPR-NQ files to `query_full.jsonl` and
+  `answer_full.jsonl`, then selected 400 paired rows with seed 42 while
+  preserving original order and IDs.
+- Updated `grid_dapr_nq_bge_rag.yaml` to:
+  - `TOTAL_NUM=400`
+  - `PROMPT_FORMAT=chat_system_user`
+  - run name `dapr-nq-bge-rag-tuned-bsz-0726-chat`
+
+### What was verified
+- Every NewsQA raw span is a valid, exact substring of its reconstructed source
+  article.
+- NewsQA label file counts are 5,126 complete rows and 5,106 unique query
+  strings.
+- All 14 NewsQA grid cases completed successfully. Aggregate case time was
+  4,086.77 seconds.
+- Focused NewsQA converter and evidence-metric tests passed.
+- DAPR-NQ full files contain 2,390 paired rows; active subset files contain 400
+  paired rows.
+- Every active DAPR-NQ query/answer ID matches by row, and regenerating seed 42
+  from the full files reproduces the active subset exactly.
+
+### NewsQA results
+
+| Method | Chunk | K | R | Context tokens | Char exact | Token exact |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Vanilla | 128 | 10 | - | 1102.2 | 0.4202 | 0.4147 |
+| Vanilla | 128 | 20 | - | 2236.9 | 0.4843 | 0.4790 |
+| Vanilla | 256 | 10 | - | 2011.8 | 0.4618 | 0.4561 |
+| Vanilla | 256 | 20 | - | 4090.0 | 0.5274 | 0.5217 |
+| Vanilla | 512 | 10 | - | 3282.6 | 0.4730 | 0.4669 |
+| Vanilla | 512 | 20 | - | 6656.9 | 0.5441 | 0.5383 |
+| Subchunk | 512 | 10 | 0.15 | 573.1 | 0.4000 | 0.3954 |
+| Subchunk | 512 | 10 | 0.25 | 914.9 | 0.4289 | 0.4242 |
+| Subchunk | 512 | 10 | 0.50 | 1766.1 | 0.4609 | 0.4551 |
+| Subchunk | 512 | 10 | 0.75 | 2617.8 | 0.4738 | 0.4676 |
+| Subchunk | 512 | 20 | 0.15 | 1100.8 | 0.4720 | 0.4675 |
+| Subchunk | 512 | 20 | 0.25 | 1792.5 | 0.5004 | 0.4957 |
+| Subchunk | 512 | 20 | 0.50 | 3522.4 | 0.5317 | 0.5270 |
+| Subchunk | 512 | 20 | 0.75 | 5250.9 | 0.5441 | 0.5389 |
+
+### Open issues
+- These NewsQA metrics weight every raw non-`None` annotation span, including
+  repeated or disagreeing annotator spans. They must be described as raw-span
+  evidence coverage rather than consensus evidence coverage.
+- The query-text-keyed duplicate-question noise remains intentionally
+  unresolved.
+- The active DAPR-NQ files are now the 400-row subset. Any full 2,390-row run
+  must explicitly use or restore the `_full.jsonl` files and update
+  `TOTAL_NUM`.
+
+### Next steps
+- Use the 400-row DAPR-NQ files for the requested chat-template RAG smoke
+  experiment.
+- Do not run a NewsQA consensus subset unless the full raw-span result later
+  shows a specific anomaly that justifies that diagnostic.
+
+## 2026-07-26 — Correction: revert accidental DAPR-NQ sampling
+
+### Objective
+- Undo a dataset-target mistake: the requested 400-query subset was for
+  NewsQA, not DAPR-NQ.
+
+### What was changed
+- Restored the original 2,390-row DAPR-NQ `questions/query.jsonl` and
+  `answers/answer.jsonl` from the temporary `_full.jsonl` files.
+- Removed the accidental 400-row DAPR-NQ subset and the temporary paired
+  sampling helper.
+- Restored `TOTAL_NUM=2390` in `grid_dapr_nq_bge_rag.yaml`.
+- Kept the separately requested `PROMPT_FORMAT=chat_system_user` and matching
+  `-chat` run name.
+
+### What was verified
+- DAPR-NQ query and answer files each contain 2,390 rows.
+- Every row has matching query/answer IDs, covering IDs 0 through 2,389.
+- No `query_full.jsonl` or `answer_full.jsonl` remains.
+- No NewsQA dataset file was changed during this restoration.
+
+### Correction
+- The preceding entry's statements that the active DAPR-NQ files contain 400
+  rows and that its grid uses `TOTAL_NUM=400` are superseded by this entry.
+
+### Next steps
+- Do not sample any dataset until the target dataset is explicitly resolved.
+- If proceeding with the requested NewsQA 400-query RAG subset, first determine
+  the intended official NewsQA answer representation; the current NewsQA
+  materialization contains raw evidence spans but no `answers/answer.jsonl`.
+
+## 2026-07-26 — Create the requested NewsQA 400-query QA subset
+
+### Objective
+- Apply the paired 400-query sampling request to NewsQA, leaving DAPR-NQ
+  unchanged.
+
+### What was changed
+- Added `test/sample_newsqa_qa_subset.py` and its focused unit test.
+- Constructed NewsQA answer records directly from every official non-`None`
+  raw character-span text already stored in the complete raw evidence file.
+  Each record uses an `answers` list and preserves duplicates, whitespace,
+  annotation disagreement, and original order. No consensus selection,
+  normalization, deduplication, or fallback policy was applied.
+- Renamed the 5,126-row NewsQA query file to `query_full.jsonl`.
+- Wrote the corresponding 5,126-row `answer_full.jsonl`.
+- Selected 400 paired rows with seed 42, preserving original dataset order and
+  original IDs, and wrote the active `query.jsonl` and `answer.jsonl`.
+
+### What was verified
+- Active NewsQA query and answer files each contain 400 rows.
+- Full NewsQA query and answer files each contain 5,126 rows.
+- Every active and full query/answer ID matches by row.
+- Regenerating the seed-42 sample from the full files reproduces the active
+  query and answer records exactly.
+- Every full answer list exactly equals its corresponding unmodified
+  `evidence_texts` list from the official raw-span materialization.
+- DAPR-NQ remains at 2,390 query and answer rows.
+- The focused subset test and Black formatting check passed.
+
+### Open issues
+- `src/acc_metric.py` has no NewsQA evaluator registration. The dataset files
+  are ready for a paired RAG run, but an answer metric must follow an approved
+  official NewsQA evaluation rule rather than an invented local rule.
+- The completed 5,126-row NewsQA evidence grid predates this active 400-row
+  query file. Re-running that full grid now requires explicitly using or
+  restoring `query_full.jsonl`.
+
+### Next steps
+- Confirm the official NewsQA answer-scoring implementation before registering
+  a NewsQA evaluator or launching answer-quality evaluation.
+
+## 2026-07-26 — Switch NewsQA QA labels to official single consensus
+
+### Objective
+- Replace the active raw-annotator-answer QA condition with NewsQA's official
+  single-consensus-answer condition and add the paper-specified answer scorer.
+
+### What was changed
+- Added `test/prepare_newsqa_consensus_qa.py`, which ports both the official
+  `NewsQaDataset` out-of-range endpoint clipping and
+  `get_consensus_answer()` from Maluuba NewsQA commit
+  `d5bb9e9640e2ed7a31e209393376549d737d276b`.
+- Excluded rows for which the official function does not return a character
+  span. This reduces the preceding 5,126-row raw-non-`None` conversion to
+  4,293 single-consensus question/answer pairs.
+- Replaced NewsQA `query_full.jsonl` and `answer_full.jsonl` with those 4,293
+  paired records. Each answer record has exactly one consensus string.
+- Recreated active NewsQA `query.jsonl` and `answer.jsonl` as a seed-42 sample
+  of 400 paired rows from the 4,293-row set.
+- Preserved the preceding raw files as
+  `query_raw_non_none_full.jsonl`,
+  `query_raw_non_none_seed42_400.jsonl`,
+  `answer_raw_annotations_full.jsonl`, and
+  `answer_raw_annotations_seed42_400.jsonl`.
+- Added `NewsQAOfficialEvaluator` and registered dataset name `newsqa`. It
+  ports the SQuAD v1.1 normalized EM/token-F1 rules specified by the NewsQA
+  paper.
+- Documented the new QA population, scoring rule, and result comparability in
+  `docs/eval_protocol.md`.
+
+### What was verified
+- Full consensus query and answer files each contain 4,293 records; active
+  files each contain 400 records.
+- Query and answer IDs match for every full and active row.
+- Regenerating the seed-42 sample reproduces both active files exactly.
+- All 4,293 answer records contain exactly one non-empty source substring.
+- The preserved raw full files contain 5,126 records and exactly match the
+  previously materialized raw evidence texts.
+- NewsQA metric tests, consensus-conversion tests, NQ-open metric tests, and
+  ConditionalQA metric tests pass. Modified Python files pass Black and
+  `py_compile`.
+
+### Open issues
+- Nine official consensus strings are exactly `The ` or `the `. SQuAD v1.1
+  normalization removes these article-only strings, so a self-prediction gets
+  EM 1 and F1 0. They remain in the official consensus set; no local filtering
+  was introduced.
+- Earlier 5,126-row raw evidence-coverage results remain valid only for that
+  raw-span evidence protocol. They are not directly comparable to QA results
+  on the 4,293-row consensus population.
+- The raw evidence labels remain query-text keyed for the existing evidence
+  evaluator and retain the previously documented duplicate-question noise.
+
+### Next steps
+- Use dataset name `newsqa` for RAG answer scoring on the active 400-pair
+  consensus sample.
+- If consensus evidence coverage is required, define it as a new, explicitly
+  named evaluation condition instead of relabeling the completed raw-span
+  evidence results.
+
+## 2026-07-26 — Add NewsQA consensus RAG grid
+
+### Objective
+- Prepare the NewsQA 400-query consensus QA experiment in the same execution
+  format as the existing DAPR-NQ BGE RAG grid.
+
+### What was changed
+- Added `run/grid_search/grid_newsqa_bge_rag.yaml`.
+- The grid uses dataset `newsqa`, the active 400-pair consensus sample,
+  Llama-3.1-8B-Instruct, `chat_system_user`, BGE-small-v1.5 retrieval, and
+  the existing NewsQA vanilla and splitlong180 materializations.
+- Mirrored the 10 currently enabled DAPR-NQ cases and their per-case batch
+  sizes: vanilla 128/256/512 at K=10/20 and subchunk R=0.15/0.25 at K=10/20.
+  The four R=0.5/0.75 cases remain present but commented, matching the
+  DAPR-NQ grid.
+
+### What was verified
+- The YAML parses successfully and contains 10 active cases.
+- `TOTAL_NUM=400`, dataset `newsqa`, and `PROMPT_FORMAT=chat_system_user`.
+- Every referenced NewsQA DB manifest exists, and the referenced subchunk
+  artifact directory exists.
+- Dataset `newsqa` resolves to `NewsQAOfficialEvaluator`.
+
+### Open issues
+- Per-case batch sizes were copied from the DAPR-NQ grid and were not
+  independently OOM-probed on NewsQA.
+- With the `colbert-ir/colbertv2.0` WordPiece tokenizer, the active 400-query
+  sample has mean content length 8.41, maximum 20, and no query that exceeds
+  the 29-content-token capacity of `query_maxlen=32` after three ColBERT
+  special tokens. In the full 4,293-query consensus set, one record (preserved
+  source ID 4560) has 47 content tokens and is the only truncated query. Its
+  official question text appears malformed/concatenated; it is not in the
+  active sample.
+
+### Next steps
+- Launch with
+  `python run/grid_search/eval.py run/grid_search/grid_newsqa_bge_rag.yaml`
+  when requested.
+
+## 2026-07-26 — Build TriviaQA unfiltered dev with Wikipedia documents only
+
+### Objective
+- Prepare TriviaQA under `/mnt/nvme1/datasets` in the local
+  `questions/`, `answers/`, and `documents/` layout.
+- Use the official unfiltered dev questions and only their packaged Wikipedia
+  documents.
+- Do not sample questions, create evidence labels, chunk documents, build a DB,
+  or materialize a ColBERT artifact.
+
+### What was changed
+- Added `test/prepare_triviaqa_unfiltered_wikipedia_dev.py` and its focused
+  unit test.
+- Materialized `/mnt/nvme1/datasets/triviaqa-unfiltered-wikipedia` with:
+  - all 11,313 official `unfiltered-web-dev.json` questions;
+  - all complete official `Answer` objects;
+  - the exact union of 16,078 packaged Wikipedia `EntityPages` documents;
+  - deterministic `doc_XXXXXX.txt` names and
+    `dataset_info/document_sources.jsonl` source-name mappings.
+- Excluded every Web `SearchResults` document as explicitly requested.
+- Recorded the exact conversion policy in `dataset_manifest.json`.
+- Measured character, whitespace-delimited word, and
+  Llama-3.1-8B-Instruct token lengths in
+  `dataset_info/document_length_stats.json`.
+- Retained the official unfiltered archive and extracted dev JSON under
+  `/mnt/nvme1/datasets/triviaqa-unfiltered-source`.
+- Deleted the 2.5 GB RC archive and its temporary extracted documents after
+  verifying the final copies. The RC archive can be downloaded again from the
+  official TriviaQA site.
+
+### What was verified
+- Question and answer records exactly match all 11,313 official dev records in
+  source order, including the complete official answer objects.
+- All 16,078 final documents are byte-identical to the packaged source files.
+- The dataset contains no 400-query subset and no evidence-label file.
+- The converter's four focused unit tests and Python compilation pass.
+- Of the 11,313 questions, 778 have no packaged Wikipedia document reference;
+  they remain in the official evaluation population rather than being silently
+  removed.
+- Llama-3.1-8B-Instruct document-token lengths without special tokens:
+  mean 4,809.78, p50 3,313.5, p75 6,818.5, p90 11,181.5,
+  p95 14,121.15, and maximum 72,583. A total of 14,715/16,078
+  documents (91.52%) exceed 512 tokens.
+
+### Open issues
+- This is an explicitly Wikipedia-only condition over an official
+  `unfiltered-web` dev file, not the complete Wikipedia-plus-Web unfiltered
+  document condition.
+- Dataset-specific RAG evaluator registration, a grid, preprocessing, DB
+  construction, and candidate-artifact construction have not been requested or
+  implemented.
+
+### Next steps
+- If RAG evaluation is requested, first register an explicit dataset name for
+  this Wikipedia-only condition while reusing the official TriviaQA alias-aware
+  EM/F1 scorer.
+- Decide whether to evaluate all 11,313 questions or create a separately
+  documented subset before building retrieval DBs.
+
+## 2026-07-26 — Create TriviaQA seed-42 1,000-query paired subset
+
+### Objective
+- Preserve the complete TriviaQA unfiltered dev question/answer files and make
+  a reproducible 1,000-query active evaluation subset.
+
+### What was changed
+- Added the reusable paired sampler `test/sample_paired_qa_subset.py` and its
+  focused unit test.
+- Renamed the complete 11,313-row files to `query_full.jsonl` and
+  `answer_full.jsonl`.
+- Sampled 1,000 shared row indices without replacement using
+  `random.Random(42)`, sorted the selected indices back into source order, and
+  wrote the paired active files as `query.jsonl` and `answer.jsonl`.
+- Preserved original numeric IDs and TriviaQA `QuestionId` values rather than
+  renumbering the subset.
+- Added `dataset_info/subset_manifest.json` with the sampling policy, selected
+  indices and IDs, and SHA-256 file hashes. Updated `dataset_manifest.json` to
+  distinguish the full and active populations.
+- Documented the active evaluation population in `docs/eval_protocol.md`.
+- Did not change the 16,078-document Wikipedia-only corpus.
+
+### What was verified
+- Full question and answer files each contain 11,313 paired records; active
+  files each contain 1,000 paired records.
+- Regenerating the seed-42 row sample reproduces both active files exactly.
+- Every full question and complete official `Answer` object exactly matches
+  `unfiltered-web-dev.json` in source order.
+- Query/answer numeric IDs and source `QuestionId` values match for every full
+  and active row.
+- The sampler's two unit tests and Python compilation pass.
+- The active sample contains 68 questions with no packaged Wikipedia
+  `EntityPages` document reference. They were not filtered because the request
+  was uniform sampling from all 11,313 official dev questions.
+
+### Open issues
+- This remains a Wikipedia-only corpus condition. The 68 active questions with
+  no packaged Wikipedia reference may require Web evidence and can therefore be
+  impossible to answer from the selected corpus.
+- A dataset-specific evaluator registration, preprocessing databases, ColBERT
+  artifact, and RAG grid have not been created in this session.
+
+### Next steps
+- If requested, register the explicit Wikipedia-only dataset name using the
+  existing official TriviaQA alias-aware EM/F1 evaluator before running RAG.
+
+## 2026-07-26 — Add TriviaQA seed-42 RAG grid
+
+### Objective
+- Prepare a RAG evaluation grid for the active 1,000-query TriviaQA
+  Wikipedia-only sample using the DAPR-NQ BGE grid structure.
+
+### What was changed
+- Added `run/grid_search/grid_trivia.yaml`.
+- Registered dataset name `triviaqa-unfiltered-wikipedia` as an alias of the
+  existing official TriviaQA evaluator. No metric normalization or scoring
+  behavior changed.
+- Set `TOTAL_NUM=1000` and retained the DAPR-NQ grid's model, standard chat
+  prompt, BGE-small-v1.5 retrieval backend, ColBERT query configuration, ten
+  active Vanilla/subchunk cases, and per-case batch sizes.
+- Added a focused evaluator-registration test and documented the evaluation
+  condition in `docs/eval_protocol.md`.
+
+### What was verified
+- The grid parses as YAML and contains ten active cases.
+- Its dataset name resolves to `TriviaQAOfficialEvaluator`.
+- A complete official TriviaQA `Answer` object is scored through its normalized
+  aliases as expected.
+
+### Open issues
+- The TriviaQA retrieval DBs and ColBERT candidate artifact do not exist yet,
+  so the grid is configured but cannot run successfully.
+- Batch sizes are copied from the DAPR-NQ grid and have not been tested for
+  out-of-memory failures on TriviaQA.
+
+### Next steps
+- Build the three Vanilla BGE databases and the sentence-512 splitlong180
+  database plus ColBERT artifact before launching the grid.
+
+## 2026-07-26 — Launch unattended TriviaQA materialization and RAG evaluation
+
+### Objective
+- Build all materialized inputs required by `grid_trivia.yaml`, validate them,
+  and run the grid sequentially without additional approval prompts.
+
+### What was changed
+- Added `run/run_trivia_bge_rag_pipeline.sh`.
+- The pipeline runs under one cooperative GPU lock and builds, in order:
+  - Vanilla BGE-small-v1.5 fixed-size 128 DB;
+  - Vanilla BGE-small-v1.5 fixed-size 256 DB;
+  - Vanilla BGE-small-v1.5 fixed-size 512 DB;
+  - sentence-512/splitlong180 BGE-small-v1.5 DB;
+  - CUDA ColBERT candidate artifact;
+  - the ten active cases in `grid_trivia.yaml`.
+- DB embedding and upsert batch sizes are both 5,461, matching the DAPR-NQ
+  BGE builds. ColBERT artifact batch size is 6,144 on CUDA.
+- The script never deletes or overwrites an existing path. A completed stage is
+  verified from its manifest and skipped; an incomplete existing directory
+  causes a clear failure.
+- Pipeline output is appended to
+  `outputs/grid_07/triviaqa-unfiltered-wikipedia-bge-rag-seed42-1000-chat/pipeline.log`.
+
+### What was verified
+- Shell syntax and static stage checks passed.
+- The GPU lock was acquired on idle GPU 0.
+- The pipeline started at 2026-07-26 17:42 UTC with 145 GiB free on
+  `/mnt/nvme1`.
+- The first stage, Vanilla BGE-small-v1.5 fixed-size 128 DB construction, is in
+  progress.
+
+### Open issues
+- Materialization and evaluation have not completed yet.
+- If any stage fails, the pipeline stops without deleting or overwriting its
+  partial output; that failure would require inspection before resumption.
+
+### Next steps
+- Monitor the active unified execution session and update this handoff entry
+  with final DB/artifact validation and grid results after completion.
+
+## 2026-07-27 — Queue TriviaQA grid retry with revised batch sizes
+
+### Objective
+- Re-run the same TriviaQA grid after the first pass, using the user's revised
+  per-case batch sizes and without repeating unchanged successful cases.
+
+### What was changed
+- No evaluation code, dataset, DB, artifact, prompt, metric, or output format
+  was changed.
+- Queued a second invocation of `grid_trivia.yaml` under the cooperative GPU
+  lock with GPU-idle waiting enabled.
+
+### What was verified
+- All four DBs and the ColBERT artifact completed; ColBERT candidate-ID
+  validation passed with no missing or extra IDs.
+- The first 14-case grid pass produced 10 successful cases and four failed
+  cases.
+- Three failures were CUDA out-of-memory errors. Vanilla-256/K=20 completed
+  generation but its output JSONL contained one truncated record and therefore
+  failed during scoring.
+- The grid runner includes `EVAL_BSZ` in completed-case matching. Under the
+  currently edited grid, eight unchanged successful cases will be skipped and
+  six cases whose batch size differs from a prior success will run.
+- The original pipeline's final validator looked under the earlier `-chat`
+  run-name directory after the grid run name had been edited. This caused only
+  the pipeline's final status check to fail; it did not invalidate completed
+  DB, artifact, or grid outputs.
+
+### Open issues
+- The queued retry currently waits because an unrelated process is using GPU 0.
+- Two of the six retry cases succeeded under their preceding larger batch size,
+  but will run again because their batch sizes were subsequently changed in the
+  grid. Their output paths are distinct and will not overwrite the earlier
+  results.
+
+### Next steps
+- Allow the queued retry to start automatically when GPU 0 becomes idle, then
+  verify the final successful configuration count and summarize results.
+
+## 2026-07-27 — Analyze preliminary TriviaQA subchunk effectiveness
+
+### Objective
+- Determine why the completed TriviaQA subchunk points show little advantage
+  over the Vanilla input-length/F1 frontier.
+
+### What was changed
+- No code, dataset, evaluation protocol, prompt, metric, DB, artifact, or active
+  experiment was changed.
+- Per-query diagnostics were computed from the ten successful first-pass
+  outputs and the unchanged official TriviaQA answer objects.
+
+### What was verified
+- The current results use `PROMPT_FORMAT=raw_chunk_first`.
+- Vanilla-128/K=20 already reaches F1 0.7098 at 2,584.6 input tokens, while
+  Vanilla-512/K=20 reaches only 0.7158 at 9,832.1 tokens. The completed
+  subchunk points are therefore mostly dominated by the strong small-chunk
+  Vanilla frontier.
+- Against the same 512/K=20 retrieval family, subchunk R=0.5 reduces average
+  input from 9,832.1 to 5,245.3 tokens and changes F1 from 0.7158 to 0.7072.
+  Its F1 is 0.0046 above Vanilla-512/K=10 at 4,943.2 tokens, but a paired
+  10,000-resample bootstrap interval is [-0.0110, 0.0206], so the observed
+  improvement is not statistically resolved.
+- Canonical answer-value containment falls from 0.764 for Vanilla-512/K=20 to
+  0.704 at subchunk K=20/R=0.15. Relative to Vanilla, 72 queries lose a
+  previously contained canonical value and only 12 gain one. At R=0.5,
+  containment recovers to 0.758 and answer quality nearly recovers.
+- The official linked-document diagnostic is applicable to 732 queries whose
+  packaged Wikipedia-linked document contains the canonical/alias answer.
+  Vanilla-128/K=10 already places text from such a document in the prompt for
+  90.3% of those queries; K=20 reaches 92.3%. This is parent-document presence,
+  not evidence-chunk recall, and must not be used to claim that 128-token
+  retrieval is easy. TriviaQA documents are long, so a retrieved chunk from the
+  linked document can still omit the answer-bearing passage.
+- The more direct but still auxiliary canonical-answer-string diagnostic does
+  show a wide-retrieval benefit: containment is 0.677/0.717 for
+  Vanilla-128 at K=10/20 and 0.720/0.764 for Vanilla-512. Moving from
+  128/K=20 to 512/K=20 adds the canonical value for 74 queries and loses it for
+  27, although answer F1 improves by only 0.0060.
+- ColBERT's query length is a material confounder: 109/1,000 questions exceed
+  the 29-content-WordPiece capacity of `query_maxlen=32`. For subchunk
+  K=20/R=0.5 versus Vanilla-512/K=20, the F1 change is -0.0045 on the 891
+  untruncated questions and -0.0418 on the 109 truncated questions.
+
+### Open issues
+- TriviaQA has no local gold evidence-span label. Canonical answer containment
+  and packaged Wikipedia-linked-document presence are diagnostics, not official
+  evidence recall metrics.
+- The active sample's 68 records without packaged Wikipedia `EntityPages`
+  references are not no-answer questions: all retain official TriviaQA gold
+  answers. They lack a question-linked document in the chosen Wikipedia-only
+  corpus, although their answer may still appear in another pooled Wikipedia
+  document or be supplied from model knowledge.
+- Excluding those 68 records raises F1 by roughly 0.015--0.017 across the
+  inspected methods. On the remaining 932 records, Vanilla-128/K=20 has F1
+  0.7256 and Vanilla-512/K=20 has 0.7309, so their gap remains only 0.0053.
+  Thus the 68 records lower absolute scores but do not explain the weak
+  final-QA separation between 128- and 512-token retrieval.
+- The 68 records do amplify aggressive-compression loss. At K=20/R=0.5,
+  subchunk versus Vanilla-512 F1 changes by -0.0069 on the 932 linked records
+  and -0.0319 on the 68 unlinked records. Even after excluding them,
+  Vanilla-128/K=20 remains slightly better and much shorter than the completed
+  subchunk K=20/R=0.5 point.
+- Several R=0.25/R=0.5 cases are still being retried with lower batch sizes, so
+  the final curve is incomplete.
+- TriviaQA official aliases can be broad. The canonical `NormalizedValue`
+  containment diagnostic is more conservative but still does not prove that a
+  supporting statement is present.
+
+### Next steps
+- Finish the queued retry and update the input-length/F1 frontier.
+- If TriviaQA remains in scope, evaluate the subchunk cases with the previously
+  defined adaptive full-query ColBERT condition
+  (`query_minlen=32`, larger `query_maxlen`) as a separately named ablation.
+
+## 2026-07-27 — Contrast TriviaQA saturation with DAPR-NQ evidence retrieval
+
+### Objective
+- Reconcile the weak TriviaQA QA separation with the strong retrieval-width
+  effect in `dapr-nq-bge-evidence-exact-boundary-0725`.
+
+### What was changed
+- No code, data, metric, or running experiment was changed.
+
+### What was verified
+- DAPR-NQ exact evidence recall at K=10 rises from 0.2776 (128 chunks) to
+  0.5279 (256) and 0.6936 (512); at K=20 it rises from 0.2951 to 0.5643 and
+  0.7432.
+- DAPR-NQ longest-contiguous partial evidence recall also rises materially:
+  0.5343 to 0.6739 to 0.7653 at K=10, and 0.5860 to 0.7295 to 0.8197 at K=20.
+  Thus the width effect is not explained solely by the full-passage exact
+  boundary requirement.
+- At nearly equal context length, DAPR-NQ subchunk K=10/R=0.25 reaches exact
+  evidence recall 0.5721 at 1,295.6 tokens versus Vanilla-128/K=10's 0.2776 at
+  1,256.1 tokens. K=20/R=0.25 reaches 0.6591 at 2,525.5 tokens versus
+  Vanilla-256/K=10's 0.5279 at 2,461.7 tokens.
+
+### Interpretation
+- DAPR-NQ directly labels and measures full supporting passages in a much
+  larger retrieval corpus, so narrow retrieval failure remains visible.
+- TriviaQA currently has no evidence-span labels. Its canonical-answer-string
+  containment is a weaker proxy, and the 8B answer score can saturate through
+  aliases, partial clues, or model knowledge even when 128-token retrieval
+  misses the full supporting passage.
+- The NQ exact metric is additionally sensitive to a labeled passage crossing
+  a 128-token boundary, but the large partial-recall separation confirms a
+  genuine broader coverage advantage.
+
+### Next steps
+- Use DAPR-NQ as the primary retrieval/evidence argument.
+- Treat TriviaQA as an auxiliary end-to-end QA condition unless a full-query
+  ColBERT ablation materially improves its subchunk frontier.
+
+### Expected 1B behavior on TriviaQA
+
+- The coarse retrieval result itself is unchanged by the compressor. The
+  observed loss occurs after retrieval when selected subchunks omit
+  answer-bearing text.
+- Current canonical-answer-string containment:
+  - vanilla 512/K=20: `0.764`
+  - subchunk K=20/R=0.15: `0.704` (72 previously contained cases lost and 12 gained)
+  - subchunk K=20/R=0.50: `0.758`
+- A 1B reader may show a larger benefit from distractor removal than the 8B
+  reader, but it will also be less able to recover from answer-bearing text
+  removed by compression or from parametric knowledge.
+- The most plausible positive 1B point is a moderate retain ratio that preserves
+  answer containment while reducing context. Aggressive `R=0.15` is unlikely
+  to be competitive.
+- TriviaQA's Vanilla-128/K=20 frontier is already strong: F1 `0.70983` at
+  2,584.6 tokens for 8B. Therefore a 1B subchunk run may beat the same
+  512-chunk retrieval family while still failing to beat the global Vanilla
+  input-length/F1 frontier.
+- `109/1000` TriviaQA questions exceed the current 29-content-WordPiece ColBERT
+  query capacity. A 1B reader experiment does not fix this selector-side
+  truncation confound; the separately named adaptive full-query ColBERT
+  ablation is needed to determine whether the compression loss is avoidable.
+
+## 2026-07-26 — Prepare the NarrativeQA full corpus and evaluation QA splits
+
+### Objective
+- Prepare NarrativeQA under `/mnt/nvme1/datasets/narrativeqa`.
+- Retain the complete document corpus while writing only the official
+  validation and test questions and answers.
+- Validate the downloaded source documents against the official byte sizes and
+  `story_start`/`story_end` markers before using the normal project chunking
+  pipeline.
+
+### What was changed
+- Added `test/prepare_narrativeqa_dataset.py` and its focused unit test.
+- Used the current official `deepmind/narrativeqa` Hugging Face snapshot at
+  revision `2e643e7363944af1c33a652d1c87320d0871c4e4`:
+  - `narrativeqa-master.zip` contains the official metadata and QA CSV files;
+  - `narrativeqa_full_text.zip` contains all 1,572 downloaded source documents.
+- Materialized all 1,572 train/valid/test documents as UTF-8 text under
+  `documents/`.
+- Wrote all 3,461 official valid QAP rows under `splits/validation/` and all
+  10,557 official test QAP rows under `splits/test/`. Each answer record
+  preserves both reference answers. No train questions were written.
+- Preserved the official known-story association in each split's
+  `dataset_info/query_documents.jsonl`.
+- Applied an explicitly custom movie-source conversion: retain visible HTML
+  text while removing markup and `head`, `script`, `style`, `noscript`, and
+  `template` contents. Gutenberg documents retain the complete decoded source,
+  including Gutenberg headers and license text. Neither source kind is cut
+  using the start/end markers.
+- Added a limited malformed-HTML recovery rule: the `<body>` tag starts visible
+  content even if a source page failed to close `<head>`.
+- Copied both official source archives into the dataset's `source/` directory
+  and recorded their SHA-256 hashes, conversion policy, validation policy, and
+  counts in `dataset_info/manifest.json`.
+- Recorded per-document source/output hashes, encoding, byte-size comparison,
+  and marker results in `dataset_info/document_sources.jsonl`.
+
+### What was verified
+- The source archives match the Hugging Face snapshot hashes:
+  - full text:
+    `3e179a579d348da37b4929f20ece277a721f853fdc5efc11f915904de2a71727`;
+  - metadata:
+    `d9fc92d5f53409f845ba44780e6689676d879c739589861b4805064513d1476b`.
+- The final corpus contains exactly 1,572 non-empty documents:
+  1,102 train, 115 valid, and 355 test; 783 Gutenberg and 789 movie sources.
+- The parsed corpus contains 458,019,907 bytes. The complete dataset, including
+  both source archives, occupies approximately 634 MiB.
+- Source byte sizes are within the official README's 3.5% comparison threshold
+  for 1,570/1,572 documents. The two failures are both train documents; every
+  valid and test document passes the size threshold.
+- After case folding, HTML-entity decoding, and word/punctuation token
+  normalization, both official markers occur in 1,475 documents. The remaining
+  statuses are 86 end-only, 10 start-only, and one neither. For valid the
+  distribution is 106 both, eight end-only, and one start-only; for test it is
+  340 both, 14 end-only, and one start-only. No document was silently removed
+  because of a marker mismatch.
+- Validation has 3,461 aligned question, answer, and source-document records;
+  test has 10,557. IDs and source QAP identifiers align, every linked document
+  exists, and every answer record contains two references.
+- Four focused converter tests, Python compilation, and Black formatting pass.
+
+### Open issues
+- Indexing all 1,572 documents together is a custom open-corpus NarrativeQA
+  retrieval condition. The official full-story task supplies the associated
+  story for each question; using `query_documents.jsonl` to restrict retrieval
+  to that story reproduces that known-story condition.
+- The 97 documents without both normalized markers are retained from the
+  official current snapshot. The per-document report must be used if a stricter
+  inclusion policy is later proposed.
+- No active root-level query split was selected. Evaluation must explicitly use
+  either the validation or test query/answer paths.
+- Chunking, retrieval DB construction, dataset evaluator registration, prompt
+  selection, and experiment grids were not requested and were not changed.
+
+### Next steps
+- Choose the evaluation condition explicitly: official known-story retrieval or
+  custom global retrieval over all 1,572 documents.
+- Choose validation or test before registering paths or building retrieval
+  artifacts.
+- Run the normal project preprocessing pipeline over `documents/` only after
+  those evaluation choices are fixed.
+## 2026-07-27 — Validate small-reader distractor trade-off on DAPR-NQ
+
+### Objective
+
+- Check whether the DAPR-NQ results support the paper message that wide retrieval improves evidence recall but exposes a small reader to more irrelevant context, and that subchunk selection reduces this trade-off.
+
+### What changed
+
+- No code, dataset, evaluation protocol, or experiment configuration was changed.
+- Compared the existing raw-prompt 1B and 8B RAG results with the existing exact-boundary DAPR-NQ evidence-recall results.
+
+### What was verified
+
+- Wider vanilla retrieval increased labeled-evidence exact recall:
+  - vanilla 128, K=10: `0.27765`
+  - vanilla 256, K=10: `0.52789`
+  - vanilla 512, K=10: `0.69362`
+  - vanilla 512, K=20: `0.74317`
+- The 1B reader did not monotonically benefit from that additional context:
+  - vanilla 512, K=10: 4,734.68 input tokens, F1 `0.43522`
+  - vanilla 512, K=20: 9,393.49 input tokens, F1 `0.37874`
+- Wide retrieval followed by subchunk selection gave the strongest 1B result:
+  - subchunk K=20, R=0.25: 2,581.83 input tokens, compressed evidence exact recall `0.65914`, F1 `0.46014`
+- Retaining more subchunk context after the optimum reduced 1B QA:
+  - K=20, R=0.25: F1 `0.46014`
+  - K=20, R=0.50: F1 `0.42335`
+  - K=20, R=0.75: F1 `0.40638`
+- Paired query bootstrap over the 1B per-query F1 values (10,000 resamples, seed 42) found that subchunk K=20, R=0.25 improved over:
+  - vanilla 128, K=20 by `+0.0349`, 95% CI `[0.0180, 0.0516]`
+  - vanilla 256, K=10 by `+0.0266`, 95% CI `[0.0112, 0.0422]`
+  - vanilla 512, K=10 by `+0.0249`, 95% CI `[0.0097, 0.0396]`
+  - vanilla 512, K=20 by `+0.0814`, 95% CI `[0.0648, 0.0981]`
+- The 8B reader was much more robust to the added context:
+  - vanilla 512, K=20: 9,393.49 input tokens, F1 `0.58584`
+  - subchunk K=20, R=0.25: 2,581.83 input tokens, F1 `0.58640`
+  - Thus the 8B result mainly demonstrates comparable quality with about 72.5% fewer input tokens, whereas the 1B result demonstrates both shorter input and higher QA quality.
+
+### Interpretation and open issues
+
+- The observed pattern strongly supports a retrieval-breadth versus reader-context-burden trade-off, especially for the 1B reader.
+- The safest wording is that subchunking reduces distractor exposure and small-model sensitivity to excess context. Aggregate results alone do not isolate semantic distraction from general long-context degradation.
+- Raw-prompt and chat-template runs must not be mixed in this comparison.
+- Latency values from runs with different batch sizes are not directly comparable; this analysis concerns input length, evidence recall, and QA quality.
+- Compression overhead is proportionally more important for the 1B reader because its LLM inference is faster. The system-level break-even condition is that the LLM time saved by the shorter prompt must exceed compression plus any additional retrieval time.
+- Existing 1B timing summaries are only suggestive because they report time per batch while the effective batch conditions differ across points. At approximately 2,580 input tokens:
+  - vanilla 128, K=20: F1 `0.42522`, total `5.5756 s/batch`
+  - subchunk K=10, R=0.50: F1 `0.45655`, total `5.5717 s/batch`, compression `0.4562 s/batch`
+  - subchunk K=20, R=0.25: F1 `0.46014`, total `5.8177 s/batch`, compression `0.7457 s/batch`
+  These numbers indicate that the quality gain may survive the overhead, but they are not a controlled latency comparison and must not be reported as one.
+
+### Next steps
+
+- Present the NQ evidence-recall curve together with the 1B QA curve as the primary diagnostic figure.
+- Use the 8B result as an efficiency result: wide-retrieval quality is preserved with substantially less reader-visible context.
+- If a stronger causal claim about distractor removal is needed, add a controlled evidence-only/oracle-context ablation or a per-query analysis relating retained evidence and removed non-evidence text to QA changes.
+- Measure the 1B latency/throughput break-even curve under identical batch size, prompt format, CPU affinity/contention, GPU condition, and cache state. Report both batch size 1 latency and a fixed larger-batch throughput setting; do not infer either from the current mixed-batch summary.
+
+### Paper-positioning clarification
+
+- Do not describe the method as intrinsically specific to 1B models.
+- Separate two pressures:
+  - retrieval difficulty, measured by how retrieval breadth/granularity changes labeled-evidence recall;
+  - reader context interference, measured by whether adding retrieved context hurts QA despite improving evidence recall.
+- The current DAPR-NQ results already demonstrate substantial retrieval difficulty: vanilla exact evidence recall rises from `0.27765` at 128/K=10 to `0.74317` at 512/K=20.
+- The current results demonstrate strong reader-context interference for 1B but only weak interference for 8B at the tested maximum of roughly 9.4k input tokens:
+  - 1B vanilla 512 K=10 -> K=20: F1 `0.43522 -> 0.37874`
+  - 8B vanilla 512 K=10 -> K=20: F1 `0.59114 -> 0.58584`
+- The working interpretation is that the 1B model reaches the context-interference regime at a much shorter context length. It provides an accessible stress setting for the general retrieval-breadth/context-burden problem, but it does not by itself prove that an 8B model would show the same quality gain under full-Wikipedia or much wider-context retrieval.
+- For the current 8B setting, the supported claim is efficiency: subchunk K=20/R=0.25 preserves the quality of vanilla 512/K=20 with much less reader-visible context. A distractor-mitigation or lost-in-the-middle quality claim for 8B requires a stronger controlled stress experiment.
+- External-evidence clarification:
+  - Prior work supports the direction that larger models can be more robust to distractors and long-context degradation. RULER reports that a 34B model outperforms a 6B model both absolutely and in relative degradation as context grows; a controlled Pythia-family study from 70M to 12B also reports increasing distractor robustness with scale.
+  - These studies do not establish a universal threshold at 10k tokens, nor do they directly prove that the exact local Llama 1B/8B difference is caused only by model size. Treat the 10k-scale threshold as a local empirical observation.
+  - “Lost in the Middle” reports on NaturalQuestions-Open that reader performance saturates well before retriever recall; increasing retrieved documents from 20 to 50 improves GPT-3.5-Turbo by only about 1.5 points and Claude 1.3 by about 1 point. This directly supports the concern that simply increasing top-k on NQ may yield little 8B QA separation.
+  - Hard retrieval and hard answer generation are separate. The current NQ evidence-recall gap establishes retrieval difficulty, while the near-flat 8B F1 establishes that the current answer-generation task/context regime is close to saturation for that reader.
+
+### Bottleneck interpretation correction
+
+- Do not infer from a flat top-k/F1 curve that the 8B result is bounded primarily by the model's intrinsic reasoning ability.
+- Under the same `chat_system_user` prompt format:
+  - 8B vanilla BGE 256/K=10: EM `0.47615`, F1 `0.57585`
+  - 8B gold-evidence oracle: EM `0.66444`, F1 `0.75801`
+- The approximately 18.2-point F1 oracle gap shows substantial remaining loss from retrieval and reader-visible context construction. The oracle gap combines retrieval misses, distractor exposure, and context organization; it is not a pure retrieval-recall measurement.
+- A flat response to increasing top-k only establishes diminishing downstream utility from the additional retrieved chunks. It does not identify whether the cause is retrieval quality, context utilization, parametric knowledge, task/evaluator saturation, or intrinsic reasoning.
+- Use the following terminology:
+  - retrieval/context-construction bound when the gold-evidence oracle greatly exceeds retrieved-context QA;
+  - reader bound only when retrieved-context QA is close to the oracle but the oracle itself remains low.
+- NQ is primarily concise factoid QA, so “reader/context utilization” is safer than “reasoning ability” unless a separate reasoning-demanding analysis supports the latter.
+
+## 2026-07-27 — Absolute prohibition on autonomous changes
+
+### Objective
+
+- Record the user's explicit requirement that no autonomous change is
+  permitted.
+
+### Required discipline
+
+- Do not change or substitute any user-specified environment, command, path,
+  model, dataset, preprocessing rule, experiment condition, prompt, metric,
+  scoring rule, output format, or execution order.
+- This prohibition includes changes that appear technically equivalent,
+  convenient, faster, safer, or necessary to the assistant.
+- If the exact requested action cannot proceed, stop and report the blocking
+  condition. Do not choose an alternative without the user's explicit
+  approval.
+- Use `/home/dongseob/miniconda3` base for every project Python execution,
+  including preprocessing, DB construction, artifact construction, evaluation,
+  analysis scripts, and unit tests.
+- Do not use any other Conda environment for this project. There is no testing
+  exception.
+- If a required package such as `pytest` is unavailable in base, stop and
+  report it. Do not switch environments.
+
+### Incident recorded
+
+- NewsQA unit tests were incorrectly run in the `sglang` environment after
+  `pytest` was found there.
+- NewsQA vanilla DB construction was then incorrectly moved from base to
+  `sglang`.
+- The resulting three vanilla DBs were built with Chroma 1.0.8 instead of
+  base's Chroma 1.5.7 and must not be used.
+- The attempted sentence DB stopped before processing its first document
+  because `blingfire` was absent from `sglang`.
+- No deletion occurred after the user interrupted the cleanup command.
+
+### Current state
+
+- NewsQA source documents, questions, answers, and labels are intact.
+- The invalid `vanilla-bge-small-v1.5-{128,256,512}` DB directories still
+  exist.
+- `sent-bge-small-v1.5-512-splitlong180` contains only the failed empty DB.
+- No NewsQA preprocessing or artifact process is currently running.
+
+### Next step
+
+- Do nothing until the user explicitly authorizes the exact invalid-directory
+  deletion and base-environment rebuild.
+
+## 2026-07-27 — Rescore NewsQA `chat` final contexts with raw-span evidence
+
+### Objective
+
+- Rescore the saved final contexts from the existing 400-question NewsQA run
+  `newsqa-bge-rag-consensus-bsz-0726-chat`.
+- Use the existing official raw character-span annotations and unchanged
+  text-evidence coverage implementation.
+
+### What was changed
+
+- No retrieval, compression, answer generation, source code, dataset, prompt,
+  label, or metric implementation was changed.
+- Read the seven completed RAG output files and joined each saved
+  `ctxs[*].text` value in stored order with two newline characters.
+- Scored those final context strings with `TextEvidenceCoverageScorer`, the
+  existing query-keyed raw-span label adapter, Llama-3.1-8B-Instruct metric
+  tokenization, and passage-recall threshold 0.8.
+- Wrote the aggregate JSON, aggregate CSV, and seven per-query detail files to
+  `outputs/analysis/newsqa_chat_raw_span_evidence_400/`.
+- The source run name ends in `-chat`, but its manifest verifies that its
+  actual prompt format was `raw_chunk_first`.
+
+### What was verified
+
+- All seven source cases contain the same 400 unique questions in identical
+  order, and every question exists in the unchanged query-keyed raw-span label
+  file.
+- The aggregate JSON, CSV, and each 400-row detail file agree exactly.
+- Final-context mean token counts and raw-span exact character evidence recall
+  are:
+  - subchunk K=20/R=0.15: 1,109.74 tokens, 0.49409;
+  - subchunk K=20/R=0.25: 1,806.64 tokens, 0.51613;
+  - subchunk K=20/R=0.50: 3,559.37 tokens, 0.55138;
+  - subchunk K=20/R=0.75: 5,301.81 tokens, 0.56047;
+  - vanilla-128/K=20: 2,249.77 tokens, 0.51129;
+  - vanilla-256/K=20: 4,121.44 tokens, 0.53004;
+  - vanilla-512/K=20: 6,716.69 tokens, 0.55526.
+- Retrieval, compression, and generation were not rerun.
+
+### Open issues
+
+- The unchanged query-keyed raw-span adapter retains the previously documented
+  duplicate-question final-row behavior. No custom alignment correction was
+  introduced.
+- The raw spans are official NewsQA annotations, while the evidence-coverage
+  aggregation is the existing project metric rather than the official NewsQA
+  answer-scoring metric.
+
+### Next steps
+
+- Use the saved summary and detail files for analysis of the `chat`
+  (`raw_chunk_first`) run.
+- Do not substitute the `chat2` (`chat_system_user`) outputs unless explicitly
+  requested.
+
+## 2026-07-27 — Compare NewsQA evidence/F1 coupling with DAPR-NQ
+
+### Objective
+
+- Determine why final-context raw-span evidence recall and answer F1 do not
+  move together across the seven NewsQA `chat` conditions as closely as the
+  corresponding DAPR-NQ condition averages.
+
+### What was changed
+
+- No code, data, output, metric, prompt, or experiment condition was changed.
+- Performed read-only aggregate and per-query analysis using the saved NewsQA
+  raw-span rescore details, the saved NewsQA predictions, the active official
+  single-consensus answers, and existing DAPR-NQ evidence/QA summaries.
+
+### What was verified
+
+- Across the seven NewsQA conditions, aggregate raw-span exact character
+  evidence recall and F1 have Pearson correlation `-0.7225` and Spearman rank
+  correlation `-0.8214`. Across only the four K=20 subchunk ratios, they are
+  `-0.8510` and `-0.8000`.
+- Across the matched seven DAPR-NQ K=20 conditions, aggregate exact evidence
+  recall and 8B raw-prompt F1 have Pearson correlation `0.7731` and Spearman
+  rank correlation `0.7857`. Across the four subchunk ratios, they are
+  `0.8682` and `0.8000`.
+- The DAPR-NQ association is strong but not perfectly monotonic: K=20
+  subchunk R=0.25 to R=0.50 raises exact evidence recall
+  `0.65914 -> 0.72245` while F1 changes `0.58640 -> 0.58426`.
+- Within each individual NewsQA condition, per-query raw-span evidence recall
+  still has a positive Pearson correlation with answer F1, ranging from
+  `0.5276` to `0.6089`.
+- NewsQA official-consensus answer containment and contained-case F1 move in
+  opposite directions as more subchunk context is retained:
+  - R=0.15: containment `0.4950`, contained-case F1 `0.5016`;
+  - R=0.25: containment `0.5200`, contained-case F1 `0.4813`;
+  - R=0.50: containment `0.5475`, contained-case F1 `0.4612`;
+  - R=0.75: containment `0.5600`, contained-case F1 `0.4375`.
+- The same pattern occurs for vanilla width:
+  - 128: containment `0.5175`, contained-case F1 `0.4765`;
+  - 256: containment `0.5225`, contained-case F1 `0.4686`;
+  - 512: containment `0.5500`, contained-case F1 `0.4314`.
+- Depending on the condition, 27--42 questions contain at least one raw
+  annotator span but do not contain the official single-consensus answer after
+  NewsQA normalization. The reverse mismatch occurs for 3--7 questions.
+
+### Interpretation
+
+- NewsQA has two opposing measured effects: longer final context contains more
+  labeled answer text, but the reader extracts the official answer less
+  accurately even when that answer is present. Their combination produces the
+  flat or negative aggregate F1 curve.
+- The NewsQA evidence and answer targets are not identical. Evidence coverage
+  averages all raw non-`None` annotator spans, including disagreement and
+  duplicates, while QA scores one official consensus span.
+- DAPR-NQ evidence labels are complete qrel passages rather than short raw
+  answer spans, and NQ-open answer scoring accepts the full official alias
+  list. These differences make DAPR-NQ evidence presence and answer scoring
+  more directly coupled than the current NewsQA raw-span/consensus pairing.
+- NewsQA questions were authored for an associated article and can contain
+  local references such as pronouns. Under the custom shared-corpus RAG
+  condition, additional retrieved articles can add competing referents. This
+  is a dataset-derived plausible mechanism, not a separately isolated causal
+  result.
+- The `chat` run uses `raw_chunk_first`. Standard chat improves NewsQA
+  contained-case F1 in the existing `chat2` diagnostic but does not eliminate
+  the flat condition-level curve, so prompt serialization explains only part
+  of the difference.
+- NewsQA has only 400 sampled questions and a much smaller evidence-recall
+  range than DAPR-NQ's 2,390-question full run. Small differences among NewsQA
+  conditions therefore have greater sampling uncertainty.
+
+### Open issues
+
+- The current analysis does not causally separate distractor semantics,
+  context-length degradation, local-reference ambiguity, and answer-label
+  ambiguity.
+- The NewsQA rescore is final-context evidence recall. For subchunk conditions
+  it is compressed-context recall, not coarse retrieval recall before
+  selection.
+
+### Next steps
+
+- If causal separation is required, compare the same 400 questions under:
+  official consensus span only, raw annotator spans, and gold-evidence-only
+  reader contexts, while keeping prompt format and reader fixed.
+
+## 2026-07-27 — Verify the NewsQA question `What does she do?`
+
+### Objective
+
+- Determine whether `What does she do?` was introduced by local conversion or
+  exists verbatim in the official NewsQA data.
+
+### What was changed
+
+- No code, data, metric, or experiment output was changed.
+- Performed a read-only comparison of the official NewsQA archive, official
+  test-story list, local query/answer records, raw evidence labels, and linked
+  article text.
+
+### What was verified
+
+- The question occurs verbatim in the official
+  `newsqa-data-v1/newsqa-data-v1.csv` at zero-based data-row index 559.
+- Its linked story is
+  `./cnn/stories/557fd3f6fc104f27dc6071bd80dc7c0b2c19cafa.story`, which is present in
+  the official test-story ID list.
+- The official row stores:
+  - `is_question_bad=0.0`;
+  - `is_answer_absent=0.0`;
+  - raw answer ranges `256:262|342:392|256:277`;
+  - validated answers `{"256:262": 1, "256:277": 2}`.
+- The three raw spans are `sings `, `was performing outside Washington's
+  Union Station `, and `sings for her friend `.
+- The exact official consensus conversion selects `sings for her friend `.
+- The linked article introduces Abby Miller immediately before those answer
+  spans, so the pronoun is locally resolvable when the associated article is
+  supplied.
+- The same question string occurs once more in the complete official CSV for a
+  different story, but that second story is not in the official test-story
+  list used here.
+
+### Interpretation
+
+- The question is not a conversion error. It is valid only relative to its
+  associated article context.
+- The current shared-corpus RAG condition removes the original known-story
+  assumption and submits the question alone to retrieval. Under that custom
+  condition, `she` has no unique referent before retrieval and the question is
+  under-specified.
+- This verifies a concrete dataset-setting mismatch that can weaken both
+  retrieval and final-answer evaluation independently of the compressor.
+
+### Next steps
+
+- Do not describe the current NewsQA shared-corpus result as the unmodified
+  official NewsQA task.
+- If NewsQA remains in scope, quantify how many active questions contain local
+  references that are not independently resolvable from the question text.
+
+## 2026-07-27 — Audit NarrativeQA for story-dependent question references
+
+### Objective
+
+- Check whether the locally prepared NarrativeQA validation and test questions
+  contain pronoun/deictic references analogous to NewsQA's
+  `What does she do?`.
+
+### What was changed
+
+- No code, dataset, metric, or experiment output was changed.
+- Performed a read-only custom lexical diagnostic over all 3,461 validation
+  questions and all 10,557 test questions.
+
+### What was verified
+
+- The exact string `What does she do?` does not occur in either split.
+- Analogous story-dependent questions do occur in the official NarrativeQA
+  records. Test examples include:
+  - `Where were they forced to move from?`
+  - `Who were they entertaining?`
+  - `Why does he become a taxi driver?`
+  - `What did she have to do with the tears?`
+  - `Where does this radio station take place?`
+- A broad custom lexical count for third-person pronouns or deictic terms
+  (`he/she/it/they` forms plus `this/that/these/those`) matches:
+  - 784/3,461 validation questions;
+  - 2,488/10,557 test questions.
+- A narrower custom surface pattern in which a third-person pronoun directly
+  follows the leading question auxiliary matches:
+  - 9 validation questions;
+  - 34 test questions.
+- The broad counts are not counts of invalid questions. Many matched questions
+  also name the relevant character or use a locally resolvable grammatical
+  construction. They are only a lexical upper-bound diagnostic.
+- Every inspected question retains its official `source_document_id`, and
+  `query_documents.jsonl` maps it to the associated story.
+
+### Interpretation
+
+- NarrativeQA has the same fundamental setting issue as NewsQA if converted to
+  global open-corpus retrieval: its official full-story task assumes the
+  associated story is known, while some question strings are not independently
+  resolvable.
+- Under official known-story retrieval, these questions are valid because the
+  linked narrative supplies the referent. Under the proposed custom global
+  retrieval over all 1,572 documents, pronoun-only questions can be
+  under-specified before retrieval.
+- The lexical diagnostic does not establish the exact prevalence of
+  semantically under-specified questions. That would require manual annotation
+  or a separately approved, explicit reference-resolution protocol.
+
+### Next steps
+
+- Choose official known-story retrieval or explicitly label any all-document
+  NarrativeQA experiment as a custom open-corpus condition.
+- Do not infer an exact ambiguous-question percentage from the lexical counts.
+
+## 2026-07-27 — Audit TriviaQA for under-specified question references
+
+### Objective
+
+- Check whether the locally prepared TriviaQA unfiltered dev questions contain
+  question-external pronoun/deictic references analogous to the NewsQA and
+  NarrativeQA examples.
+
+### What was changed
+
+- No code, dataset, metric, or experiment output was changed.
+- Performed a read-only custom lexical diagnostic over all 11,313 official dev
+  questions and the active seed-42 1,000-question subset.
+
+### What was verified
+
+- The exact string `What does she do?` does not occur.
+- A broad custom lexical pattern for third-person pronouns and deictic terms
+  matches 1,756/11,313 full questions and 143/1,000 active questions.
+- Most inspected broad matches contain their antecedent in the same question,
+  for example `How old was Jimi Hendrix when he died?`; the broad count is not
+  an ambiguous-question count.
+- A narrower leading pattern such as
+  `What/Why/Where ... does/did/is ... he/she/it/they` matches zero questions in
+  both the full and active populations.
+- TriviaQA is not fully clean. The active subset contains official question ID
+  `dpql_4165`:
+  `His name comes from the refrain of what pop song?`
+  The question does not identify the referent of `His`; the official answer is
+  `STRANGERS IN THE NIGHT`.
+- The full population also contains other context-dependent or incomplete quiz
+  formulations, such as `Who was the first of these to become US President?`.
+
+### Interpretation
+
+- Unlike NewsQA and NarrativeQA, TriviaQA is designed as open-domain trivia and
+  does not systematically assume that one known source story is supplied with
+  each question.
+- The observed under-specified examples are source-question noise or lost quiz
+  context, not a protocol-wide known-story-to-open-corpus conversion mismatch.
+- Their exact prevalence remains unknown. The custom lexical patterns cannot
+  distinguish all semantically complete and incomplete questions.
+
+### Next steps
+
+- Treat TriviaQA as substantially better aligned with shared-corpus RAG than
+  NewsQA or NarrativeQA, while documenting that a small unquantified amount of
+  official question noise exists.
+- If this noise becomes material, manually audit a fixed, explicitly named
+  subset rather than filtering questions with an automatic pronoun heuristic.
+
+## 2026-07-27 — Summarize DAPR-MS MARCO corpus scale against DAPR-NQ
+
+### Objective
+
+- Verify DAPR-MS MARCO parent-document count and length distribution, then
+  compare them with the existing DAPR-NQ corpus while preserving and
+  disclosing each existing serialization definition.
+
+### What was changed
+
+- No code, dataset, metric, or experiment output was changed.
+- Reviewed the official DAPR paper and dataset card and rechecked the existing
+  full-corpus streaming audit in `outputs/dapr_msmarco_feasibility.json`.
+- Recomputed only arithmetic ratios from the previously measured values.
+
+### What was verified
+
+- Official DAPR document counts are:
+  - MS MARCO: 1,359,163;
+  - Natural Questions: 108,626;
+  - ratio: 12.5123x.
+- The official DAPR paper reports average passage lengths of 63.9 words for
+  MS MARCO and 105.5 words for NQ, but deliberately leaves MS MARCO passages
+  per document blank because no gold paragraph segmentation exists.
+- The existing full-corpus audit serialized every DAPR-MS MARCO document as
+  `title + blank line + DAPR passages joined by blank lines` and tokenized it
+  without special tokens using `meta-llama/Llama-3.1-8B-Instruct`.
+- Measured DAPR-MS MARCO parent-document token lengths are:
+  - count 1,359,163;
+  - mean 1,901.70;
+  - p50 951;
+  - p75 1,816;
+  - p90 3,792;
+  - p95 6,530;
+  - p99 16,032;
+  - max 446,042;
+  - 77.675% exceed 512 tokens;
+  - 46.595% exceed 1,024 tokens.
+- The existing DAPR-NQ token statistics are:
+  - count 108,626;
+  - mean 2,565.6;
+  - p50 1,382;
+  - p75 3,221;
+  - p90 6,453;
+  - p95 9,162.5;
+  - p99 15,677.25;
+  - max 89,393.
+- MS MARCO/NQ length ratios are:
+  - mean 0.741x;
+  - p50 0.688x;
+  - p75 0.564x;
+  - p90 0.588x;
+  - p95 0.713x;
+  - p99 1.023x;
+  - maximum 4.990x.
+- Total reconstructed parent-document token volumes are:
+  - MS MARCO: 2,584,717,369;
+  - NQ: 278,693,385;
+  - ratio: 9.2744x.
+- Therefore MS MARCO has 12.51x more documents, but its typical document is
+  shorter. Its much larger corpus count still yields 9.27x the total token
+  volume, and its extreme maximum is about 4.99x longer than NQ's maximum.
+
+### Comparability caveat
+
+- These document percentiles are project-measured tokenizer statistics, not
+  values reported by the DAPR paper.
+- The MS MARCO audit places a blank line between title and passages, while the
+  materialized NQ corpus places one newline there; both join subsequent
+  passages with blank lines. This one-newline-per-document difference is small
+  but means the tokenizer measurements are not byte-identical serialization
+  protocols.
+- MS MARCO lacks official gold paragraph segmentation. DAPR constructs its
+  usable document/passages by combining MS MARCO QA, Passage Ranking, and
+  Document Ranking data and limits candidate passages to the Passage Ranking
+  pool. Passage-count comparisons with NQ must therefore not be interpreted as
+  equivalent natural paragraph counts.
+
+### Next steps
+
+- Use the 12.51x document-count and 9.27x token-volume ratios for corpus/index
+  capacity planning.
+- Do not infer exact 512-token chunk count or artifact size without actually
+  building the corpus or running a dedicated chunk-count audit.
+
+## 2026-07-27 — Clarify DAPR-MS MARCO candidate-passage construction
+
+### Objective
+
+- Replace the unclear phrase “Passage Ranking passage” with a concrete
+  description of DAPR-MS MARCO's stored segments and retrieval candidates.
+
+### What was changed
+
+- No code, data, metric, or output was changed.
+- Rechecked the official DAPR dataset card and paper appendix.
+
+### What was verified
+
+- DAPR-MS MARCO stores a parent web document plus a sequence of segments.
+- The official MS MARCO Passage Ranking collection supplies 2,383,023 text
+  spans that DAPR can use as retrieval candidates.
+- DAPR segments each parent document so that those known spans remain
+  standalone segments. Text before, between, and after them is retained as
+  surrounding document-context segments.
+- Candidate spans have `is_candidate=true`; surrounding context segments have
+  `is_candidate=false`.
+- The Hugging Face dataset exposes approximately 6.01 million total stored
+  segments, including both candidate and context-only segments. The official
+  DAPR overview reports 2,383,023 candidate passages.
+- DAPR-NQ instead uses 2,682,017 pre-existing Wikipedia paragraphs, all of
+  which are retrieval candidates.
+
+### Interpretation
+
+- “Passage Ranking passage” means “a text span imported from the separately
+  released MS MARCO Passage Ranking dataset,” not a ranking operation or a
+  special passage type generated by the current project.
+- Dividing 2,383,023 candidate spans by 1,359,163 MS MARCO documents does not
+  measure natural paragraphs per document; it measures only how many imported
+  retrieval-candidate spans were available.
+- In NQ, 2,682,017/108,626 is meaningful as the average number of available
+  Wikipedia paragraph candidates per parent document.
+- For the proposed project's fixed-512 parent-document build, the earlier
+  document-token comparison uses all retained text segments, including
+  context-only segments. Therefore the 12.51x document-count and 9.27x total
+  token-volume comparisons remain valid; only the direct passage-count
+  comparison requires this caveat.
+
+## 2026-07-27 — Remove invalid NewsQA DB directories
+
+### Objective
+
+- Delete the NewsQA vector databases built in the unauthorized `sglang`
+  environment with Chroma 1.0.8.
+
+### What was changed
+
+- Permanently deleted:
+  - `/mnt/nvme1/datasets/newsqa/vanilla-bge-small-v1.5-128`
+  - `/mnt/nvme1/datasets/newsqa/vanilla-bge-small-v1.5-256`
+  - `/mnt/nvme1/datasets/newsqa/vanilla-bge-small-v1.5-512`
+- The failed `sent-bge-small-v1.5-512-splitlong180` directory was already
+  absent; no deletion was needed for that path.
+- No source code, dataset source file, question, answer, label, or evaluation
+  protocol was changed.
+
+### What was verified
+
+- All four intended NewsQA DB paths are absent.
+- The NewsQA `documents`, `questions`, `answers`, and `dataset_info`
+  directories remain present.
+
+### Open issues
+
+- No usable NewsQA vector DB currently exists.
+
+### Next steps
+
+- Rebuild the requested NewsQA DBs only from
+  `/home/dongseob/miniconda3` base with Chroma 1.5.7 after an explicit build
+  request.
+
+## 2026-07-27 — Remove unused ColBERT SQLite reader methods
+
+### Objective
+
+- Remove only ColBERT metadata methods with no callers, without changing the
+  active artifact-build, migration, runtime-loading, or evaluation paths.
+
+### What was changed
+
+- Removed `ColBERTMetadataReader.region_payload()`,
+  `ColBERTMetadataReader.cacheable_count()`, and
+  `ColBERTMetadataReader.region_count()` from `src/colbert_metadata.py`.
+- Preserved reader methods used by the active build/export path, tests, and the
+  one-time legacy migration entry point.
+
+### What was verified
+
+- `python -m py_compile src/colbert_metadata.py` passed.
+- Black check for `src/colbert_metadata.py` passed.
+- The three focused standard-library `unittest` files passed: 60 tests total.
+- `git diff --check -- src/colbert_metadata.py` passed.
+
+### Open issues
+
+- `src/colbert_metadata.py` still contains the active temporary SQLite build
+  implementation.
+- Some reader methods are used only by tests or legacy migration tooling; they
+  were not classified as dead code in this change because they still have
+  callers.
+
+### Next steps
+
+- Decide separately whether to retain the legacy migration entry point and
+  test-only reader APIs.
+- Treat complete removal of temporary build-time SQLite as a distinct
+  persistence redesign rather than dead-code deletion.
+
+## 2026-07-27 — Consolidate ColBERT metadata persistence
+
+### Objective
+
+- Consolidate the temporary SQLite build metadata and finalized split-JSON
+  helpers into one module without changing either persistence format or
+  evaluation behavior.
+- Diagnose the post-inference JSONL parsing failure observed for the TriviaQA
+  vanilla 256/top-k-20/batch-size-4 case.
+
+### What was changed
+
+- Moved the split-JSON filenames, streaming writers, legacy conversion helper,
+  and SHA-256-verified JSON reader from `src/colbert_json_metadata.py` into
+  `src/colbert_metadata.py`.
+- Updated artifact loading, candidate-store materialization, legacy migration,
+  and the focused metadata test to import from `colbert_metadata`.
+- Deleted `src/colbert_json_metadata.py`.
+- Did not change the temporary SQLite schema, finalized JSON bytes, hashes,
+  candidate mappings, region mappings, runtime loading, prompts, metrics, or
+  scoring.
+
+### What was verified
+
+- No Python import of `colbert_json_metadata` remains under `src/` or `test/`.
+- Black and `py_compile` checks passed for all affected Python files.
+- Four focused standard-library `unittest` files passed: 62 tests total.
+- The failed TriviaQA prediction file contains 1,000 physical LF-delimited
+  records. Its physical record 549 contains two literal U+0085 NEXT LINE
+  characters inside retrieved context text.
+- `acc_metric.load_json_records()` uses `str.splitlines()`, which treats U+0085
+  as a record boundary. It therefore splits physical record 549 into three
+  fragments and reports an unterminated JSON string at the first fragment.
+
+### Open issues
+
+- The TriviaQA inference completed and wrote all 1,000 prediction records, but
+  metric computation and grid-case completion failed.
+- The prediction loader must distinguish the JSONL LF delimiter from valid
+  Unicode line-separator characters embedded in JSON string values. This
+  evaluation-parser fix was not included in the metadata-module refactor.
+
+### Next steps
+
+- Change the JSONL loader under a separate evaluation-sensitive change, add a
+  regression test containing U+0085, and rerun scoring only on the existing
+  prediction file. Model inference does not need to be repeated.
+
+### Evaluation comparability
+
+- The ColBERT metadata change is import/module consolidation only; previous and
+  new experiment results remain directly comparable.
+- No metric result was produced for the affected TriviaQA case, so it must not
+  be treated as a completed scored grid result until scoring succeeds.
+
+## 2026-07-27 — Recover TriviaQA score from U+0085 JSONL parsing failure
+
+### Objective
+
+- Correct JSONL record delimiting for valid Unicode characters embedded in
+  retrieved text.
+- Score the completed TriviaQA vanilla BGE-small 256/top-k-20/batch-size-4
+  prediction file without rerunning retrieval or model inference.
+- Add the recovered score to the existing grid results and summary CSV files.
+
+### What was changed
+
+- Changed `acc_metric.load_json_records()` to split JSONL records only on LF
+  (`U+000A`) instead of `str.splitlines()`.
+- Added `test/test_acc_metric_jsonl.py`, which verifies that literal U+0085 NEXT
+  LINE inside a JSON string remains part of that string.
+- Documented the JSONL delimiter rule in `docs/eval_protocol.md`.
+- Added one `status=ok` result to:
+  `outputs/grid_07/triviaqa-unfiltered-wikipedia-bge-rag-seed42-1000/results.jsonl`.
+- Marked that result with `recovered_score_only=true`.
+- Regenerated:
+  - `summary-triviaqa-unfiltered-wikipedia.csv`
+  - `summary-triviaqa-unfiltered-wikipedia-summary2.csv`
+- Preserved prior `failures.jsonl` records as execution history.
+
+### What was verified
+
+- The existing prediction file loads as exactly 1,000 records.
+- Physical record 549 retains both embedded U+0085 characters and maps to the
+  expected question, `Who was known as Dr Angelicus?`.
+- Recovered official TriviaQA metrics:
+  - exact match: `0.652`
+  - F1: `0.7154429749058467`
+  - count: `1000`
+- `results.jsonl` and both summary CSV files contain 15 result rows.
+- The recovered dataset/subdirectory/top-k/batch-size combination occurs
+  exactly once in each applicable result file.
+- The new JSONL regression test and 12 existing metric tests passed.
+- Black, `py_compile`, and the actual 1,000-record loader check passed.
+
+### Open issues
+
+- The original failed process exited before printing post-score aggregate
+  `run_time`, `process_total_time`, and `end_to_end_time`. Those fields remain
+  empty for the recovered row rather than being estimated.
+- Original measured per-batch timings, throughput, runner elapsed time, and the
+  failed log are retained in the recovered result.
+
+### Next steps
+
+- Use the recovered row for the requested grid comparison.
+- Do not rerun model inference for this case unless a separate experiment input
+  or protocol setting changes.
+
+### Evaluation comparability
+
+- This changes only JSONL record delimiting. It does not alter prediction text,
+  reference answers, answer normalization, exact-match computation, F1
+  computation, retrieval, prompts, or model generation.
+- Files without embedded Unicode line-separator characters produce the same
+  records and scores as before. The affected file was previously unscorable;
+  its recovered score is directly comparable to the other cases under the same
+  evaluation configuration.
+
+## 2026-07-27 — Remove legacy ColBERT clone and migration entry points
+
+### Objective
+
+- Remove ColBERT artifact utilities that are not part of the normal preprocess
+  or evaluation paths.
+- Preserve the current v3 artifact build, split-JSON loading, and evaluation
+  behavior.
+
+### What was changed
+
+- Deleted `src/entrypoint/clone_colbert_artifact.py`.
+- Deleted `src/entrypoint/migrate_colbert_metadata.py`.
+- Removed the clone invocation and obsolete source-subdirectory variable from
+  `run/run_dapr_nq_bge_evidence_pipeline.sh`.
+- Changed that special pipeline to wait for both the target DB manifest and a
+  normally materialized target ColBERT artifact index.
+- Removed the migration-only unit test and the now-unused
+  `write_split_metadata_from_legacy_index()` helper.
+- Preserved the finalized split-metadata reuse test.
+- Updated `docs/eval_protocol.md` to require rebuilding legacy artifacts
+  instead of referring to the deleted one-time migration path.
+
+### What was verified
+
+- No source, run script, or test reference to either deleted entry point,
+  `clone_artifact()`, `migrate_artifact()`, or the removed legacy conversion
+  helper remains.
+- Black, Python compilation, and shell syntax checks passed for the affected
+  files.
+- In the base environment (`/home/dongseob/miniconda3/bin/python`), the complete
+  test suite passed:
+  - 185 tests.
+  - 683,634 subtests.
+  - one existing non-writable NumPy memory-map warning.
+
+### Open issues
+
+- The special DAPR-NQ pipeline now requires its sentence-level target ColBERT
+  artifact to be built through the normal materialization path before it
+  proceeds.
+
+### Next steps
+
+- Rebuild any legacy v1/v2 ColBERT artifact that is needed again; in-place
+  migration and cross-DB artifact cloning are no longer supported.
+
+### Evaluation comparability
+
+- No dataset handling, retrieval, prompt, metric, scoring, or finalized v3
+  artifact format changed. Existing valid v3 results remain directly
+  comparable.
+
+## 2026-07-27 — Rename gold-evidence evaluation entry point to oracle
+
+### Objective
+
+- Distinguish the gold-evidence oracle answer-generation path from text
+  evidence-coverage evaluation.
+
+### What was changed
+
+- Renamed `run/eval_gold_evidence.sh` to `run/eval_oracle.sh`.
+- Updated the DAPR-NQ gold-evidence oracle grid to use the new script name.
+- Updated `docs/codebase_guide.md` and `docs/eval_protocol.md`.
+- Did not rename output files or run names, preserving existing result-path
+  compatibility.
+
+### What was verified
+
+- No active source, run, test, or current documentation reference to
+  `eval_gold_evidence.sh` remains.
+- `bash -n run/eval_oracle.sh` passed.
+- The oracle grid parses and resolves `eval_script` to `run/eval_oracle.sh`.
+- Ten focused oracle-evidence and evidence-coverage tests passed in the base
+  environment with `PYTHONPATH=src`.
+- `git diff --check` passed for the affected files.
+
+### Open issues
+
+- `src/oracle_evidence.py` reuses `load_text_evidence_labels()` from
+  `src/evidence_coverage.py`, but it does not call
+  `TextEvidenceCoverageScorer` or compute coverage metrics.
+- The actual coverage evaluation entry point remains
+  `run/retrieval_eval/eval_retrieval_and_compression.sh` with
+  `EVIDENCE_METRIC_MODE=text_evidence_exact`.
+
+### Next steps
+
+- Use `run/eval_oracle.sh` for oracle answer-quality experiments.
+- Use `run/retrieval_eval/eval_retrieval_and_compression.sh` for retrieval or
+  compressed-context evidence coverage.
+
+### Evaluation comparability
+
+- This is an entry-point rename only. Dataset handling, gold context,
+  generation, answer scoring, and evidence-coverage metrics are unchanged.
+
+## 2026-07-27 — Rename evidence evaluation shell entry point
+
+### Objective
+
+- Give the retrieval/evidence-only shell entry point a name distinct from
+  integrated retrieval, compression, and answer-generation evaluation.
+
+### What was changed
+
+- Renamed
+  `run/retrieval_eval/eval_retrieval_and_compression.sh` to
+  `run/retrieval_eval/eval_retrieval_only.sh`.
+- Updated the DAPR-NQ and NewsQA evidence grid configurations.
+- Updated `docs/eval_protocol.md`.
+- Kept the internal Python implementation filename unchanged.
+- Kept the separate legacy root script
+  `run/eval_retrieval_and_compression.sh` unchanged.
+
+### What was verified
+
+- No active reference to the former nested shell path remains.
+- The renamed shell script passes `bash -n`.
+- Both evidence grid YAML files parse and resolve to the renamed entry point.
+- `git diff --check` passed for the affected files.
+
+### Open issues
+
+- The separate root-level `run/eval_retrieval_and_compression.sh` still exists
+  and is outside this rename's scope.
+
+### Next steps
+
+- Use `run/retrieval_eval/eval_retrieval_only.sh` for DAPR-NQ and NewsQA
+  evidence-coverage grids.
+
+### Evaluation comparability
+
+- This is a path rename only. Retrieval, compression, evidence labels,
+  context construction, metrics, and output formats are unchanged.
+
+## 2026-07-27 — Document retrieval-only and oracle evaluation in README
+
+### Objective
+
+- Explain the distinct purposes and inputs of the retrieval/evidence-coverage
+  and gold-evidence oracle shell entry points.
+
+### What was changed
+
+- Added a retrieval and evidence-coverage section to `README.md` for
+  `run/retrieval_eval/eval_retrieval_only.sh`.
+- Documented a runnable DAPR-NQ example and the required
+  `EVIDENCE_METRIC_MODE=text_evidence_exact` selection.
+- Documented the project-specific custom evidence-label schema:
+  - unique non-empty `query`;
+  - aligned non-empty `evidence_passage_ids` and `evidence_texts`;
+  - exact query-string matching;
+  - optional additional metadata;
+  - JSONL, JSON-array, and `records`-array containers.
+- Documented exact-containment and contiguous-partial metric semantics,
+  tokenizer selection, and output locations.
+- Added a gold-evidence oracle section for `run/eval_oracle.sh`, including a
+  runnable example, answer-generation behavior, evidence ordering and exact
+  duplicate removal, answer inputs, and output location.
+
+### What was verified
+
+- Every documented environment variable is consumed by the corresponding
+  shell script.
+- Both shell scripts pass `bash -n`.
+- `git diff --check -- README.md` passed.
+
+### Open issues
+
+- None.
+
+### Next steps
+
+- Use the README entry-point distinction when adding future evidence datasets
+  or oracle configurations.
+
+### Evaluation comparability
+
+- Documentation only; no dataset, retrieval, compression, prompt, metric,
+  scoring, or output behavior changed.
+
+## 2026-07-27 — Correct interpretation of DAPR-MS MARCO `is_candidate`
+
+### Objective
+
+- Clarify whether only `is_candidate=true` text originates from MS MARCO.
+
+### What was changed
+
+- No code, data, metric, or output was changed.
+- Corrected the dataset interpretation in the session record.
+
+### What was verified
+
+- All ordered text segments under a DAPR-MS MARCO `doc_id`, including
+  `is_candidate=false` segments, originate from the retained MS MARCO Document
+  Ranking document text.
+- `is_candidate=true` means that the segment additionally corresponds to a
+  passage available in the separate MS MARCO Passage Ranking collection.
+- `is_candidate=false` means that the segment is surrounding text retained
+  from the Document Ranking document but is excluded from DAPR's passage
+  retrieval candidate pool.
+- Concatenating the ordered segments reconstructs DAPR's retained document
+  text, not necessarily a byte-identical copy of the live source web page.
+
+### Open issues
+
+- None for this terminology clarification.
+
+### Next steps
+
+- Describe `is_candidate` as an evaluation/retrieval-pool membership flag, not
+  as an indicator of whether text originates from MS MARCO.
+
+## 2026-07-27 — Rough DAPR-MS MARCO storage projection
+
+### Objective
+
+- Estimate DAPR-MS MARCO ColBERT artifact and fixed-size vanilla Chroma DB
+  storage from the existing DAPR-NQ builds.
+
+### What was changed
+
+- No code, dataset, evaluation protocol, or artifact was changed.
+- Calculated projections from existing on-disk byte counts.
+
+### What was verified
+
+- Existing DAPR-NQ byte counts are 20.011 GB for vanilla-128, 22.082 GB for
+  vanilla-256, 16.725 GB for vanilla-512, and 62.401 GB for the ColBERT
+  artifact.
+- Existing DAPR-NQ vanilla chunk counts are 2,248,787, 1,148,143, and 601,747
+  for sizes 128, 256, and 512.
+- Applying DAPR-NQ's observed per-document chunk-rounding overhead to
+  DAPR-MS MARCO gives rough chunk-count multipliers of 9.38x, 9.44x, and
+  9.58x, respectively.
+- Corresponding projected DB sizes are approximately 187.7 GB, 208.5 GB, and
+  160.3 GB, or 556.4 GB total.
+- Scaling the 62.401 GB NQ ColBERT artifact by the measured 9.2744x corpus
+  token ratio gives approximately 578.7 GB. The FP16 128-dimensional vector
+  payload alone is approximately 558.2 GB; the rest is estimated metadata.
+- The three vanilla DBs plus one ColBERT artifact project to approximately
+  1.135 TB decimal (1.032 TiB) in total.
+
+### Open issues
+
+- These are capacity estimates, not measured DAPR-MS MARCO artifact sizes.
+- Chroma SQLite allocation/bloat, actual tokenizer-boundary rounding, sentence
+  counts, metadata lengths, and filesystem allocation can materially change
+  final disk use.
+
+### Next steps
+
+- Reserve additional build headroom beyond the projected final size if these
+  artifacts are materialized.
+
+## 2026-07-27 — Assess NewsQA `chat` result for paper use
+
+### Objective
+
+- Determine whether the 400-question NewsQA `chat` result supports a
+  quality-efficiency claim, especially against vanilla-128/K=20.
+
+### What was changed
+
+- No code, dataset, metric, prompt, or experiment output was changed.
+- Performed a read-only paired bootstrap analysis with seed `20260727` and
+  100,000 resamples over the same 400 questions.
+
+### What was verified
+
+- The run contains R=0.15 and R=0.25, not R=0.20.
+- Vanilla-128/K=20 has F1 `0.26550` and mean model input length `2305.79`.
+- Subchunk K=20/R=0.15 has F1 `0.26371` and mean model input length `1163.19`:
+  a `-0.00180` absolute F1 difference and `49.55%` shorter input.
+- The paired-bootstrap 95% interval for the R=0.15-minus-vanilla-128 F1
+  difference is `[-0.02962, 0.02581]`.
+- Subchunk K=20/R=0.25 has F1 `0.25954` and mean model input length `1860.10`:
+  a `-0.00597` absolute F1 difference and `19.33%` shorter input.
+- The paired-bootstrap 95% interval for the R=0.25-minus-vanilla-128 F1
+  difference is `[-0.03258, 0.02021]`.
+- R=0.15 is the stronger paper point among these two because R=0.25 is longer
+  and has lower observed F1 in this run.
+
+### Interpretation
+
+- Neither F1 difference is statistically distinguishable from zero at this
+  sample size.
+- Failure to detect a difference does not establish equivalence or formal
+  non-inferiority. The intervals remain compatible with a several-point F1
+  loss, and no non-inferiority margin was predefined.
+- The R=0.15 point supports a descriptive result: approximately half the input
+  tokens with nearly identical observed F1. It does not by itself prove that
+  answer quality is preserved.
+- This NewsQA setup is a custom 400-question shared-corpus RAG conversion and
+  uses `raw_chunk_first` despite the `-chat` run name. It is suitable as a
+  secondary robustness/efficiency experiment if labeled explicitly, but is
+  weak as the sole or primary benchmark for the paper's quality-preservation
+  claim.
+
+### Next steps
+
+- If a formal preservation claim is desired, predefine a practically acceptable
+  F1 non-inferiority margin and increase the sample size or add repeated,
+  seed-controlled evaluations before testing it.
+
+## 2026-07-27 — Interpret NewsQA K=10 evidence-recall baselines
+
+### Objective
+
+- Relate the full NewsQA raw-span evidence results at vanilla K=10 to the
+  400-question `chat` answer-quality comparison.
+
+### What was changed
+
+- No code, data, metric, prompt, or experiment output was changed.
+- Rechecked the existing 5,126-question raw-span evidence summary.
+
+### What was verified
+
+- Vanilla-128/K=10 has 1,102.21 mean context tokens and exact character
+  evidence recall `0.42021`.
+- Subchunk K=20/R=0.15 has 1,100.83 mean context tokens and compressed-context
+  exact character evidence recall `0.47198`.
+- At effectively identical context length, subchunk is `+0.05177` absolute
+  evidence recall.
+- Vanilla-256/K=10 has 2,011.76 tokens and evidence recall `0.46180`.
+- Vanilla-128/K=20 has 2,236.90 tokens and evidence recall `0.48426`; the two
+  are relatively close, with vanilla-256/K=10 `0.02247` lower while using
+  `10.1%` fewer context tokens.
+- Subchunk K=20/R=0.15 also has `0.01019` higher evidence recall than
+  vanilla-256/K=10 while using `45.3%` fewer context tokens.
+
+### Interpretation
+
+- The matched-length vanilla-128/K=10 comparison directly supports the
+  retrieval-breadth/evidence-selection mechanism: retrieve twenty larger
+  coarse chunks, then retain selected text at the same final token budget as
+  ten fixed 128-token chunks.
+- Vanilla-256/K=10 is a useful second baseline, but it operates at almost
+  twice the final context length of subchunk R=0.15.
+- The evidence audit covers all 5,126 custom NewsQA shared-corpus queries,
+  whereas the answer-generation run covers 400. The K=10 answer-generation
+  comparison must use those same 400 questions before combining its F1 and
+  evidence results in one claim.
+
+### Next steps
+
+- Evaluate vanilla-128/K=10 and preferably vanilla-256/K=10 on the same
+  400-question `raw_chunk_first` generation condition if a matched-budget
+  paper comparison is desired.
+
+## 2026-07-27 — Assess new NewsQA `chat2` vanilla-128/K=10 result
+
+### Objective
+
+- Compare the newly completed standard-chat vanilla-128/K=10 generation result
+  against subchunk K=20/R=0.15 on the same 400 questions.
+
+### What was changed
+
+- No code, dataset, prompt, metric, or experiment output was changed.
+- Performed a read-only paired bootstrap with seed `20260727` and 100,000
+  resamples.
+
+### What was verified
+
+- Vanilla-128/K=10: model input `1189.67`, EM `0.1700`, F1 `0.26803`.
+- Subchunk K=20/R=0.15: model input `1195.10`, EM `0.1825`, F1 `0.27589`.
+- Subchunk uses only `5.43` additional model-input tokens (`0.46%`) while
+  improving observed EM by `0.0125` and F1 by `0.00785`.
+- The paired 95% bootstrap intervals for subchunk minus vanilla are
+  `[-0.015, 0.040]` for EM and `[-0.01978, 0.03544]` for F1; neither
+  improvement is statistically distinguishable from zero with 400 questions.
+- Per-question F1 comparison has 56 subchunk wins, 300 ties, and 44 losses.
+- At their recorded tuned batch sizes, subchunk throughput is `2.4588`
+  requests/s versus vanilla's `3.0757` requests/s. The matched-input comparison
+  therefore supports answer quality at equal prompt length, not a
+  system-throughput improvement over vanilla K=10.
+
+### Interpretation
+
+- The point estimate supports the desired matched-budget trade-off: subchunk
+  has higher observed answer quality at essentially identical model input.
+- Together with the existing full-query evidence result (`0.47198` versus
+  `0.42021` exact character recall at approximately 1,101 context tokens), this
+  is a coherent mechanism/result pair, but the evidence and generation sample
+  scopes remain 5,126 and 400 respectively.
+
+### Reproducibility issue
+
+- The current `chat2` summary contains the earlier three vanilla K=20 rows plus
+  the new K=10 row, but the overwritten `manifest.json` now lists K=10 and the
+  four subchunk cases only. `events.log` retains both histories, but the
+  manifest no longer fully enumerates every row in the summary.
+
+### Next steps
+
+- Before paper reporting, preserve a manifest/configuration that explicitly
+  enumerates every reported condition without rerunning or changing the
+  completed outputs.
+
+## 2026-07-27 — Reassess vanilla-128/K=10 using only NewsQA `chat`
+
+### Objective
+
+- Correct the prior cross-run comparison and use only
+  `newsqa-bge-rag-consensus-bsz-0726-chat`, whose actual prompt format is
+  `raw_chunk_first`.
+
+### What was changed
+
+- No code, dataset, metric, prompt, or experiment output was changed.
+- Performed a read-only paired bootstrap with seed `20260727` and 100,000
+  resamples on the same 400 questions.
+
+### What was verified
+
+- Vanilla-128/K=10: input `1157.76`, EM `0.1600`, F1 `0.25282`.
+- Subchunk K=20/R=0.15: input `1163.19`, EM `0.1675`, F1 `0.26371`.
+- At a `0.47%` larger input, subchunk has `+0.0075` EM and `+0.01088` F1;
+  the relative F1 improvement is `4.30%`.
+- The paired 95% intervals for subchunk minus K=10 are `[-0.015, 0.030]`
+  for EM and `[-0.01506, 0.03663]` for F1.
+- Vanilla-128/K=20: input `2305.79`, EM `0.1650`, F1 `0.26550`.
+- Relative to K=20, subchunk R=0.15 uses `49.55%` less input, has `+0.0025`
+  EM, and has only `-0.00180` absolute F1 (`99.32%` F1 retention).
+
+### Interpretation
+
+- The `chat` point estimates form the intended trade-off: subchunk retains
+  almost all K=20 F1 at a K=10-sized prompt and has higher observed F1 than
+  K=10 at that matched input length.
+- The 400-question intervals do not establish a statistically significant
+  quality difference. Report this as the observed quality-input trade-off,
+  not a proven superiority result.
+- Do not use the `chat2` K=10 values when discussing this run.
+
+### Reproducibility issue
+
+- The `chat` summary retains earlier K=20 rows, while its current overwritten
+  manifest lists K=10, a failed R=0.10 attempt, and the existing subchunk
+  cases, but no vanilla K=20 cases. The events log retains the full history.
+
+### Next steps
+
+- Preserve a complete report manifest enumerating all successful rows selected
+  from this single run before paper reporting.
+## 2026-07-27 — Remove obsolete retrieval-and-compression evaluator
+
+### Objective
+
+- Remove the obsolete root retrieval-and-compression evaluator, its two grid
+  configurations, and the legacy metric implementation while preserving the
+  active retrieval-only exact-evidence evaluation.
+
+### What was changed
+
+- Deleted `run/eval_retrieval_and_compression.sh`,
+  `test/eval_retrieval_and_compression.py`,
+  `run/grid_search/grid_context.yaml`, and
+  `run/grid_search/grid_context_vanilla.yaml`.
+- Renamed the active Python entry point from
+  `run/retrieval_eval/eval_retrieval_and_compression.py` to
+  `run/retrieval_eval/eval_retrieval_only.py`.
+- Removed its `legacy_text` Rouge-L, supporting-document, and
+  supporting-subchunk branches. The remaining path always uses the custom
+  `text_evidence_exact` metric from `src/evidence_coverage.py`.
+- Removed the obsolete `GOLD_FIELD` and `EVIDENCE_METRIC_MODE` controls from
+  the retrieval-only shell and current DAPR/NewsQA evidence grids.
+- Removed legacy retrieval-summary parsing and CSV fields from
+  `run/grid_search/eval.py`.
+- Updated `README.md` and `docs/eval_protocol.md` to describe the single
+  supported retrieval-only metric and its result-comparability boundary.
+
+### What was verified
+
+- Shell syntax, Python compilation, YAML parsing, Black formatting, and
+  `git diff --check` passed.
+- Focused evidence/grid tests passed: 8 tests.
+- The full base-environment suite passed: 185 tests and 683,634 subtests in
+  88.71 seconds.
+- The suite emitted one pre-existing warning about converting a non-writable
+  NumPy memory map to a PyTorch tensor in `src/colbert_artifact.py`.
+- No model server, vLLM, or SGLang process was started.
+- No active code exposes the deleted entry points, grids, legacy mode, or
+  removed environment variables. Current documentation mentions `legacy_text`
+  only to record the result-comparability boundary.
+
+### Open issues
+
+- Historical Rouge-L figure data under `docs/paper/figures/` remains preserved
+  as experiment output; it is not executable legacy code.
+- Former `legacy_text` results cannot be regenerated with the current code and
+  are not directly comparable with `text_evidence_exact` results.
+
+### Next steps
+
+- Use `run/retrieval_eval/eval_retrieval_only.sh` with a custom evidence label
+  file containing aligned `evidence_passage_ids` and `evidence_texts`.
+
+## 2026-07-27 — Move retrieval-only Python entry point into `src`
+
+### Objective
+
+- Place the active retrieval/evidence-only Python command with the other
+  application entry points without changing evaluation behavior.
+
+### What was changed
+
+- Moved `run/retrieval_eval/eval_retrieval_only.py` to
+  `src/entrypoint/eval_retrieval_only.py`.
+- Updated `run/retrieval_eval/eval_retrieval_only.sh` to invoke the new path.
+- Changed only the source-directory path calculation required by the new file
+  location; command-line arguments, retrieval, compression, evidence scoring,
+  and output fields are unchanged.
+- Added the Python implementation path to `docs/eval_protocol.md`.
+
+### What was verified
+
+- The previous Python path no longer exists and no current reference points to
+  it.
+- Black formatting, Python compilation, shell syntax, and `git diff --check`
+  passed.
+- Focused evidence/grid tests passed: 8 tests.
+- The full base-environment suite passed: 185 tests and 683,634 subtests in
+  90.74 seconds.
+- The suite emitted the existing non-writable NumPy memory-map warning from
+  `src/colbert_artifact.py`.
+- No model, vLLM, or SGLang process was started.
+
+### Open issues
+
+- None introduced by this file move.
+
+### Next steps
+
+- Continue invoking retrieval-only evaluation through
+  `run/retrieval_eval/eval_retrieval_only.sh`.
+
+## 2026-07-27 — Move retrieval-only shell to `run/`
+
+### Objective
+
+- Place the retrieval-only shell alongside the repository's other top-level
+  evaluation scripts.
+
+### What was changed
+
+- Moved `run/retrieval_eval/eval_retrieval_only.sh` to
+  `run/eval_retrieval_only.sh`.
+- Updated its repository-root calculation for the new directory depth.
+- Updated the README example, `docs/eval_protocol.md`, and the DAPR NQ/NewsQA
+  evidence grids to use the new shell path.
+- Retrieval arguments, metric implementation, and output construction remain
+  unchanged.
+
+### What was verified
+
+- The previous shell path no longer exists and no current code or documentation
+  references it.
+- Shell syntax, Python compilation, both evidence-grid YAML files, and
+  `git diff --check` passed.
+- Focused evidence/grid tests passed: 8 tests.
+- The full base-environment suite passed: 185 tests and 683,634 subtests in
+  115.58 seconds.
+- The suite emitted the existing non-writable NumPy memory-map warning from
+  `src/colbert_artifact.py`.
+- No model, vLLM, or SGLang process was started.
+
+### Open issues
+
+- None introduced by this shell move.
+
+### Next steps
+
+- Invoke retrieval-only evaluation with `run/eval_retrieval_only.sh`.
+
+## 2026-07-27 — Clarify the gold-evidence VectorDB implementation name
+
+### Objective
+
+- Make the oracle context source's filename and class name explicitly identify
+  that it substitutes for the engine's `VectorDB` interface.
+
+### What was changed
+
+- Renamed `src/oracle_evidence.py` to
+  `src/gold_evidence_vectordb.py`.
+- Renamed `GoldEvidenceDB` to `GoldEvidenceVectorDB`.
+- Updated `src/entrypoint/eval.py` to import and construct the renamed class.
+- Renamed `test/test_oracle_evidence.py` to
+  `test/test_gold_evidence_vectordb.py` and updated its test names and imports.
+- Made that test set `src/` on its import path explicitly so it passes when run
+  alone rather than depending on earlier test-module imports.
+- Updated `docs/codebase_guide.md` and `docs/eval_protocol.md`.
+
+### What was verified
+
+- The old module, class, and test names have no active references.
+- Black formatting, Python compilation, and `git diff --check` passed.
+- The renamed test plus evidence-label tests passed independently: 10 tests.
+- The full base-environment suite passed: 185 tests and 683,634 subtests in
+  116.37 seconds.
+- The suite emitted the existing non-writable NumPy memory-map warning from
+  `src/colbert_artifact.py`.
+- No model, vLLM, or SGLang process was started.
+
+### Open issues
+
+- None introduced by this rename.
+
+### Next steps
+
+- Continue using `run/eval_oracle.sh`; its external interface and evaluation
+  behavior are unchanged.
+
+## 2026-07-27 — Re-audit stale code under `test/`
+
+### Objective
+
+- Identify test-directory code that is unreachable, runtime-incompatible with
+  current modules, or fitted to retired experiment contracts.
+
+### What was changed
+
+- No source, test, dataset, configuration, or evaluation output was changed.
+- Performed a read-only static and import-level audit.
+
+### What was verified
+
+- `test/` contains 92 Python files. Pytest collects 185 tests from the 35
+  `test_*.py` files; the remaining 57 files are manual preparation, analysis,
+  benchmark, profiling, or replay utilities rather than unit tests.
+- All 92 files compile syntactically.
+- Four manual scripts fail immediately when imported because they reference
+  removed modules or symbols:
+  - `analyze_cacheoff_attention_2wiki.py`
+  - `analyze_supporting_fact_fusion.py`
+  - `analyze_sentence_concat_chunk_rerank.py`
+  - `run_conditionalqa_colbert_query_policy_ablation.py`
+- Two suite launchers invoke the deleted
+  `test/eval_retrieval_and_compression.py`; the post-filter suite additionally
+  selects a removed compressor:
+  - `run_chunk_rerank_recall_suite.py`
+  - `run_postfilter_recall_suite.py`
+- Three more scripts use retired `COMPARE_EMBED_DIR`, `GLOBAL_TOP_R`, or
+  `colbert_window` selection contracts:
+  - `analyze_llm_evidence_fusion.py`
+  - `analyze_no_harm_dropped_sentences.py`
+  - `rebuild_2wiki_prompt_cacheable_diff.py`
+- Two completed metadata benchmarks require pre-v3 artifact fields such as
+  `metadata_file`, `id_to_row`, or `region_specs_by_chunk`. Current DAPR-NQ and
+  HotpotQA v3 indexes do not contain those fields:
+  - `benchmark_colbert_metadata_access.py`
+  - `benchmark_hotpotqa_metadata_format.py`
+- `diagnose_musique_rag.py` remains partly useful for Chroma inspection, but
+  its `compare_embed.pt` inspection is stale.
+- Tests mentioning removed compressor names or legacy artifact formats are
+  active negative regression tests and are not dead merely because they name
+  removed behavior.
+- SQLite metadata tests are also active: the current ColBERT materializer still
+  uses `.build_metadata.sqlite3` as temporary build metadata, exports the v3
+  split JSON files, and deletes the temporary database. Runtime artifact
+  loading does not use SQLite.
+- No model, vLLM, or SGLang process was started.
+
+### Open issues
+
+- The eleven clearly stale manual scripts listed above remain in the tree.
+- Historical but currently importable tools such as
+  `eval_oracle_supporting_facts.py` and the official-ColBERT replay scripts
+  require an explicit reproducibility-versus-cleanup decision; lack of an
+  active runner reference alone does not prove they are dead.
+- If the intended policy is to prohibit SQLite during artifact construction as
+  well as runtime, the active materializer and its tests require a separate
+  source-level redesign.
+
+### Next steps
+
+- Safest cleanup batch: delete the six scripts with removed imports/targets.
+- Review the three retired dense/count-ratio scripts and two pre-v3 metadata
+  benchmarks as a second historical-experiment cleanup batch.
+- Treat the partially stale Musique diagnostic and still-runnable historical
+  oracle/replay tools separately.
+
+## 2026-07-27 — Delete broken and retired-contract scripts under `test/`
+
+### Objective
+
+- Remove the six confirmed broken manual scripts and five scripts tied to
+  retired selection or metadata-format contracts.
+
+### What was changed
+
+- Deleted scripts with removed imports, symbols, target entry points, or
+  compressor methods:
+  - `test/analyze_cacheoff_attention_2wiki.py`
+  - `test/analyze_supporting_fact_fusion.py`
+  - `test/analyze_sentence_concat_chunk_rerank.py`
+  - `test/run_conditionalqa_colbert_query_policy_ablation.py`
+  - `test/run_chunk_rerank_recall_suite.py`
+  - `test/run_postfilter_recall_suite.py`
+- Deleted scripts fitted to retired `COMPARE_EMBED_DIR`, `GLOBAL_TOP_R`,
+  `colbert_window`, or pre-v3 ColBERT metadata contracts:
+  - `test/analyze_llm_evidence_fusion.py`
+  - `test/analyze_no_harm_dropped_sentences.py`
+  - `test/rebuild_2wiki_prompt_cacheable_diff.py`
+  - `test/benchmark_colbert_metadata_access.py`
+  - `test/benchmark_hotpotqa_metadata_format.py`
+- Did not modify active pytest tests, production code, datasets, current grid
+  configurations, or experiment outputs.
+
+### What was verified
+
+- No current code, run script, README section, evaluation document, or
+  remaining test script references the eleven deleted files.
+- Every remaining `test/*.py` file compiles.
+- Pytest still collects 185 tests.
+- The full base-environment suite passed: 185 tests and 683,634 subtests in
+  90.24 seconds.
+- The suite emitted the existing non-writable NumPy memory-map warning from
+  `src/colbert_artifact.py`.
+- `git diff --check` passed.
+- No model, vLLM, or SGLang process was started.
+
+### Open issues
+
+- Historical results produced by the deleted scripts remain documented, but
+  those exact retired experiment implementations can no longer be rerun from
+  this checkout.
+- `test/diagnose_musique_rag.py` still contains a stale
+  `compare_embed.pt` inspection branch and was intentionally left for separate
+  review.
+- Still-runnable historical oracle and official-ColBERT replay tools were not
+  deleted.
+
+### Next steps
+
+- Review the partially stale Musique diagnostic separately before editing or
+  deleting it.
+
+## 2026-07-27 — Rebuild the NewsQA Vanilla-128 BGE database
+
+### Objective
+
+- Rebuild only the NewsQA fixed-128 retrieval database after removal of the
+  invalid Chroma 1.0.8 build.
+
+### What was changed
+
+- Materialized
+  `/mnt/nvme1/datasets/newsqa/vanilla-bge-small-v1.5-128/db` from the existing
+  12,744 NewsQA documents.
+- Used `/home/dongseob/miniconda3` base with Chroma 1.5.7,
+  BGE-small-en-v1.5 passage embeddings on CUDA, embedding batch size 5,461,
+  DB batch size 5,461, fixed-size 128-token retrieval/cacheable chunks, and no
+  document-hash deduplication.
+- Did not build the Vanilla-256, Vanilla-512, sentence-512, or ColBERT
+  artifacts.
+- No source code, question, answer, label, prompt, metric, or evaluation
+  protocol was changed.
+
+### What was verified
+
+- Preprocessing completed successfully in 287.65 seconds.
+- The Chroma database contains 84,678 unique embedding IDs, matching the
+  preceding valid NewsQA build count.
+- Metadata references all 12,744 parent documents, contains no empty stored
+  text, has no invalid source-token ranges, and has a maximum stored token
+  count of 127.
+- `build_manifest.json` records Chroma-side build semantics including
+  `embedding_backend=bge_small_v1_5`, `embedding_device=cuda`,
+  `embedding_batch_size=5461`, `db_batch_size=5461`,
+  `splitter=fixed_size`, and 128-token retrieval/cacheable sizes.
+- The completed directory occupies approximately 820 MiB.
+
+### Open issues
+
+- The NewsQA Vanilla-256, Vanilla-512, sentence-512/splitlong180 database, and
+  ColBERT candidate artifact remain absent.
+- A rebuilt approximate HNSW graph is not assumed to be bit-identical to an
+  earlier physical database despite matching preprocessing semantics and
+  counts.
+
+### Next steps
+
+- Build no additional NewsQA database or artifact unless explicitly requested.
+
+## 2026-07-27 — Build the NewsQA sentence database and ColBERT artifact
+
+### Objective
+
+- Build the NewsQA ColBERT candidate artifact before starting the requested
+  NarrativeQA database work.
+- Rebuild its missing sentence-based Chroma database prerequisite with the
+  current base environment.
+
+### What was changed
+
+- Removed the incomplete
+  `/mnt/nvme1/datasets/newsqa/sent-bge-small-v1.5-512-splitlong180`
+  directory, which contained only an empty 192 KiB Chroma SQLite file and no
+  build manifest.
+- Materialized
+  `/mnt/nvme1/datasets/newsqa/sent-bge-small-v1.5-512-splitlong180/db`
+  from the existing 12,744 NewsQA documents.
+- Used `/home/dongseob/miniconda3` base, BGE-small-en-v1.5 passage embeddings
+  on CUDA, embedding and DB batch sizes of 5,461, sentence splitting,
+  512-token retrieval chunks, and a 180-token maximum sentence subchunk size.
+- Materialized
+  `/mnt/nvme1/datasets/newsqa/sent-bge-small-v1.5-512-splitlong180/colbert_window`
+  with the official `colbert-ir/colbertv2.0` checkpoint on CUDA, batch size
+  1,024, 180-token document and region budgets, subchunk centers, and
+  half-precision stored vectors.
+- No source code, question, answer, label, prompt, metric, retrieval flow, or
+  evaluation protocol was changed.
+
+### What was verified
+
+- Sentence DB preprocessing completed successfully in 245.94 seconds.
+- The Chroma DB contains 25,621 unique retrieval chunks spanning all 12,744
+  parent documents, with no empty stored text, malformed cacheable metadata,
+  or invalid source-token ranges.
+- The DB contains 405,731 cacheable occurrences representing 393,381 unique
+  subchunk IDs and 12,350 repeated overlap references.
+- `build_manifest.json` records the requested BGE-small CUDA, sentence,
+  512-token retrieval, and 180-token maximum subchunk settings.
+- ColBERT encoding completed in 506.34 seconds and region specification
+  construction completed in 13.60 seconds.
+- The artifact contains 393,381 cacheables, 8,631,660 token vectors of
+  dimension 128, and 212,536 region specifications for 25,621 retrieval
+  chunks. Twelve center sequences reached the 180-token truncation limit.
+- Candidate-ID validation passed: the DB and artifact both contain the same
+  393,381 unique IDs, with zero missing and zero extra IDs.
+- The completed ColBERT artifact occupies approximately 2.3 GiB.
+
+### Open issues
+
+- The NewsQA Vanilla-256 and Vanilla-512 databases remain absent.
+- The 12 truncated ColBERT center sequences are recorded build outputs from
+  the configured official 180-token document limit; no evaluation has been
+  run to measure their effect.
+- NarrativeQA database construction has not started and no NarrativeQA
+  database directory was produced.
+
+### Next steps
+
+- Build the custom NarrativeQA open-corpus databases only after the user
+  confirms that work should resume.

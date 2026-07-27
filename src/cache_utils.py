@@ -1,6 +1,9 @@
+"""Load, rotate, concatenate, and pad materialized transformer KV caches."""
+
 import torch
 import os
-from deepspeed.ops.op_builder import GDSBuilder, AsyncIOBuilder
+
+# from deepspeed.ops.op_builder import GDSBuilder, AsyncIOBuilder
 from transformers.models.llama.configuration_llama import LlamaConfig
 from transformers.models.llama.modeling_llama import LlamaRotaryEmbedding, rotate_half
 from utils import parse_json_query, file_read, restore_tensor_shape
@@ -17,6 +20,7 @@ DEFAULT_LLAMA31_ROPE_SCALING = {
 }
 
 _ROTARY_EMBEDDING_CACHE: Dict[Tuple[str, int, float, int], LlamaRotaryEmbedding] = {}
+
 
 # def load_kv_cache_gds(self, doc_id: str):
 #     in_file = os.path.join(self.cache_dir, f"{doc_id}.pt")
@@ -175,6 +179,8 @@ def _build_rotary_cos_sin(
 
 
 def shift_rotary_cache(cache, position_offset: int, base: float = 500000.0):
+    """Rebase cached Llama keys when their prompt position changes."""
+
     if position_offset == 0:
         return tuple((key.to("cuda"), value.to("cuda")) for key, value in cache)
 

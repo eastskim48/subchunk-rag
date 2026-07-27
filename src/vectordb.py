@@ -1,7 +1,9 @@
-import fire
+"""Dense embedding adapter and Chroma-backed retrieval database."""
+
 import json
 import chromadb
 import abc
+import copy
 import os
 import time
 import numpy as np
@@ -9,15 +11,92 @@ import numpy as np
 from typing import Dict, List
 
 from chunk import RetrievableChunk, CacheableChunk
-from embedding_utils import (
+from encoder.dense import (
+    BGE_SMALL_MODEL,
     BGE_M3_MODEL,
     DenseTextEmbedder,
+    E5_SMALL_MODEL,
+    default_passage_prefix,
     default_query_prefix,
     env_int,
 )
 
 
+class DevicePinnedDefaultEmbeddingFunction:
+    """Run Chroma's default MiniLM ONNX graph on an explicit provider."""
+
+    def __init__(self, device: str = "cpu", batch_size: int = 32):
+        from chromadb.utils.embedding_functions.onnx_mini_lm_l6_v2 import (
+            ONNXMiniLM_L6_V2,
+        )
+
+        normalized_device = device.strip().lower()
+        if normalized_device == "cpu":
+            providers = ["CPUExecutionProvider"]
+        elif normalized_device == "cuda":
+            providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
+        else:
+            raise ValueError(f"unsupported default Chroma embedding device: {device!r}")
+        if batch_size <= 0:
+            raise ValueError("default Chroma embedding batch_size must be positive")
+
+        self.device = normalized_device
+        self.batch_size = batch_size
+        self.embedder = ONNXMiniLM_L6_V2(preferred_providers=providers)
+        available_providers = set(self.embedder.ort.get_available_providers())
+        if not set(providers).issubset(available_providers):
+            raise RuntimeError(
+                f"requested ONNX providers {providers}, but only "
+                f"{sorted(available_providers)} are available"
+            )
+
+    def __call__(self, input):
+        texts = list(input)
+        if not texts:
+            return []
+        self.embedder._download_model_if_not_exists()
+        embeddings = self.embedder._forward(texts, batch_size=self.batch_size)
+        return [np.array(row, dtype=np.float32) for row in embeddings]
+
+    def embed_query(self, input):
+        return self(input)
+
+    @staticmethod
+    def name() -> str:
+        return "default"
+
+    @staticmethod
+    def default_space() -> str:
+        return "cosine"
+
+    @staticmethod
+    def supported_spaces() -> List[str]:
+        return ["cosine", "l2", "ip"]
+
+    @staticmethod
+    def build_from_config(config: Dict[str, object]):
+        return DevicePinnedDefaultEmbeddingFunction()
+
+    @staticmethod
+    def get_config() -> Dict[str, object]:
+        return {}
+
+    @staticmethod
+    def validate_config(config: Dict[str, object]) -> None:
+        return
+
+    @staticmethod
+    def is_legacy() -> bool:
+        return False
+
+    @staticmethod
+    def max_tokens() -> int:
+        return 256
+
+
 class DenseEmbeddingFunction:
+    """Expose the shared dense encoder through Chroma's embedding interface."""
+
     MODEL_NAME = BGE_M3_MODEL
 
     def __init__(
@@ -39,6 +118,7 @@ class DenseEmbeddingFunction:
             if query_prefix is None
             else query_prefix
         )
+        self.passage_prefix = default_passage_prefix(self.model_name)
         self.embedder = DenseTextEmbedder(
             model_name=self.model_name,
             device=self.device,
@@ -47,7 +127,9 @@ class DenseEmbeddingFunction:
         self.device = self.embedder.device
 
     def __call__(self, input):
-        return self._embed_texts_batched(list(input))
+        return self._embed_texts_batched(
+            [f"{self.passage_prefix}{text}" for text in input]
+        )
 
     def embed_query(self, input):
         return self._embed_texts_batched(
@@ -112,6 +194,8 @@ class DenseEmbeddingFunction:
 
 
 class VectorDB(abc.ABC):
+    """Abstract retrieval/store interface used by the evaluation engine."""
+
     def __init__(self):
         pass
 
@@ -125,9 +209,20 @@ class VectorDB(abc.ABC):
 
 
 class ChromaDB(VectorDB):
+    """Persist and retrieve coarse chunks with Chroma vector search."""
+
     DEFAULT_EMBEDDING_MODEL = BGE_M3_MODEL
     DEFAULT_EMBED_BACKEND = "default"
     BGE_M3_EMBED_BACKEND = "bge_m3"
+    BGE_SMALL_EMBED_BACKEND = "bge_small_v1_5"
+    E5_SMALL_EMBED_BACKEND = "e5_small_v2"
+    DENSE_EMBED_BACKENDS = {
+        BGE_M3_EMBED_BACKEND: BGE_M3_MODEL,
+        BGE_SMALL_EMBED_BACKEND: BGE_SMALL_MODEL,
+        E5_SMALL_EMBED_BACKEND: E5_SMALL_MODEL,
+    }
+    # Applied only to the DenseTextEmbedder/SentenceTransformers choices above.
+    # The `default` ONNX MiniLM path intentionally uses Chroma's HNSW defaults.
     DEFAULT_COLLECTION_CONFIGURATION = {
         "hnsw": {
             "space": "cosine",
@@ -140,8 +235,43 @@ class ChromaDB(VectorDB):
     }
 
     def __init__(self, db_dir: str):
+        """Open a runtime DB with query embedding permanently pinned to CPU."""
         super().__init__()
-        self.db = self._get_chroma_client(db_dir)
+        self._initialize(
+            db_dir,
+            embedding_device="cpu",
+            embedding_batch_size=32,
+        )
+
+    @classmethod
+    def for_build(
+        cls,
+        db_dir: str,
+        embedding_device: str,
+        embedding_batch_size: int,
+    ):
+        """Open a preprocessing-only DB writer with an explicit build device."""
+        instance = cls.__new__(cls)
+        VectorDB.__init__(instance)
+        instance._initialize(
+            db_dir,
+            embedding_device=embedding_device,
+            embedding_batch_size=embedding_batch_size,
+        )
+        return instance
+
+    def _initialize(
+        self,
+        db_dir: str,
+        *,
+        embedding_device: str,
+        embedding_batch_size: int,
+    ):
+        self.db = self._get_chroma_client(
+            db_dir,
+            embedding_device=embedding_device,
+            embedding_batch_size=embedding_batch_size,
+        )
         self.include_documents = os.environ.get(
             "RETRIEVAL_INCLUDE_DOCUMENTS", "True"
         ).strip().lower() in {
@@ -154,7 +284,11 @@ class ChromaDB(VectorDB):
         self.last_find_timings = {}
 
     @staticmethod
-    def _get_chroma_client(dir: str):
+    def _get_chroma_client(
+        dir: str,
+        embedding_device: str = "cpu",
+        embedding_batch_size: int = 32,
+    ):
         chroma_client = chromadb.PersistentClient(path=dir)
         embed_backend = (
             os.environ.get(
@@ -165,18 +299,26 @@ class ChromaDB(VectorDB):
             .lower()
         )
         if embed_backend in {"default", "chroma_default"}:
-            return chroma_client.get_or_create_collection(name="doc_collection")
-        if embed_backend != ChromaDB.BGE_M3_EMBED_BACKEND:
+            return chroma_client.get_or_create_collection(
+                name="doc_collection",
+                embedding_function=DevicePinnedDefaultEmbeddingFunction(
+                    device=embedding_device,
+                    batch_size=embedding_batch_size,
+                ),
+            )
+        model_name = ChromaDB.DENSE_EMBED_BACKENDS.get(embed_backend)
+        if model_name is None:
             raise ValueError(
                 f"unsupported CHROMA_EMBED_BACKEND={embed_backend!r}; "
-                "expected 'default', 'bge_m3', or 'chroma_default'"
+                "expected 'default', 'chroma_default', 'bge_m3', "
+                "'bge_small_v1_5', or 'e5_small_v2'"
             )
         return chroma_client.get_or_create_collection(
             name="doc_collection",
-            configuration=ChromaDB.DEFAULT_COLLECTION_CONFIGURATION,
+            configuration=copy.deepcopy(ChromaDB.DEFAULT_COLLECTION_CONFIGURATION),
             embedding_function=DenseEmbeddingFunction(
-                model_name=ChromaDB.DEFAULT_EMBEDDING_MODEL,
-                function_name=ChromaDB.BGE_M3_EMBED_BACKEND,
+                model_name=model_name,
+                function_name=embed_backend,
             ),
         )
 

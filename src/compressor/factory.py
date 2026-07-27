@@ -1,35 +1,33 @@
+"""Create and reuse the compressor selected by an evaluation option."""
+
 from typing import List
 from chunk import RetrievableChunk
 
-from compressor.comparison_compressor import (
-    DenseSummarizer,
-    FrontCompressor,
-    Summarizer,
+from compressor.methods.colbert import (
+    ColBERTSubchunkCompressor,
+    ColBERTRerankAndRegionCompressor,
+    ColBERTRerankCompressor,
+    FixedChunkColBERTRerankCompressor,
+    ColBERTSlidingRegionCompressor,
 )
-from compressor.colbert_window_compressor import (
-    ColBERTWindowSummarizer,
-    ColBERTRerankAndRegionSummarizer,
-    ColBERTRerankSummarizer,
-    BudgetColBERTWindowSummarizer,
-    FixedChunkColBERTRerankSummarizer,
-    SlidingRegionColBERTWindowSummarizer,
-)
-from compressor.ml_compressor import EXITCompressor, ProvenceCompressor
+from compressor.methods.dense import DenseCompressor
+from compressor.methods.ml_selector import EXITCompressor, ProvenceCompressor
+from compressor.methods.summarization import Summarizer
 
+# Evaluation runs reuse one compressor instance so model/artifact initialization
+# and query-encoder warmup are not repeated for every batch.
 compressor = None
 compressor_warmed = False
 
 
 COMPRESSOR_TYPES = {
     "summ": Summarizer,
-    "dense": DenseSummarizer,
-    "colbert_subchunk": ColBERTWindowSummarizer,
-    "colbert_rerank": ColBERTRerankSummarizer,
-    "colbert_chunk_rerank": FixedChunkColBERTRerankSummarizer,
-    "colbert_window_budget": BudgetColBERTWindowSummarizer,
-    "colbert_sliding_region": SlidingRegionColBERTWindowSummarizer,
-    "rerank_and_region": ColBERTRerankAndRegionSummarizer,
-    "front": FrontCompressor,
+    "dense": DenseCompressor,
+    "colbert_subchunk": ColBERTSubchunkCompressor,
+    "colbert_rerank": ColBERTRerankCompressor,
+    "colbert_chunk_rerank": FixedChunkColBERTRerankCompressor,
+    "colbert_sliding_region": ColBERTSlidingRegionCompressor,
+    "rerank_and_region": ColBERTRerankAndRegionCompressor,
     "exit": EXITCompressor,
     "provence": ProvenceCompressor,
 }

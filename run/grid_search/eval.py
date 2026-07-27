@@ -69,9 +69,11 @@ class GridRunner:
         self.events_log = self.results_dir / "events.log"
         self.logs_dir = self.results_dir / "logs"
         self.bsz_probe_dir = self.results_dir / "bsz_probe_outputs"
+        self.eval_outputs_dir = self.results_dir / "eval_outputs"
         self.results_dir.mkdir(parents=True, exist_ok=True)
         self.logs_dir.mkdir(parents=True, exist_ok=True)
         self.bsz_probe_dir.mkdir(parents=True, exist_ok=True)
+        self.eval_outputs_dir.mkdir(parents=True, exist_ok=True)
         self._write_manifest()
 
     def _load_config(self) -> dict[str, Any]:
@@ -175,9 +177,7 @@ class GridRunner:
             max_value = config.get("max", self.fixed_env.get("AUTO_EVAL_BSZ_MAX"))
             if min_value is not None and max_value is not None:
                 step = int(
-                    config.get(
-                        "step", self.fixed_env.get("AUTO_EVAL_BSZ_STEP", 1)
-                    )
+                    config.get("step", self.fixed_env.get("AUTO_EVAL_BSZ_STEP", 1))
                 )
                 if step <= 0:
                     raise ValueError(f"auto_eval_bsz.step must be positive, got {step}")
@@ -476,53 +476,67 @@ class GridRunner:
                     }
                 )
                 break
-            if isinstance(obj, dict) and "vanilla" in obj and "compressed" in obj:
-                vanilla = obj.get("vanilla") or {}
-                compressed = obj.get("compressed") or {}
-                delta = obj.get("delta") or {}
-                gold = obj.get("gold") or {}
-                context_summary = {
-                    "count": obj.get("count"),
-                    "dataset": obj.get("dataset"),
-                    "gold_chunk_counts": gold.get("chunk_counts"),
-                    "gold_subchunk_counts": gold.get("subchunk_counts"),
-                    "gold_subchunk_rouge_l_recall": gold.get("subchunk_rouge_l_recall"),
-                    "vanilla_rouge_l_recall": vanilla.get("rouge_l_recall"),
-                    "vanilla_rouge_l_precision": vanilla.get("rouge_l_precision"),
-                    "vanilla_selected_tokens": vanilla.get("selected_tokens"),
-                    "vanilla_chunk_level_recall": vanilla.get("chunk_level_recall"),
-                    "vanilla_chunk_level_precision": vanilla.get(
-                        "chunk_level_precision"
-                    ),
-                    "vanilla_subchunk_level_recall": vanilla.get(
-                        "subchunk_level_recall"
-                    ),
-                    "vanilla_subchunk_level_precision": vanilla.get(
-                        "subchunk_level_precision"
-                    ),
-                    "compressed_rouge_l_recall": compressed.get("rouge_l_recall"),
-                    "compressed_rouge_l_precision": compressed.get("rouge_l_precision"),
-                    "compressed_token_counts": compressed.get("token_counts"),
-                    "compressed_subchunk_counts": compressed.get("subchunk_counts"),
-                    "compressed_subchunk_level_recall": compressed.get(
-                        "subchunk_level_recall"
-                    ),
-                    "compressed_subchunk_level_precision": compressed.get(
-                        "subchunk_level_precision"
-                    ),
-                    "recall_drop": delta.get("recall_drop"),
-                    "precision_gain": delta.get("precision_gain"),
-                    "token_reduction": delta.get("token_reduction"),
-                    "context_setup_time_sec": obj.get("setup_time_sec"),
-                    "context_run_time_sec": obj.get("run_time_sec"),
-                }
-                if gold:
-                    context_summary.update(
-                        {
-                            "gold_tokens": gold.get("tokens"),
-                        }
-                    )
-                summary.update(context_summary)
+            if (
+                isinstance(obj, dict)
+                and obj.get("metric_mode") == "text_evidence_exact"
+                and "retrieval" in obj
+                and "compressed" in obj
+            ):
+                retrieval = obj["retrieval"]
+                compressed = obj["compressed"]
+                conditional = obj.get("conditional") or {}
+                selected = compressed if obj.get("compress_method") else retrieval
+                summary.update(
+                    {
+                        "count": obj.get("count"),
+                        "dataset": obj.get("dataset"),
+                        "context_tokens": selected.get("context_tokens"),
+                        "evidence_char_exact_recall": selected.get(
+                            "evidence_char_exact_recall"
+                        ),
+                        "evidence_token_exact_recall": selected.get(
+                            "evidence_token_exact_recall"
+                        ),
+                        "all_evidence_char_exact": selected.get(
+                            "all_evidence_char_exact"
+                        ),
+                        "all_evidence_token_exact": selected.get(
+                            "all_evidence_token_exact"
+                        ),
+                        "evidence_char_partial_recall": selected.get(
+                            "evidence_char_partial_recall"
+                        ),
+                        "evidence_token_partial_recall": selected.get(
+                            "evidence_token_partial_recall"
+                        ),
+                        "retrieval_evidence_char_exact_recall": retrieval.get(
+                            "evidence_char_exact_recall"
+                        ),
+                        "compressed_evidence_char_exact_recall": compressed.get(
+                            "evidence_char_exact_recall"
+                        ),
+                        "retrieval_evidence_char_partial_recall": retrieval.get(
+                            "evidence_char_partial_recall"
+                        ),
+                        "compressed_evidence_char_partial_recall": compressed.get(
+                            "evidence_char_partial_recall"
+                        ),
+                        "conditional_evidence_char_exact_retention": conditional.get(
+                            "evidence_char_exact_retention"
+                        ),
+                        "conditional_evidence_token_exact_retention": conditional.get(
+                            "evidence_token_exact_retention"
+                        ),
+                        "conditional_evidence_char_partial_retention": conditional.get(
+                            "evidence_char_partial_retention"
+                        ),
+                        "conditional_evidence_token_partial_retention": conditional.get(
+                            "evidence_token_partial_retention"
+                        ),
+                        "context_setup_time_sec": obj.get("setup_time_sec"),
+                        "context_run_time_sec": obj.get("run_time_sec"),
+                    }
+                )
                 break
         metrics = {
             "throughput_requests_per_sec": "throughput | requests/sec",
@@ -629,8 +643,6 @@ class GridRunner:
     def _summary2_method_name(method: Any, data_subdir: Any = None) -> Any:
         if method is None or method == "":
             return data_subdir
-        if method in {"compare_all_materialized", "compare_all"}:
-            return "embed_sim"
         return method
 
     def _to_summary2_row(self, row: dict[str, Any]) -> dict[str, Any]:
@@ -641,9 +653,8 @@ class GridRunner:
             "COMPRESS_METHOD": self._summary2_method_name(
                 row.get("COMPRESS_METHOD"), row.get("DATA_SUBDIR")
             ),
-            "GLOBAL_TOP_R": row.get("GLOBAL_TOP_R"),
             "TOP_K": row.get("TOP_K"),
-            "COLBERT_FINAL_TOKEN_BUDGET": row.get("COLBERT_FINAL_TOKEN_BUDGET"),
+            "FINAL_TOKEN_BUDGET": row.get("FINAL_TOKEN_BUDGET"),
             "RETAIN_TOKEN_RATIO": row.get("RETAIN_TOKEN_RATIO"),
             "input_len": input_len,
             "exact_match": row.get("exact_match"),
@@ -663,9 +674,8 @@ class GridRunner:
     def _write_summary2_csv(self, rows: list[dict[str, Any]]) -> None:
         fieldnames = [
             "COMPRESS_METHOD",
-            "GLOBAL_TOP_R",
             "TOP_K",
-            "COLBERT_FINAL_TOKEN_BUDGET",
+            "FINAL_TOKEN_BUDGET",
             "RETAIN_TOKEN_RATIO",
             "input_len",
             "exact_match",
@@ -686,6 +696,51 @@ class GridRunner:
             writer.writeheader()
             writer.writerows(self._to_summary2_row(row) for row in rows)
 
+    @staticmethod
+    def _retrieval_evidence_summary_fieldnames(
+        rows: list[dict[str, Any]],
+    ) -> list[str] | None:
+        has_text_evidence = any(
+            "evidence_char_exact_recall" in row and "evidence_token_exact_recall" in row
+            for row in rows
+        )
+        if not has_text_evidence:
+            return None
+        candidates = [
+            "run_name",
+            "dataset",
+            "status",
+            "preprocess_name",
+            "EVAL_BSZ",
+            "DATA_SUBDIR",
+            "TOP_K",
+            "COMPRESS_METHOD",
+            "RETAIN_TOKEN_RATIO",
+            "FINAL_TOKEN_BUDGET",
+            "count",
+            "context_tokens",
+            "evidence_char_exact_recall",
+            "evidence_token_exact_recall",
+            "all_evidence_char_exact",
+            "all_evidence_token_exact",
+            "evidence_char_partial_recall",
+            "evidence_token_partial_recall",
+            "retrieval_evidence_char_exact_recall",
+            "compressed_evidence_char_exact_recall",
+            "retrieval_evidence_char_partial_recall",
+            "compressed_evidence_char_partial_recall",
+            "conditional_evidence_char_exact_retention",
+            "conditional_evidence_token_exact_retention",
+            "conditional_evidence_char_partial_retention",
+            "conditional_evidence_token_partial_retention",
+            "context_setup_time_sec",
+            "context_run_time_sec",
+            "elapsed_sec",
+            "eval_log_file",
+            "OUTPUT_FILE",
+        ]
+        return [field for field in candidates if any(field in row for row in rows)]
+
     def _write_summary_csv(self):
         rows = []
         if not self.results_jsonl.exists():
@@ -702,12 +757,42 @@ class GridRunner:
                 )
         if not rows:
             return
-        keys = sorted({key for row in rows for key in row.keys()})
+        keys = self._retrieval_evidence_summary_fieldnames(rows)
+        if keys is None:
+            keys = sorted({key for row in rows for key in row.keys()})
         with self.summary_csv.open("w", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=keys)
+            writer = csv.DictWriter(f, fieldnames=keys, extrasaction="ignore")
             writer.writeheader()
             writer.writerows(rows)
         self._write_summary2_csv(rows)
+
+    def _has_completed_result(
+        self,
+        preprocess_name: str,
+        preprocess_env: dict[str, str],
+        eval_env: dict[str, str],
+        merged_eval_env: dict[str, str],
+    ) -> bool:
+        if not self.results_jsonl.exists():
+            return False
+        expected_values = dict(preprocess_env)
+        expected_values.update(eval_env)
+        expected_values["EVAL_BSZ"] = merged_eval_env.get("EVAL_BSZ", "")
+        with self.results_jsonl.open() as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                row = json.loads(line)
+                if row.get("status") != "ok":
+                    continue
+                if row.get("preprocess_name") != preprocess_name:
+                    continue
+                if all(
+                    str(row.get(k, "")) == str(v) for k, v in expected_values.items()
+                ):
+                    return True
+        return False
 
     def run(self):
         dataset = self.dataset
@@ -731,6 +816,18 @@ class GridRunner:
                         "/", "_"
                     )
                 )
+                if not self._auto_bsz_enabled() and self._has_completed_result(
+                    preprocess_name, preprocess_env, eval_env, merged_eval_env
+                ):
+                    self._print_status(
+                        f"[skip-completed] dataset={dataset} eval={preprocess_name} "
+                        f"env={eval_env} EVAL_BSZ={merged_eval_env.get('EVAL_BSZ', '')}"
+                    )
+                    self._log_event(
+                        f"skip_completed dataset={dataset} eval={preprocess_name} "
+                        f"env={merged_eval_env}"
+                    )
+                    continue
                 auto_bsz = self._select_auto_bsz(
                     dataset, merged_eval_env, log_prefix_base
                 )
@@ -762,12 +859,18 @@ class GridRunner:
                         attempt_log_prefix = (
                             f'{log_prefix}__bsz={merged_eval_env["EVAL_BSZ"]}'
                         )
+                    attempt_eval_env = dict(merged_eval_env)
+                    attempt_eval_env.setdefault(
+                        "OUTPUT_FILE",
+                        str(self.eval_outputs_dir / f"{attempt_log_prefix}.jsonl"),
+                    )
                     eval_stage = self._run_script(
-                        self.eval_script, dataset, merged_eval_env, attempt_log_prefix
+                        self.eval_script, dataset, attempt_eval_env, attempt_log_prefix
                     )
                     run_attempts.append(
                         {
                             "EVAL_BSZ": merged_eval_env.get("EVAL_BSZ"),
+                            "OUTPUT_FILE": attempt_eval_env.get("OUTPUT_FILE"),
                             "returncode": eval_stage.returncode,
                             "elapsed_sec": eval_stage.elapsed_sec,
                             "log_file": str(
@@ -778,6 +881,7 @@ class GridRunner:
                     )
                     if eval_stage.returncode == 0:
                         log_prefix = attempt_log_prefix
+                        merged_eval_env["OUTPUT_FILE"] = attempt_eval_env["OUTPUT_FILE"]
                         break
                     if auto_bsz is None or not self._is_oom_failure(eval_stage.stdout):
                         log_prefix = attempt_log_prefix
@@ -831,6 +935,7 @@ class GridRunner:
                     "eval_log_file": str(self.logs_dir / f"{log_prefix}.log"),
                     "elapsed_sec": eval_stage.elapsed_sec,
                     "EVAL_BSZ": merged_eval_env.get("EVAL_BSZ"),
+                    "OUTPUT_FILE": merged_eval_env.get("OUTPUT_FILE"),
                 }
                 result.update(preprocess_env)
                 result.update(eval_env)
@@ -845,16 +950,8 @@ class GridRunner:
                     metric_bits.append(f"f1={summary['f1']}")
                 if "exact_match" in summary:
                     metric_bits.append(f"em={summary['exact_match']}")
-                if "compressed_rouge_l_recall" in summary:
-                    metric_bits.append(
-                        f"crecall={summary['compressed_rouge_l_recall']}"
-                    )
                 if "recall_drop" in summary:
                     metric_bits.append(f"drop={summary['recall_drop']}")
-                if "compressed_rouge_l_precision" in summary:
-                    metric_bits.append(
-                        f"cprec={summary['compressed_rouge_l_precision']}"
-                    )
                 metric_text = " ".join(metric_bits)
                 if metric_text:
                     metric_text = f" {metric_text}"
