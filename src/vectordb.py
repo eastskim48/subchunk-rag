@@ -211,11 +211,10 @@ class VectorDB(abc.ABC):
 class ChromaDB(VectorDB):
     """Persist and retrieve coarse chunks with Chroma vector search."""
 
-    DEFAULT_EMBEDDING_MODEL = BGE_M3_MODEL
-    DEFAULT_EMBED_BACKEND = "default"
     BGE_M3_EMBED_BACKEND = "bge_m3"
     BGE_SMALL_EMBED_BACKEND = "bge_small_v1_5"
     E5_SMALL_EMBED_BACKEND = "e5_small_v2"
+    DEFAULT_EMBED_BACKEND = BGE_SMALL_EMBED_BACKEND
     DENSE_EMBED_BACKENDS = {
         BGE_M3_EMBED_BACKEND: BGE_M3_MODEL,
         BGE_SMALL_EMBED_BACKEND: BGE_SMALL_MODEL,

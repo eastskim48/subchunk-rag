@@ -42,15 +42,15 @@ Set `DATASET_PREFIX` if the datasets live somewhere else.
 ## Preprocess
 
 DB preprocessing and candidate-store construction are separate steps. First,
-build the sentence-based default Chroma DB:
+build a sentence-based Chroma DB:
 
 ```bash
 DATASET=longbench-hotpotqa \
-PREPROCESS_SUBDIR=sent-default-512 \
+PREPROCESS_SUBDIR=sent-bge-small-v1.5-512 \
 SPLITTER=sentence \
 RETRIEVABLE_CHUNK_SIZE=512 \
 CACHEABLE_CHUNK_SIZE=None \
-CHROMA_EMBED_BACKEND=default \
+CHROMA_EMBED_BACKEND=bge_small_v1_5 \
 CHROMA_EMBED_DEVICE=cuda \
 CHROMA_EMBED_BATCH_SIZE=128 \
 MATERIALIZE_CACHE=False \
@@ -74,14 +74,12 @@ or IDs, but changing the insertion batching can change the approximate HNSW
 graph. Comparisons must therefore share the same built DB rather than rebuild
 one method's DB with a different batch size.
 
-For the default Chroma MiniLM backend, preprocessing pins ONNX execution to
-`CHROMA_EMBED_DEVICE` and records both the device and
-`CHROMA_EMBED_BATCH_SIZE`. Evaluation does not inherit these build options:
+The implicit retrieval-backend default is `bge_small_v1_5`. Preprocessing
+records `CHROMA_EMBED_BACKEND`, `CHROMA_EMBED_DEVICE`, and
+`CHROMA_EMBED_BATCH_SIZE`. Evaluation does not inherit the build device:
 ordinary `ChromaDB(db_dir)` construction always pins runtime query embedding
 to CPU and exposes no device option. CUDA is reachable only through the
-preprocessing-only `ChromaDB.for_build(...)` constructor. CPU and CUDA execute
-the same ONNX graph, tokenizer, truncation, pooling, and normalization, but
-their floating-point outputs are not bit-identical.
+preprocessing-only `ChromaDB.for_build(...)` constructor.
 
 This writes the DB and its preprocessing manifest under:
 

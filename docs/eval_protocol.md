@@ -34,6 +34,7 @@ The current `run/eval.sh` defaults are:
 - `CACHE_SUBDIR=cache`
 - `DB_DIR=$DATASET_PATH/$DATA_SUBDIR/db`
 - `CACHE_DIR=$DATASET_PATH/$DATA_SUBDIR/$CACHE_SUBDIR`
+- `CHROMA_EMBED_BACKEND=bge_small_v1_5`
 - `DENSE_EMBED_DIR=$DATASET_PATH/$DATA_SUBDIR/dense_embed`
 - `COLBERT_WINDOW_DIR=$DATASET_PATH/$DATA_SUBDIR/colbert_window`
 - `EVAL_USE_PAST_CACHE=False`
@@ -43,13 +44,19 @@ The current `run/eval.sh` defaults are:
 - `USE_CLEANER=False`
 - `EVAL_BSZ=4`
 - `TOP_K=20`
-- `TOTAL_NUM=200`
+- `TOTAL_NUM` unset: evaluate every record in the query file
 - `MAX_NEW_TOKENS=20`
 - `COMPRESS_METHOD=dense`
 - `RETAIN_TOKEN_RATIO=0.1`
 
 Changing any of these can change the evaluated workload, model behavior, or
 timing condition. Report changed values with every result table.
+
+Setting `TOTAL_NUM` to a positive integer limits evaluation to that many
+records from the beginning of the query file. Omitting it, or setting it to an
+empty value, evaluates the complete query file. Results with an explicit limit
+are not directly comparable to full-file results unless the evaluated
+populations are otherwise made identical.
 
 `COMPRESS_METHOD=dense` is the materialized dense-embedding selector. It uses
 the same query embedding, stored sentence embeddings, and deduplication as the
@@ -165,20 +172,12 @@ label loading, context construction, prompt, metric, or output, so results
 before and after the rename remain directly comparable when all experiment
 inputs match.
 
-The separately named
-`dapr-nq-gold-evidence-oracle-chat-0726` condition uses
-`PROMPT_FORMAT=chat_system_user`. It serializes the same evidence and question
-with the evaluated model tokenizer's official system/user chat template and an
-assistant-generation header. It remains cache-off. Its EM/F1 values are not
-directly comparable to raw-prompt Vanilla, subchunk, or oracle results because
-prompt serialization changes model behavior. The default
-`PROMPT_FORMAT=raw_chunk_first` remains unchanged for all other runs.
-
-The separately named `dapr-nq-bge-rag-sllm-chat-0726` grid applies the same
-`chat_system_user` serialization to all 14 Llama-3.2-1B-Instruct Vanilla and
-subchunk cases. It is cache-off and is the matched standard-chat comparison for
-the 1B oracle. Its answer-quality results are not directly comparable to the
-earlier raw-prompt sLLM grid.
+`grid_dapr_nq_gold_evidence_oracle.yaml` does not override `PROMPT_FORMAT` and
+therefore uses the `raw_chunk_first` default from `run/eval_oracle.sh`.
+`grid_dapr_nq_bge_rag_sllm.yaml` likewise uses the `raw_chunk_first` default
+from `run/eval.sh`. Historical results whose run names contain `-chat-` used
+`chat_system_user`; they are not directly comparable with these raw-prompt
+conditions because prompt serialization can change model behavior.
 
 `USE_CLEANER=False` is the current default in `run/eval.sh`. Results with
 different cleaner settings are not directly comparable unless the prediction
@@ -321,11 +320,12 @@ rebuilt against the deduplicated DB before running ColBERT-based compression.
 
 `CHROMA_EMBED_BACKEND` controls how Chroma collections are opened:
 
-- `default` is the current default and main paper setting. It opens the
-  collection with Chroma's ONNX `all-MiniLM-L6-v2` embedding implementation.
-  Because this path does not pass an explicit HNSW configuration, Chroma 1.5.7
-  uses `ef_construction=100`, `ef_search=100`, and `M=16`
-  (`max_neighbors=16`). `chroma_default` is an alias for this same path.
+- When the variable is unset, `bge_small_v1_5` is selected.
+- The explicitly named `default` backend is the main paper MiniLM setting. It
+  opens the collection with Chroma's ONNX `all-MiniLM-L6-v2` embedding
+  implementation. Because this path does not pass an explicit HNSW
+  configuration, Chroma 1.5.7 uses `ef_construction=100`, `ef_search=100`, and
+  `M=16` (`max_neighbors=16`). `chroma_default` is an alias for this same path.
 - `bge_m3`, `bge_small_v1_5`, and `e5_small_v2` use the project's
   `DenseTextEmbedder`/SentenceTransformers implementation and an explicit HNSW
   configuration: `ef_construction=200`, `ef_search=200`, and `M=32`
@@ -350,6 +350,13 @@ retrieval backends" means `bge_m3`, `bge_small_v1_5`, and `e5_small_v2`.
 Neither term means the `dense` context-compression method. Changing the
 retrieval backend changes the retrieval condition and must be reported as a
 separate retriever setting.
+
+Changing the implicit default does not alter grids that explicitly set
+`CHROMA_EMBED_BACKEND`. A DB built with MiniLM still requires
+`CHROMA_EMBED_BACKEND=default`; opening it under the new implicit
+`bge_small_v1_5` selection is not a compatible retrieval condition. Results
+from MiniLM and BGE-small DBs are not directly comparable as the same
+retriever.
 
 Dense selectors use `DENSE_EMBED_DIR`. ColBERT-window selectors use
 `COLBERT_WINDOW_DIR` and `COLBERT_MODEL_NAME`. Runtime ColBERT query encoding is

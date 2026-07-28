@@ -46,14 +46,15 @@
 ### Chroma retrieval backend terminology
 
 All `CHROMA_EMBED_BACKEND` choices are dense vector-retrieval backends. Do not
-refer to only the non-default choices as "dense backends," and do not confuse
+refer to only the non-MiniLM choices as "dense backends," and do not confuse
 them with the `dense` context-compression baseline:
 
-- `default` (alias `chroma_default`) is the main paper retrieval backend. It
-  uses Chroma's ONNX `all-MiniLM-L6-v2` embedding implementation. The project
-  does not pass an HNSW configuration for this path, so Chroma 1.5.7 supplies
-  `ef_construction=100`, `ef_search=100`, and `M=16`
-  (`max_neighbors=16`).
+- The implicit environment default is `bge_small_v1_5`.
+- The explicitly named `default` backend (alias `chroma_default`) is the main
+  paper MiniLM retrieval setting. It uses Chroma's ONNX
+  `all-MiniLM-L6-v2` embedding implementation. The project does not pass an
+  HNSW configuration for this path, so Chroma 1.5.7 supplies
+  `ef_construction=100`, `ef_search=100`, and `M=16` (`max_neighbors=16`).
 - `bge_m3`, `bge_small_v1_5`, and `e5_small_v2` use the project's
   `DenseTextEmbedder`/SentenceTransformers path. The project explicitly creates
   these collections with `ef_construction=200`, `ef_search=200`, and `M=32`
@@ -157,11 +158,11 @@ effect. Semantic splitting requires an explicit grouper, currently selected
 through the legacy `MERGER` CLI option. The old PN-mapping and
 resolved-sentence preprocessing paths are intentionally unsupported.
 
-The default Chroma MiniLM backend uses an explicitly provider-pinned ONNX
-wrapper. `run/preprocess.sh` builds embeddings on CUDA by default and records
-the build device and internal embedding batch in the DB manifest. Ordinary
-`ChromaDB(db_dir)` runtime construction always pins query encoding to CPU and
-has no device argument. CUDA is exposed only by the preprocessing-only
+The explicitly named `default` Chroma MiniLM backend uses a provider-pinned
+ONNX wrapper. `run/preprocess.sh` builds embeddings on CUDA by default and
+records the build device and internal embedding batch in the DB manifest.
+Ordinary `ChromaDB(db_dir)` runtime construction always pins query encoding to
+CPU and has no device argument. CUDA is exposed only by the preprocessing-only
 `ChromaDB.for_build(...)` constructor. Do not add runtime GPU query encoding.
 
 Sentence segmentation and source-span alignment live in

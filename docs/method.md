@@ -197,8 +197,8 @@ retrieved chunk from that parent document needs ColBERT vectors.
 
 At query time, Chroma retrieves top-k retrievable chunks.
 
-For the main paper setting, the DB backend is Chroma `default`, i.e. the
-lightweight default/MiniLM-style retrieval configuration.
+For the main paper setting, the DB backend is explicitly named Chroma
+`default`, i.e. the lightweight MiniLM-style retrieval configuration.
 
 Each retrieved row is deserialized into a `RetrievableChunk`:
 

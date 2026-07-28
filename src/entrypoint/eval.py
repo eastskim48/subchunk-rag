@@ -39,7 +39,7 @@ def main(
     use_past_cache: bool = True,
     bsz: int = 1,
     max_new_tokens: int = 100,
-    total_num: int = 100,
+    total_num: Optional[int] = None,
     output_file: str = "log.jsonl",
     answer_file: str = "answer.jsonl",
     model_name: str = "meta-llama/Llama-3.1-8B",

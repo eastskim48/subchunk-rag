@@ -4,7 +4,7 @@ import time
 import os
 from itertools import islice
 from tqdm import tqdm
-from typing import List
+from typing import List, Optional
 from transformers import DynamicCache
 from chunk import RetrievableChunk
 
@@ -250,7 +250,10 @@ class QueryProcessor:
         }
 
     def process_query(
-        self, bsz: int = 1, max_new_tokens: int = 100, total_num: int = 100
+        self,
+        bsz: int = 1,
+        max_new_tokens: int = 100,
+        total_num: Optional[int] = None,
     ):
         """Evaluate input queries in batches and write reproducible records."""
 

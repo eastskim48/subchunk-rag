@@ -11,6 +11,7 @@ else
 fi
 export CHUNK_SIZE="${CHUNK_SIZE:-1024}"
 export VANILLA_SUBDIR="${VANILLA_SUBDIR:-vanilla-default-${CHUNK_SIZE}}"
+export CHROMA_EMBED_BACKEND="${CHROMA_EMBED_BACKEND:-bge_small_v1_5}"
 export CHROMA_EMBED_DEVICE="${CHROMA_EMBED_DEVICE:-cpu}"
 export DENSE_EMBED_DEVICE="${DENSE_EMBED_DEVICE:-cpu}"
 export DEFAULT_MODEL_NAME="meta-llama/Llama-3.1-8B-Instruct"

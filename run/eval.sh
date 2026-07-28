@@ -20,6 +20,7 @@ export DATA_SUBDIR="${DATA_SUBDIR:-sent}"
 export CACHE_SUBDIR="${CACHE_SUBDIR:-cache}"
 export DB_DIR="${DB_DIR:-$DATASET_PATH/$DATA_SUBDIR/db}"
 export CACHE_DIR="${CACHE_DIR:-$DATASET_PATH/$DATA_SUBDIR/$CACHE_SUBDIR}"
+export CHROMA_EMBED_BACKEND="${CHROMA_EMBED_BACKEND:-bge_small_v1_5}"
 export CHROMA_EMBED_DEVICE="${CHROMA_EMBED_DEVICE:-cpu}"
 export COLBERT_WINDOW_DIR="${COLBERT_WINDOW_DIR:-$DATASET_PATH/$DATA_SUBDIR/colbert_window}"
 export COLBERT_MODEL_NAME="${COLBERT_MODEL_NAME:-colbert-ir/colbertv2.0}"
@@ -36,7 +37,7 @@ export USE_CLEANER="${USE_CLEANER:-False}"
 export PROMPT_FORMAT="${PROMPT_FORMAT:-raw_chunk_first}"
 export EVAL_BSZ="${EVAL_BSZ:-4}"
 export TOP_K="${TOP_K:-20}"
-export TOTAL_NUM="${TOTAL_NUM:-200}"
+export TOTAL_NUM="${TOTAL_NUM:-}"
 export MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-20}"
 export COMPRESS_METHOD="${COMPRESS_METHOD-colbert_sliding_region}"
 export TORCHRUN_MASTER_PORT="${TORCHRUN_MASTER_PORT:-29500}"
@@ -105,12 +106,17 @@ else
 fi
 OUTPUT_FILE="${OUTPUT_FILE:-./outputs/eval-$DATASET-$DATA_SUBDIR${OUTPUT_PATH_SUFFIX}.jsonl}"
 
+TOTAL_NUM_ARGS=()
+if [ -n "$TOTAL_NUM" ]; then
+    TOTAL_NUM_ARGS=(--total_num "$TOTAL_NUM")
+fi
+
 torchrun --nproc_per_node 1 --master_port "$TORCHRUN_MASTER_PORT" src/entrypoint/eval.py \
     --dataset="$DATASET" \
     --db_dir="$DB_DIR" \
     --cache_dir="$CACHE_DIR" \
     --query_file="$DATASET_PATH/questions/query.jsonl" \
-    --top_k "$TOP_K" --max_new_tokens "$MAX_NEW_TOKENS" --total_num "$TOTAL_NUM" \
+    --top_k "$TOP_K" --max_new_tokens "$MAX_NEW_TOKENS" \
     --model_name "$MODEL_NAME" \
     --use_past_cache="$EVAL_USE_PAST_CACHE" \
     --disable_rope "$DISABLE_ROPE" \
@@ -121,6 +127,7 @@ torchrun --nproc_per_node 1 --master_port "$TORCHRUN_MASTER_PORT" src/entrypoint
     --answer_file "$DATASET_PATH/answers/answer.jsonl" \
     --bsz "$EVAL_BSZ" \
     --use_cleaner "$USE_CLEANER" \
+    "${TOTAL_NUM_ARGS[@]}" \
     "${COMPRESS_ARGS[@]}"
 ## HOTPOTQA 실험 ##
 # BOS 유무
