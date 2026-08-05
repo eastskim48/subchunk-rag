@@ -4,7 +4,6 @@ import json
 import sys
 import time
 from argparse import ArgumentParser
-from itertools import islice
 from pathlib import Path
 from typing import Any
 
@@ -35,12 +34,21 @@ def actual_token_count(text: str, tokenizer) -> int:
     return len(tokenizer.encode(text, add_special_tokens=False))
 
 
-def load_jsonl_queries(path: Path, total_num: int) -> list[str]:
-    queries = []
+def load_jsonl_query_records(
+    path: Path, probe_query_limit: int | None = None
+) -> list[dict[str, Any]]:
+    if probe_query_limit is not None and probe_query_limit <= 0:
+        raise ValueError(f"probe_query_limit must be positive, got {probe_query_limit}")
+    records = []
     with path.open(encoding="utf-8") as handle:
-        for line in islice(handle, total_num):
-            queries.append(parse_json_query(line))
-    return queries
+        for line_index, line in enumerate(handle):
+            if probe_query_limit is not None and line_index >= probe_query_limit:
+                break
+            payload = json.loads(line)
+            if not isinstance(payload, dict):
+                raise ValueError(f"{path} contains a query row that is not an object")
+            records.append({"id": payload.get("id"), "query": parse_json_query(line)})
+    return records
 
 
 def docs_full_text(docs) -> str:
@@ -57,32 +65,31 @@ def write_jsonl(path: Path, records: list[dict[str, Any]]) -> None:
 def run_retrieval_only_evaluation(
     *,
     dataset: str,
-    queries: list[str],
+    query_records: list[dict[str, Any]],
     vectordb,
     tokenizer,
+    query_file: str,
     db_dir: str,
-    sample_path: Path,
+    evidence_path: Path,
     top_k: int,
     bsz: int,
     compress_method: str | None,
     model_name: str,
-    passage_recall_threshold: float,
     setup_time: float,
     colbert_query_config: dict[str, Any] | None,
     run_start: float,
     output_file: str,
     details_file: str | None,
 ) -> None:
-    labels_by_query = load_text_evidence_labels(sample_path)
-    scorer = TextEvidenceCoverageScorer(
-        metric_tokenizer=tokenizer,
-        passage_recall_threshold=passage_recall_threshold,
-    )
+    labels_by_id = load_text_evidence_labels(evidence_path)
+    scorer = TextEvidenceCoverageScorer(metric_tokenizer=tokenizer)
     records = []
     for start in tqdm(
-        range(0, len(queries), bsz), total=(len(queries) + bsz - 1) // bsz
+        range(0, len(query_records), bsz),
+        total=(len(query_records) + bsz - 1) // bsz,
     ):
-        batch_queries = queries[start : start + bsz]
+        batch_query_records = query_records[start : start + bsz]
+        batch_queries = [record["query"] for record in batch_query_records]
         batch_docs = vectordb.find_top_k_docs(top_k=top_k, queries=batch_queries)
         compressed_batch_docs = (
             compress_docs(batch_queries, batch_docs, option=compress_method)
@@ -90,14 +97,26 @@ def run_retrieval_only_evaluation(
             else batch_docs
         )
 
-        for query, retrieved_docs, compressed_docs in zip(
-            batch_queries, batch_docs, compressed_batch_docs
+        for query_record, retrieved_docs, compressed_docs in zip(
+            batch_query_records, batch_docs, compressed_batch_docs
         ):
-            label = labels_by_query.get(query)
+            query = query_record["query"]
+            label_id = query_record["id"]
+            if isinstance(label_id, bool) or not isinstance(label_id, (int, str)):
+                raise ValueError(
+                    "ID-keyed evidence lookup requires every query row to have "
+                    f"an integer or string ID; invalid ID for {query!r}: {label_id!r}"
+                )
+            label = labels_by_id.get(label_id)
             if label is None:
                 raise KeyError(
-                    f"query not found in text evidence file {sample_path}: "
-                    f"{query!r}"
+                    f"query not found in text evidence file {evidence_path}: "
+                    f"id={label_id!r}, query={query!r}"
+                )
+            if label.get("query") != query:
+                raise ValueError(
+                    f"query/evidence text mismatch for id={label_id!r}: "
+                    f"{query!r} != {label.get('query')!r}"
                 )
             retrieved_text = docs_full_text(retrieved_docs)
             compressed_text = (
@@ -124,27 +143,27 @@ def run_retrieval_only_evaluation(
             )
             records.append(
                 {
-                    "id": len(records),
+                    "id": label_id,
                     "source_id": label.get("source_id"),
                     "query": query,
+                    "retrieved_context_text": retrieved_text,
+                    "compressed_context_text": compressed_text,
                     **score,
                 }
             )
 
-    if len(records) != len(queries):
+    if len(records) != len(query_records):
         raise ValueError(
             f"evaluated record count differs from query count: "
-            f"{len(records)} != {len(queries)}"
+            f"{len(records)} != {len(query_records)}"
         )
-    summary = summarize_text_evidence_records(
-        records,
-        passage_recall_threshold=passage_recall_threshold,
-    )
+    summary = summarize_text_evidence_records(records)
     summary.update(
         {
             "dataset": dataset,
-            "sample_file": str(sample_path),
-            "query_file_count": len(queries),
+            "evidence_file": str(evidence_path),
+            "query_file": query_file,
+            "query_file_count": len(query_records),
             "db_dir": db_dir,
             "top_k": top_k,
             "compress_method": compress_method,
@@ -170,18 +189,19 @@ def main(
     query_file: str,
     db_dir: str,
     top_k: int,
-    total_num: int,
+    probe_query_limit: int | None,
     bsz: int,
     compress_method: str | None,
-    sample_file: str,
+    evidence_file: str,
     model_name: str,
     output_file: str,
     details_file: str | None,
-    passage_recall_threshold: float = 0.8,
 ) -> None:
     logging.set_verbosity_error()
-    sample_path = Path(sample_file)
-    queries = load_jsonl_queries(Path(query_file), total_num=total_num)
+    evidence_path = Path(evidence_file)
+    query_records = load_jsonl_query_records(
+        Path(query_file), probe_query_limit=probe_query_limit
+    )
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     vectordb = ChromaDB(db_dir=db_dir)
 
@@ -204,16 +224,16 @@ def main(
     run_start = time.perf_counter()
     run_retrieval_only_evaluation(
         dataset=dataset,
-        queries=queries,
+        query_records=query_records,
         vectordb=vectordb,
         tokenizer=tokenizer,
+        query_file=query_file,
         db_dir=db_dir,
-        sample_path=sample_path,
+        evidence_path=evidence_path,
         top_k=top_k,
         bsz=bsz,
         compress_method=compress_method,
         model_name=model_name,
-        passage_recall_threshold=passage_recall_threshold,
         setup_time=setup_time,
         colbert_query_config=colbert_query_config,
         run_start=run_start,
@@ -228,12 +248,11 @@ if __name__ == "__main__":
     parser.add_argument("--query_file", required=True)
     parser.add_argument("--db_dir", required=True)
     parser.add_argument("--top_k", type=int, default=20)
-    parser.add_argument("--total_num", type=int, default=200)
+    parser.add_argument("--probe_query_limit", type=int, default=None)
     parser.add_argument("--bsz", type=int, default=4)
     parser.add_argument("--compress_method", default=None)
-    parser.add_argument("--sample_file", required=True)
+    parser.add_argument("--evidence_file", required=True)
     parser.add_argument("--model_name", default="meta-llama/Llama-3.1-8B-Instruct")
-    parser.add_argument("--passage_recall_threshold", type=float, default=0.8)
     parser.add_argument("--output_file", default="outputs/retrieval-only-summary.json")
     parser.add_argument("--details_file", default=None)
     parsed = parser.parse_args()

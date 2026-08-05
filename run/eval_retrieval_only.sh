@@ -28,13 +28,16 @@ export COLBERT_QUERY_TRUNCATION_SIDE="${COLBERT_QUERY_TRUNCATION_SIDE:-right}"
 export TOP_K="${TOP_K:-20}"
 export COMPRESS_METHOD="${COMPRESS_METHOD:-none}"
 export EVAL_BSZ="${EVAL_BSZ:-8}"
-export TOTAL_NUM="${TOTAL_NUM:-200}"
 export MODEL_NAME="${MODEL_NAME:-meta-llama/Llama-3.1-8B-Instruct}"
-export SAMPLE_FILE="${SAMPLE_FILE:-$DATASET_PATH/evidence_labels.json}"
-export PASSAGE_RECALL_THRESHOLD="${PASSAGE_RECALL_THRESHOLD:-0.8}"
+export QUERY_FILE="${QUERY_FILE:-$DATASET_PATH/questions/query.jsonl}"
+export EVIDENCE_FILE="${EVIDENCE_FILE:-$DATASET_PATH/evidence_labels.json}"
 
-if [ ! -f "$SAMPLE_FILE" ]; then
-    echo "missing SAMPLE_FILE=$SAMPLE_FILE" >&2
+if [ ! -f "$QUERY_FILE" ]; then
+    echo "missing QUERY_FILE=$QUERY_FILE" >&2
+    exit 1
+fi
+if [ ! -f "$EVIDENCE_FILE" ]; then
+    echo "missing EVIDENCE_FILE=$EVIDENCE_FILE" >&2
     exit 1
 fi
 
@@ -85,16 +88,20 @@ if [ -n "$COMPRESS_METHOD" ] && [ "$COMPRESS_METHOD" != "none" ]; then
     COMPRESS_ARGS=(--compress_method "$COMPRESS_METHOD")
 fi
 
+PROBE_ARGS=()
+if [ -n "${EVAL_PROBE_QUERY_LIMIT:-}" ]; then
+    PROBE_ARGS=(--probe_query_limit "$EVAL_PROBE_QUERY_LIMIT")
+fi
+
 python "$REPO_ROOT/src/entrypoint/eval_retrieval_only.py" \
     --dataset "$DATASET" \
     --db_dir "$DATASET_PATH/$DATA_SUBDIR/db" \
-    --query_file "$DATASET_PATH/questions/query.jsonl" \
+    --query_file "$QUERY_FILE" \
     --top_k "$TOP_K" \
-    --total_num "$TOTAL_NUM" \
     --bsz "$EVAL_BSZ" \
     --model_name "$MODEL_NAME" \
-    --passage_recall_threshold "$PASSAGE_RECALL_THRESHOLD" \
-    --sample_file "$SAMPLE_FILE" \
+    --evidence_file "$EVIDENCE_FILE" \
     --output_file "$OUTPUT_FILE" \
     --details_file "$DETAILS_FILE" \
+    "${PROBE_ARGS[@]}" \
     "${COMPRESS_ARGS[@]}"

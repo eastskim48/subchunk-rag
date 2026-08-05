@@ -247,6 +247,12 @@ artifacts were not materialized under that prefix.
 - Evaluation code is especially strict: preserve the requested metric definition exactly, even if another variant looks more robust or convenient.
 - If the user asks to add a field, metric, option, or behavior, only add it. Do not remove, rename, replace, or reinterpret existing fields, metrics, options, or behavior unless the user explicitly asks for that removal or rename.
 
+## Evaluation Invariants
+- Evaluation must fail immediately when prediction and ground-truth record counts differ. Raise an explicit exception; never truncate either list, skip unmatched rows, change the denominator, or continue with a partial score.
+- Prediction logs and ground-truth records must both contain stable IDs. Compare IDs at every row before scoring and fail immediately if an ID is missing or differs; equal record counts alone do not establish alignment.
+- Retrieval-only evidence evaluation must persist each query's complete retrieved and compressed context strings in a run-local detail file so corrected labels or scoring rules can be replayed without rerunning retrieval or compression.
+- More generally, when an evaluation invariant is violated, stop with an assertion or exception instead of inventing a fallback or silently fixing the data. Do not convert an observed mismatch into evaluation policy unless the user explicitly instructs the exact handling.
+
 ## Refactoring Discipline
 - When refactoring, do not guess and make changes beyond what was explicitly requested.
 - Do only what was asked.

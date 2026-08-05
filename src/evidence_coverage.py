@@ -44,16 +44,30 @@ def _load_json_records(path: Path) -> list[dict[str, Any]]:
     return records
 
 
-def load_text_evidence_labels(path: Path) -> dict[str, dict[str, Any]]:
-    """Load query-to-evidence text labels without source-position requirements."""
+def load_text_evidence_labels(
+    path: Path, key_field: str = "id"
+) -> dict[Hashable, dict[str, Any]]:
+    """Load text-evidence labels keyed by query text or a stable record ID."""
 
-    labels_by_query: dict[str, dict[str, Any]] = {}
+    if key_field not in {"query", "id"}:
+        raise ValueError(
+            f"unsupported evidence label key {key_field!r}; expected 'query' or 'id'"
+        )
+
+    labels_by_key: dict[Hashable, dict[str, Any]] = {}
     for record in _load_json_records(path):
         query = record.get("query")
         if not isinstance(query, str) or not query:
             raise ValueError(f"{path} contains an evidence label without a query")
-        if query in labels_by_query:
-            raise ValueError(f"{path} contains a duplicate query: {query!r}")
+        key = record.get(key_field)
+        if key_field == "id" and (
+            isinstance(key, bool) or not isinstance(key, (int, str))
+        ):
+            raise ValueError(f"{path} contains an invalid evidence label ID: {key!r}")
+        if key in labels_by_key:
+            raise ValueError(
+                f"{path} contains a duplicate evidence label {key_field}: {key!r}"
+            )
 
         evidence_texts = record.get("evidence_texts")
         evidence_passage_ids = record.get("evidence_passage_ids")
@@ -69,8 +83,8 @@ def load_text_evidence_labels(path: Path) -> dict[str, dict[str, Any]]:
         if len(evidence_texts) != len(evidence_passage_ids):
             raise ValueError(f"evidence label lengths differ for query {query!r}")
 
-        labels_by_query[query] = record
-    return labels_by_query
+        labels_by_key[key] = record
+    return labels_by_key
 
 
 def _normalized_text(text: str) -> str:
@@ -171,14 +185,8 @@ def _exact_retention(compressed_exact: float, retrieved_exact: float):
 class TextEvidenceCoverageScorer:
     """Measure exact containment and longest contiguous partial evidence."""
 
-    def __init__(self, metric_tokenizer, passage_recall_threshold: float = 0.8):
-        if not 0.0 <= passage_recall_threshold <= 1.0:
-            raise ValueError(
-                "passage_recall_threshold must be between 0 and 1, got "
-                f"{passage_recall_threshold}"
-            )
+    def __init__(self, metric_tokenizer):
         self.metric_tokenizer = metric_tokenizer
-        self.passage_recall_threshold = passage_recall_threshold
 
     def score(
         self,
@@ -233,13 +241,13 @@ class TextEvidenceCoverageScorer:
                     "retrieval_token_exact": retrieved_token_exact,
                     "compressed_char_exact": compressed_char_exact,
                     "compressed_token_exact": compressed_token_exact,
-                    "retrieval_char_partial_recall": retrieved_char_overlap
+                    "retrieval_char_contiguous_partial_recall": retrieved_char_overlap
                     / len(gold_chars),
-                    "retrieval_token_partial_recall": retrieved_token_overlap
+                    "retrieval_token_contiguous_partial_recall": retrieved_token_overlap
                     / len(gold_tokens),
-                    "compressed_char_partial_recall": compressed_char_overlap
+                    "compressed_char_contiguous_partial_recall": compressed_char_overlap
                     / len(gold_chars),
-                    "compressed_token_partial_recall": compressed_token_overlap
+                    "compressed_token_contiguous_partial_recall": compressed_token_overlap
                     / len(gold_tokens),
                     "conditional_char_exact_retention": _exact_retention(
                         compressed_char_exact, retrieved_char_exact
@@ -247,10 +255,10 @@ class TextEvidenceCoverageScorer:
                     "conditional_token_exact_retention": _exact_retention(
                         compressed_token_exact, retrieved_token_exact
                     ),
-                    "conditional_char_partial_retention": _partial_retention(
+                    "conditional_char_contiguous_partial_retention": _partial_retention(
                         compressed_char_overlap, retrieved_char_overlap
                     ),
-                    "conditional_token_partial_retention": _partial_retention(
+                    "conditional_token_contiguous_partial_retention": _partial_retention(
                         compressed_token_overlap, retrieved_token_overlap
                     ),
                 }
@@ -264,12 +272,8 @@ class TextEvidenceCoverageScorer:
                 ),
                 "tokens": sum(detail["gold_tokens"] for detail in passage_details),
             },
-            "retrieval": _summarize_passage_matches(
-                passage_details, "retrieval", self.passage_recall_threshold
-            ),
-            "compressed": _summarize_passage_matches(
-                passage_details, "compressed", self.passage_recall_threshold
-            ),
+            "retrieval": _summarize_passage_matches(passage_details, "retrieval"),
+            "compressed": _summarize_passage_matches(passage_details, "compressed"),
             "conditional": _summarize_conditional_matches(passage_details),
             "passages": passage_details,
         }
@@ -278,28 +282,24 @@ class TextEvidenceCoverageScorer:
 def _summarize_passage_matches(
     details: list[dict[str, Any]],
     prefix: str,
-    threshold: float,
 ) -> dict[str, float]:
     char_exact = [detail[f"{prefix}_char_exact"] for detail in details]
     token_exact = [detail[f"{prefix}_token_exact"] for detail in details]
-    char_partial = [detail[f"{prefix}_char_partial_recall"] for detail in details]
-    token_partial = [detail[f"{prefix}_token_partial_recall"] for detail in details]
+    char_partial = [
+        detail[f"{prefix}_char_contiguous_partial_recall"] for detail in details
+    ]
+    token_partial = [
+        detail[f"{prefix}_token_contiguous_partial_recall"] for detail in details
+    ]
     return {
-        "evidence_char_exact_recall": mean(char_exact),
-        "evidence_token_exact_recall": mean(token_exact),
-        "any_evidence_char_exact": float(any(char_exact)),
-        "any_evidence_token_exact": float(any(token_exact)),
-        "all_evidence_char_exact": float(all(char_exact)),
-        "all_evidence_token_exact": float(all(token_exact)),
-        "evidence_char_partial_recall": mean(char_partial),
-        "evidence_token_partial_recall": mean(token_partial),
-        "char_partial_passage_recall_at_threshold": mean(
-            value >= threshold for value in char_partial
-        ),
-        "token_partial_passage_recall_at_threshold": mean(
-            value >= threshold for value in token_partial
-        ),
-        "worst_passage_char_partial_recall": min(char_partial),
+        "char_exact_recall": mean(char_exact),
+        "token_exact_recall": mean(token_exact),
+        "any_char_exact": float(any(char_exact)),
+        "any_token_exact": float(any(token_exact)),
+        "all_char_exact": float(all(char_exact)),
+        "all_token_exact": float(all(token_exact)),
+        "char_contiguous_partial_recall": mean(char_partial),
+        "token_contiguous_partial_recall": mean(token_partial),
     }
 
 
@@ -311,16 +311,16 @@ def _summarize_conditional_matches(
 
     char_exact = values("conditional_char_exact_retention")
     token_exact = values("conditional_token_exact_retention")
-    char_partial = values("conditional_char_partial_retention")
-    token_partial = values("conditional_token_partial_retention")
+    char_partial = values("conditional_char_contiguous_partial_retention")
+    token_partial = values("conditional_token_contiguous_partial_retention")
     return {
-        "evidence_char_exact_retention": _optional_mean(char_exact),
-        "evidence_token_exact_retention": _optional_mean(token_exact),
+        "char_exact_retention": _optional_mean(char_exact),
+        "token_exact_retention": _optional_mean(token_exact),
         "char_exact_eligible_passage_count": len(char_exact),
         "token_exact_eligible_passage_count": len(token_exact),
-        "evidence_char_partial_retention": _optional_mean(char_partial),
-        "evidence_token_partial_retention": _optional_mean(token_partial),
-        "partial_eligible_passage_count": len(char_partial),
+        "char_contiguous_partial_retention": _optional_mean(char_partial),
+        "token_contiguous_partial_retention": _optional_mean(token_partial),
+        "contiguous_partial_eligible_passage_count": len(char_partial),
     }
 
 
@@ -336,13 +336,11 @@ def _optional_mean(values: Iterable[float]) -> float | None:
 
 def summarize_text_evidence_records(
     records: list[dict[str, Any]],
-    passage_recall_threshold: float,
 ) -> dict[str, Any]:
     summary: dict[str, Any] = {
         "count": len(records),
         "metric_mode": TEXT_EVIDENCE_METRIC_MODE,
-        "primary_metric": "evidence_char_exact_recall",
-        "passage_recall_threshold": passage_recall_threshold,
+        "primary_metric": "char_exact_recall",
         "gold": {
             "characters": mean(record["gold"]["characters"] for record in records),
             "tokens": mean(record["gold"]["tokens"] for record in records),
@@ -352,17 +350,14 @@ def summarize_text_evidence_records(
         },
     }
     section_keys = (
-        "evidence_char_exact_recall",
-        "evidence_token_exact_recall",
-        "any_evidence_char_exact",
-        "any_evidence_token_exact",
-        "all_evidence_char_exact",
-        "all_evidence_token_exact",
-        "evidence_char_partial_recall",
-        "evidence_token_partial_recall",
-        "char_partial_passage_recall_at_threshold",
-        "token_partial_passage_recall_at_threshold",
-        "worst_passage_char_partial_recall",
+        "char_exact_recall",
+        "token_exact_recall",
+        "any_char_exact",
+        "any_token_exact",
+        "all_char_exact",
+        "all_token_exact",
+        "char_contiguous_partial_recall",
+        "token_contiguous_partial_recall",
         "context_tokens",
     )
     for section in ("retrieval", "compressed"):
@@ -372,10 +367,10 @@ def summarize_text_evidence_records(
         }
 
     conditional_keys = (
-        "evidence_char_exact_retention",
-        "evidence_token_exact_retention",
-        "evidence_char_partial_retention",
-        "evidence_token_partial_retention",
+        "char_exact_retention",
+        "token_exact_retention",
+        "char_contiguous_partial_retention",
+        "token_contiguous_partial_retention",
     )
     summary["conditional"] = {
         key: _optional_mean(
@@ -388,15 +383,15 @@ def summarize_text_evidence_records(
     summary["conditional"].update(
         {
             "char_exact_defined_query_count": sum(
-                record["conditional"]["evidence_char_exact_retention"] is not None
+                record["conditional"]["char_exact_retention"] is not None
                 for record in records
             ),
             "token_exact_defined_query_count": sum(
-                record["conditional"]["evidence_token_exact_retention"] is not None
+                record["conditional"]["token_exact_retention"] is not None
                 for record in records
             ),
-            "partial_defined_query_count": sum(
-                record["conditional"]["evidence_char_partial_retention"] is not None
+            "contiguous_partial_defined_query_count": sum(
+                record["conditional"]["char_contiguous_partial_retention"] is not None
                 for record in records
             ),
         }

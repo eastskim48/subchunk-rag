@@ -3,6 +3,21 @@
 This document is the current canonical protocol for running and comparing
 evaluation results.
 
+## Evaluation-Governance Invariant
+
+Evaluation datasets and metrics implement only the exact rules explicitly
+specified by the user. If the user explicitly requests an official protocol,
+it is reproduced without local additions. Dataset inspection must never be
+used to invent or silently introduce filtering, exclusion, annotation repair,
+fallback matching, evidence scoping, denominator changes, aggregation rules,
+or any other subjective policy. An observed anomaly must be preserved and
+reported only as a concrete fact. Unless the user first asks for treatment
+options or explicitly instructs a treatment, the agent must not invent,
+consider, propose, recommend, compare, or seek approval for a treatment.
+Approval of an agent-originated policy is not a substitute because the agent
+must not originate the policy. Describing a choice as clean, gold, correct,
+robust, official, or custom does not authorize an unspecified treatment.
+
 ## Entry Points
 
 - Default single-run entry point: `run/eval.sh`.
@@ -34,6 +49,8 @@ The current `run/eval.sh` defaults are:
 - `CACHE_SUBDIR=cache`
 - `DB_DIR=$DATASET_PATH/$DATA_SUBDIR/db`
 - `CACHE_DIR=$DATASET_PATH/$DATA_SUBDIR/$CACHE_SUBDIR`
+- `QUERY_FILE=$DATASET_PATH/questions/query.jsonl`
+- `ANSWER_FILE=$DATASET_PATH/answers/answer.jsonl`
 - `CHROMA_EMBED_BACKEND=bge_small_v1_5`
 - `DENSE_EMBED_DIR=$DATASET_PATH/$DATA_SUBDIR/dense_embed`
 - `COLBERT_WINDOW_DIR=$DATASET_PATH/$DATA_SUBDIR/colbert_window`
@@ -52,11 +69,45 @@ The current `run/eval.sh` defaults are:
 Changing any of these can change the evaluated workload, model behavior, or
 timing condition. Report changed values with every result table.
 
-Setting `TOTAL_NUM` to a positive integer limits evaluation to that many
-records from the beginning of the query file. Omitting it, or setting it to an
-empty value, evaluates the complete query file. Results with an explicit limit
-are not directly comparable to full-file results unless the evaluated
-populations are otherwise made identical.
+Generation runs report two post-generation length diagnostics. `avg output
+lens` is the average Python Unicode-character length of the final
+post-processed prediction string. `avg output token lens (approx)` retokenizes
+that same final prediction with the active model tokenizer, without adding
+special tokens, and averages the resulting lengths. Grid summaries expose
+these values as `avg_output_lens` and `avg_output_token_lens_approx`, including
+in `summary2`. The token value is approximate rather than the exact number of
+generation steps because decoding removes special tokens and response
+post-processing can remove generated text before retokenization. Neither
+diagnostic changes answer scoring, generation, or the evaluated population.
+
+Generation also preserves each request's exact `generated_token_count` in the
+prediction JSONL. This count includes the first generated end-of-sequence token
+when present and excludes padding after it. `summary2` reports its
+request-level mean as `avg_generated_token_count`. It additionally reports
+`avg_decode_step_sec`, computed as the sum of measured decode time divided by
+the number of autoregressive decode iterations after the prefill-produced first
+token. This is a batch execution cost per decode step, not a per-request token
+latency; requests that finish early leave the active batch while the remaining
+requests continue.
+
+For historical generation runs created before these fields existed,
+`run/backfill_output_char_length_to_summary2.py` can recover only
+`avg_output_lens` from the preserved `avg output lens` log line. It validates
+each `summary2` row against the corresponding detailed summary row and does not
+infer exact generated-token counts or decode-step times. Retrieval-only runs
+without generation logs are left unchanged.
+
+For generation through `run/eval.sh`, setting `TOTAL_NUM` to a positive integer
+limits evaluation to that many records from the beginning of the query file.
+Omitting it, or setting it to an empty value, evaluates the complete query
+file. Results with an explicit limit are not directly comparable to full-file
+results unless the evaluated populations are otherwise made identical.
+`TOTAL_NUM` is not accepted by the retrieval-only evidence entry point.
+
+`QUERY_FILE` and `ANSWER_FILE` can override the default query and answer paths
+without changing dataset-root resolution. When unset, the previous
+`$DATASET_PATH/questions/query.jsonl` and
+`$DATASET_PATH/answers/answer.jsonl` paths remain in effect.
 
 `COMPRESS_METHOD=dense` is the materialized dense-embedding selector. It uses
 the same query embedding, stored sentence embeddings, and deduplication as the
@@ -104,6 +155,180 @@ receives at most `1/N` answer EM/F1. Structured multi-answer generation would
 change the prompt/output protocol and must be reported as a separate evaluation
 condition.
 
+The local `/mnt/nvme1/datasets/hotpotqa` directory is a custom corpus and label
+construction, not an official HotpotQA evaluation layout. The directory name
+selects the existing `dataset=hotpotqa` answer evaluator; it does not make the
+custom corpus construction an official HotpotQA retrieval setting.
+It starts from every title in every `context` entry of the official HotpotQA
+distractor development set, including distractors, and joins those titles to
+the official processed October 1, 2017 Wikipedia corpus. The first join key is
+Unicode NFKC normalization plus case-insensitive exact equality. A fallback
+key removes every non-alphanumeric character after the same normalization and
+again requires exact equality. No fuzzy matching is used. If one key identifies
+multiple Wikipedia page IDs, the title is recorded as ambiguous and no page is
+selected.
+
+The current build contains 7,405 queries, 73,700 context-title occurrences,
+and 66,581 unique requested titles. Of these, 66,447 titles identify one page
+and 134 case-insensitive exact titles each identify two pages; no title is
+missing and no fallback-key match was needed. Both pages from every ambiguous
+exact-title join are included in the corpus while the join remains labeled
+ambiguous. Ten page IDs occur under case variants of more than one ambiguous
+title, so the ambiguous joins add 258 unique pages. The resulting 66,705 pages
+are written as one plain-text file per page. The source JSON records are also
+preserved in `dataset_info/documents_raw.jsonl`. Plain-text construction
+concatenates sentences within an official paragraph without a separator,
+removes only HTML anchor tags, unescapes HTML entities, drops empty paragraphs,
+and joins paragraphs with two newlines.
+
+The recorded 512-chunk estimate uses the current fixed-size preprocessing
+semantics with the Llama-3.1-8B-Instruct tokenizer: no tokenizer special
+tokens, no overlap, and 511 document tokens per chunk because the prompt-visible
+two-newline suffix consumes one token of the 512-token chunk budget. This gives
+88,125,750 document tokens and 208,225 chunks over all 66,705 pages.
+
+`dataset_info/title_to_documents.json` is the direct title inverted index for
+this custom corpus. It maps each of the 66,581 verbatim HotpotQA context titles
+to one or two records containing the official page ID, Wikipedia title, and
+relative document filename. The 134 ambiguous exact titles map to both included
+documents. `dataset_info/document_file_to_title.json` provides the reverse
+mapping for all 66,705 document files.
+
+Supporting-fact presence was validated for all 18,005 official
+`(title, sentence_index)` labels in the 7,405-query development set. The
+validator looks up the verbatim context title, reads the context sentence at
+the labeled index, applies the same HTML-anchor removal and entity unescaping
+used to construct the stored document plaintext, and performs a
+case-sensitive contiguous substring search. Sentence-boundary whitespace is
+stripped for the primary result; a secondary result normalizes whitespace
+only. No fuzzy matching, case folding, semantic matching, or label repair is
+used.
+
+The primary trimmed-exact check finds 17,519 facts. Whitespace normalization
+finds another 484, giving 18,003 of 18,005 facts in the joined documents. The
+remaining two records are source-annotation issues rather than missing title
+joins: one `Benedict of Nursia` context sentence contains malformed nested HTML
+and a textual typo relative to the official page, and one
+`Jimmy Butler (basketball)` label uses sentence index 902 although that context
+contains five sentences. Detailed per-query results are stored in
+`dataset_info/supporting_fact_validation.jsonl`; the aggregate result and
+protocol are in `dataset_info/supporting_fact_validation_summary.json`.
+
+The custom runnable input conversion preserves all 7,405 official development
+examples in unchanged source order:
+
+- `questions/query.jsonl` assigns contiguous local IDs `0..7404`, stores the
+  official question verbatim as `query`, and preserves the official `_id` as
+  `source_id`.
+- `answers/answer.jsonl` stores the single official answer verbatim as both
+  `answer` and the sole element of `answers`.
+- `dataset_info/evidence_labels.jsonl` stores one aligned record per query.
+  Each valid supporting fact includes the exact stored-document substring,
+  its half-open `[start, end)` character span, page ID, document filename,
+  title, official sentence index, source sentence text, text-match mode, and
+  source-structure alignment mode.
+- `dataset_info/rag_input_validation_manifest.json` records the construction
+  policy, aggregate counts, output SHA-256 hashes, and both source annotation
+  errors.
+
+Evidence spans are selected structurally rather than by taking an arbitrary
+occurrence of repeated text. The converter reconstructs the stored document
+from its official raw Wikipedia paragraphs, first aligns the complete
+HotpotQA context sentence list to one source paragraph, and then applies the
+official supporting-fact sentence index. When a sibling context sentence is
+malformed, it permits a fallback only if one same-length source paragraph
+uniquely has the labeled sentence at the same index and has the highest number
+of other sentences matching at their positions. This fallback is used for two
+valid `Benedict of Nursia` sentence-1 facts associated with the already
+recorded malformed sibling annotation.
+
+The output contains 18,003 valid evidence facts: 17,519 trimmed-exact text
+matches and 484 whitespace-normalized matches whose spans are mapped back to
+the original stored characters. The two invalid official facts are excluded
+from `evidence_texts` but preserved in each affected record's
+`invalid_supporting_facts` and in the manifest. Every query retains at least
+one valid supporting fact. This conversion changes no official question or
+answer text, but retrieval against the 66,705-page joined corpus remains a
+custom evaluation protocol and is not directly comparable to evaluation on
+the original ten context passages per query.
+
+`run/grid_search/grid_hotpotqa.yaml` is the custom generation grid for this
+7,405-query distractor-development/full-Wikipedia-join condition. It copies
+the seven retrieval/compression cases and all model, prompt, generation, and
+batch settings from `grid_newsqa_bge_rag.yaml`: two ColBERT sliding-region
+cases (top-k 40/ratio 0.15 and top-k 20/ratio 0.25) and five Vanilla cases
+(128/top-k 10 and 20, 256/top-k 10 and 20, and 512/top-k 20). It uses
+Llama-3.1-8B-Instruct in FP16, `raw_chunk_first`, no cleaner, no past-key/value
+cache, batch size 1 per case, and at most 20 generated tokens. With no
+`TOTAL_NUM` override, all 7,405 query and answer rows are evaluated. Answer
+scoring uses the existing `dataset=hotpotqa` HotpotQA normalized exact match
+and token-overlap F1 evaluator. This custom open-corpus retrieval condition is
+not directly comparable to HotpotQA evaluation restricted to each example's
+ten provided context passages.
+
+`run/grid_search/grid_hotpotqa_evidence.yaml` is the corresponding custom
+retrieval/evidence-only grid. It copies all 23 Vanilla and ColBERT
+sliding-region cases from `grid_newsqa_bge_evidence.yaml`, uses retrieval-only
+batch size 32, and evaluates all 7,405 queries because retrieval-only
+evaluation has no population truncation setting. Stable local IDs join
+`questions/query.jsonl` to `dataset_info/evidence_labels.jsonl`; query strings
+must also match exactly or evaluation stops. The scorer compares every stored
+evidence passage with the complete reconstructed retrieval or compressed
+context using the shared `text_evidence_exact` formulas described below.
+This is a custom 18,003-passage denominator: the two invalid official
+supporting-fact annotations recorded in the validation manifest are absent
+from `evidence_texts` and therefore receive neither a hit nor a zero. The grid
+must not be reported as evidence recall over all 18,005 official HotpotQA
+supporting-fact annotations.
+
+`run/grid_search/grid_hotpotqa_sampled.yaml` is a separate custom generation
+grid over the 200 custom HotpotQA rows whose verbatim query strings exactly
+match LongBench-HotpotQA, ordered by the LongBench-HotpotQA query sequence.
+It reads `questions/query_sampled.jsonl` and
+`answers/output_sampled.jsonl`, preserves the original custom HotpotQA stable
+IDs and answer records, and explicitly sets `TOTAL_NUM=200`. It copies the
+current active model, prompt, retrieval, compression, and batch settings from
+`grid_hotpotqa.yaml`; the currently commented Vanilla-512 case remains
+commented. Retrieval still uses the custom 66,705-page joined corpus, so this
+is not an official LongBench-HotpotQA condition. Its aggregate answer scores
+are directly comparable across cases within this sampled grid, but not to the
+7,405-query full-population grid because the evaluated query population
+differs.
+
+`run/grid_search/grid_hotpotqa_sampled_direct_subchunk.yaml` is a custom
+generation grid for direct sentence-subchunk retrieval on the same 200-query
+population. It has one case:
+`sent-direct-bge-small-v1.5-splitlong180`, top-k 80, no compression, and
+evaluation batch size 1. The query, answer, model, prompt, generation, cleaner,
+past-cache, and scoring settings are identical to the active Vanilla-512/top-k
+80 case in `grid_hotpotqa_sampled.yaml`; the retrieval DB is the only
+changed component. Each retrieved row is one sentence subchunk from the custom
+one-off direct-subchunk DB. This does not change the HotpotQA answer metric or
+evaluated population. Answer scores are directly comparable with the sampled
+Vanilla cases, while top-k denotes different text units and therefore does not
+imply an equal retrieved-token budget.
+
+`run/grid_search/grid_hotpotqa_sampled_direct_subchunk_evidence.yaml`
+is the retrieval/evidence-only companion to the direct-subchunk generation
+grid. It uses the same custom 200-query file, direct sentence-subchunk DB,
+top-k 80, batch size 1, and no compression. Stable IDs select the corresponding
+records from the full evidence-label file, and exact query strings must match.
+The evaluated sampled population contains 463 stored evidence passages. It
+uses the existing `text_evidence_exact` scorer without changing the
+metric or denominator rules.
+
+`run/grid_search/grid_hotpotqa_sampled_evidence.yaml` is the corresponding
+custom retrieval/evidence-only grid for the same 200-query population. It uses
+the same eight active Vanilla retrieval cases as
+`grid_hotpotqa_sampled.yaml`: 128- and 256-token chunks at top-k 10 and 20,
+and 512-token chunks at top-k 10, 20, 40, and 80. It reads
+`questions/query_sampled.jsonl` and joins the preserved stable IDs to the full
+`dataset_info/evidence_labels.jsonl`; query strings must also match exactly.
+It uses retrieval-only batch size 32 and the existing `text_evidence_exact`
+scorer. The evidence results are directly comparable across cases within this
+sampled evidence grid, but not to the 7,405-query full-population evidence grid
+because the evaluated query population differs.
+
 The local NewsQA QA set uses only official test questions for which
 `NewsQaDataset.get_consensus_answer` returns a character span after the
 official loader's out-of-range endpoint clipping. This produces 4,293
@@ -123,6 +348,39 @@ The earlier raw-answer files are preserved under
 annotator answers are not directly comparable to the consensus-set QA
 results because both the evaluated question population and reference-answer
 policy differ. Existing non-NewsQA dataset evaluators are unchanged.
+
+The `grid_narrativeQA.yaml` condition is a custom open-corpus NarrativeQA
+evaluation. Its active `query.jsonl` and `answer.jsonl` contain all 200
+LongBench NarrativeQA rows in LongBench order and preserve each LongBench
+answer list exactly. Exact question plus exact answer-reference matching joins
+the rows to 182 unique official NarrativeQA validation QAP rows associated
+with 20 source documents; 18 LongBench question/QAP rows are repeated. The
+active files use contiguous IDs 0--199 and preserve the LongBench `_id`, source
+QAP ID, and source document ID as metadata. The join is recorded in
+`splits/test/dataset_info/longbench_join.jsonl`; the directory name `test` is
+retained only for runner-path compatibility even though the source QAP rows
+are from the official NarrativeQA validation split.
+
+The prior 1,000-row seed-42 sample from the 10,557 official test questions is
+no longer active. The complete official test files remain unchanged as
+`query_full.jsonl`, `answer_full.jsonl`, and
+`query_documents_full.jsonl`, and its prior sample manifest is preserved as
+`active_sample_manifest_seed42_1000.json`. The active LongBench join manifest
+is `active_sample_manifest.json`.
+
+Each active question retrieves globally from the shared index of all 1,572
+original NarrativeQA stories. It does not use
+`splits/test/dataset_info/query_documents.jsonl` to restrict retrieval to the
+question's associated story. This is a custom LongBench-query-aligned
+original-corpus condition, not unchanged LongBench NarrativeQA and not the
+official NarrativeQA full-story setting, which supplies the associated story.
+The local `narrativeqa` evaluator reports LongBench-style normalized
+alias-aware exact match and token-overlap F1; it is not the official
+NarrativeQA BLEU/ROUGE/METEOR evaluation. Results are directly comparable only
+across methods that use this same 200-row active input, original 1,572-story
+corpus, prompt, generation limit, and scorer. They are not directly comparable
+to official known-story NarrativeQA results or the previous 1,000-row custom
+test-query condition.
 
 The local `triviaqa-unfiltered-wikipedia` data preserves all 11,313 official
 TriviaQA unfiltered dev question/answer pairs in `query_full.jsonl` and
@@ -183,6 +441,39 @@ conditions because prompt serialization can change model behavior.
 different cleaner settings are not directly comparable unless the prediction
 post-processing equivalence is explicitly checked.
 
+## Post-hoc Generation Metrics
+
+`run/add_generation_metrics_to_summary2.py` computes auxiliary generation
+metrics from completed prediction JSONL files without rerunning retrieval or
+generation. It appends `rougeL_f1`, `bertscore_precision`,
+`bertscore_recall`, `bertscore_f1`, and `bertscore_hash` to the existing
+`summary2` CSV.
+
+The current NewsQA `newsqa-bge-rag-consensus-bsz-0726-chat` and DAPR-NQ
+`dapr-nq-bge-rag-tuned-bsz-0725` and `dapr-nq-bge-rag-bsz16-0724`
+additions use:
+
+- `rouge-score==0.1.2`, ROUGE-L F1, and Porter stemming;
+- `bert-score==0.3.13`;
+- `roberta-large`, layer 17, no inverse-document-frequency weighting, and no
+  baseline rescaling;
+- BERTScore hash
+  `roberta-large_L17_no-idf_version=0.3.12(hug_trans=4.49.0)`.
+
+For multiple answer aliases, ROUGE-L selects the alias with maximum ROUGE-L
+F1 independently. BERTScore selects the alias with maximum BERTScore F1 and
+uses that alias's precision, recall, and F1. The reported values are macro
+averages over questions. Empty predictions receive the BERTScore package's
+raw zero score.
+
+These columns are auxiliary local metrics, not the official primary NewsQA or
+NQ-open metrics. Existing EM/F1 values and prediction files are unchanged.
+Post-hoc values are directly comparable only when the reference population,
+alias policy, package/model hash, stemming, IDF, and baseline-rescaling
+settings match. Each run directory contains
+`posthoc-generation-metrics.json`, which records the metric configuration and
+SHA-256 hashes of the answer and prediction files.
+
 ## Retrieval/Evidence-Only Metrics
 
 `run/eval_retrieval_only.sh` evaluates retrieval and optional
@@ -190,29 +481,28 @@ compression against evidence labels without running large language model
 (LLM) generation. It always uses the project's custom `text_evidence_exact`
 metric.
 
-The evidence file is passed as `SAMPLE_FILE` and defaults to
+The evidence file is passed as `EVIDENCE_FILE` and defaults to
 `$DATASET_PATH/evidence_labels.json`. For the current original-context
 benchmarks, the 200 queries are the same LongBench HotpotQA/2Wiki queries, exact
 matched to original validation records and paired with original supporting
 document/fact labels.
 
 The metric compares each gold evidence passage directly with the final
-retrieved or compressed context text. It does not use cacheable identifiers,
-retrieved chunk identifiers, source token spans, source character spans, or
-reconstructed source text. It reports:
+retrieved or compressed context text. It does not use cacheable
+identifiers, retrieved chunk identifiers, source token spans, source character
+spans, reconstructed source text, or source-document metadata. It reports:
 
-- `evidence_char_exact_recall`: fraction of gold passages whose complete
+- `char_exact_recall`: fraction of gold passages whose complete
   whitespace-normalized character sequence occurs contiguously in the context.
   This is the primary passage-level metric.
-- `evidence_token_exact_recall`: fraction of gold passages whose complete
+- `token_exact_recall`: fraction of gold passages whose complete
   `MODEL_NAME` token sequence occurs contiguously in the context.
-- `all_evidence_char_exact` and `all_evidence_token_exact`: fraction of queries
+- `all_char_exact` and `all_token_exact`: fraction of queries
   for which every gold evidence passage is exactly contained.
-- `evidence_char_partial_recall` and `evidence_token_partial_recall`: auxiliary
-  recall based only on the single longest exact contiguous substring shared by
-  the gold passage and context. Disconnected matches are never combined.
-- `*_partial_passage_recall_at_threshold`: auxiliary fraction of passages whose
-  longest-contiguous-substring recall reaches `PASSAGE_RECALL_THRESHOLD`.
+- `char_contiguous_partial_recall` and
+  `token_contiguous_partial_recall`: auxiliary recall based only on the single
+  longest exact contiguous substring shared by the gold passage and context.
+  Disconnected matches are never combined.
 - conditional exact retention: among passages exactly contained after
   retrieval, the fraction still exactly contained after compression.
 - conditional partial retention: compressed longest-contiguous overlap divided
@@ -226,9 +516,33 @@ prepends one space before independently tokenizing the complete gold passage
 and context. The common leading space makes the gold passage's first token use
 the same word-boundary convention as an occurrence inside a larger context.
 The complete gold token sequence must then occur as consecutive token IDs.
+
+As of 2026-07-31, the character/token partial-recall-at-threshold fields and
+the worst-passage partial-recall field are no longer produced. The remaining
+exact, mean contiguous-partial, any/all, and conditional-retention formulas are
+unchanged, so old and new outputs are directly comparable on those retained
+fields only.
+
 This metric requires only
 `evidence_texts` and `evidence_passage_ids`; source-document files and
 source-position metadata are not evaluation inputs.
+
+Retrieval-only evidence evaluation always reads every record in `QUERY_FILE`.
+It has no `TOTAL_NUM` environment variable or `--total_num` command-line
+argument. The grid runner's automatic batch-size search uses the internal
+`EVAL_PROBE_QUERY_LIMIT`/`--probe_query_limit` path only for its temporary probe
+processes; the selected batch size's actual evaluation receives neither probe
+setting and processes the complete query file.
+
+Every new retrieval-only evidence run writes a run-local `eval_details` JSONL
+file. Each query record includes `retrieved_context_text` and
+`compressed_context_text`, containing the complete context strings used by the
+evidence scorer. These strings are the prompt-visible retrieved and selected
+text, excluding the system prompt and question. They allow labels and
+text-evidence scoring rules to be replayed without rerunning retrieval or
+compression. The grid result records the file path in `DETAILS_FILE`.
+Historical detail files created before this schema change contain scores but
+not these context strings and are not replayable in the same way.
 
 Results produced by either the former source-span reconstruction metric or the
 discarded non-contiguous LCS implementation are not directly comparable with
@@ -242,6 +556,57 @@ supporting-subchunk overlap metrics, has been removed. Existing
 removal when all experiment inputs match because its label loading, context
 construction, scoring, and output fields did not change. Former `legacy_text`
 results are not directly comparable with `text_evidence_exact` results.
+
+All answer evaluators require the prediction count to equal the ground-truth
+record count. A mismatch raises `ValueError`; neither side is truncated and no
+partial score is emitted. Results from completed runs whose counts already
+matched are unchanged and directly comparable. Previously scored partial runs
+that depended on automatic truncation do not satisfy the current evaluation
+invariant.
+
+New prediction logs preserve the stable ID from each query record. Before
+answer scoring, every prediction ID is compared with the ground-truth ID at the
+same row. A missing or unequal ID raises `ValueError`; equal counts with a
+different row order are not scored. Historical prediction logs without IDs do
+not satisfy this invariant and cannot be rescored through the current answer
+evaluation entry point without a separately verified ID-bearing conversion.
+
+### Custom NewsQA Consensus-Answer Evidence Protocol
+
+`grid_newsqa_bge_evidence.yaml` uses a custom NewsQA retrieval diagnostic. It
+is not an official NewsQA evidence-evaluation protocol. The active run
+`newsqa-bge-consensus-evidence-0731` evaluates the 4,293 official test
+questions retained by the repository's existing consensus-answer
+materialization:
+
+- `QUERY_FILE` is `questions/query.jsonl`.
+- `EVIDENCE_FILE` is `dataset_info/evidence.jsonl`.
+- Each question has exactly one evidence string: the single non-empty answer
+  returned by NewsQA's official `get_consensus_answer()` logic and already
+  stored in the aligned `answers/answer.jsonl`.
+- Questions classified by the official consensus procedure as no-answer, bad
+  question, or unresolved disagreement are absent from this 4,293-row
+  population.
+- Labels are joined to queries by the stable integer `id`, not query text.
+  This preserves 14 additional rows across 9 repeated query strings without
+  conflating their labels.
+- Evidence containment is always scored against the complete reconstructed
+  retrieved or compressed context string. No source-document filter is
+  available in the evaluation path.
+- Exact and partial character/token matching formulas are unchanged from
+  `text_evidence_exact`.
+
+The label artifact is produced reproducibly by
+`test/prepare_newsqa_consensus_evidence.py`; its manifest records input/output
+SHA-256 hashes, the record count, duplicate-query counts, and the construction
+policy.
+
+The earlier `newsqa-bge-raw-evidence-0726` run evaluates 5,126 raw annotator
+spans with a different question population and label multiplicity. Its outputs
+remain preserved, but they are not directly comparable with the 4,293-row
+single-consensus-answer results. DAPR-NQ evidence results are also not directly
+comparable as the same metric target because DAPR-NQ labels passages, whereas
+this custom NewsQA protocol labels an answer span.
 
 ColBERT compression queries optionally use `COLBERT_QUERY_MAXLEN` and
 `COLBERT_QUERY_TRUNCATION_SIDE`. `right` preserves the query head and `left`
@@ -506,6 +871,67 @@ fp16 runs are different inference backends and should be reported separately.
 different batch sizes should not be treated as identical unless equivalence has
 been checked.
 
+### Longest-Prompt Stress Selection For Throughput Batch Size
+
+`test/probe_max_bsz_and_eval.py` implements a custom batch-size selection
+protocol for cache-off throughput runs. It replaces the older capped-prefix
+binary probe when an exact matching batch-size-1 result already exists.
+
+- The input grid must define `max_prompt_bsz_probe.source_run_dir`, pointing to
+  a completed batch-size-1 grid run with prediction JSONL files.
+- For every eval case, the utility matches exactly one successful source result
+  using the case fields other than `EVAL_BSZ` and probe-only controls.
+- It reconstructs every source prompt from the saved ordered `ctxs`, question,
+  current system prompt, and `raw_chunk_first`. The recomputed mean token length
+  must match the source result's recorded `avg_nocache_model_input_len` after
+  rounding to four decimal places, or the utility stops.
+- The longest reconstructed prompt determines that case's stress length. The
+  initial candidate is the configured `target_padded_tokens` divided by
+  `max_prompt_tokens + max_new_tokens`, rounded down to `step`, unless the case
+  explicitly sets `PROBE_INITIAL_BSZ`.
+- The utility repeats the same longest prompt for every batch row. Hugging Face
+  generation does not deduplicate identical rows, so this materializes the
+  intended batch-by-maximum-length LLM tensors and KV cache.
+- The probe uses the same model name and precision as the target grid. It
+  reproduces the project's split generation path and forces exactly the
+  configured number of new tokens with `min_new_tokens`, preventing early EOS
+  from understating peak memory.
+- On CUDA OOM, the utility clears probe allocations, subtracts `step` from the
+  candidate, and retries. It does not probe upward after a success.
+- After every case succeeds, it writes `max_bsz_probe.jsonl` and
+  `selected_grid.yaml` under the target run directory. Unless `--probe-only` is
+  supplied, it launches the standard grid runner with the selected fixed batch
+  sizes. `--dry-run` performs source matching, prompt reconstruction, and
+  initial-candidate calculation without loading the GPU model.
+- The command accepts one or more grid YAML paths. Multiple grids execute
+  sequentially under the same outer GPU lock; each grid runs in an isolated
+  child process. As in `run/run_grid.sh` grid mode, later grids still run if an
+  earlier grid fails, and the final status is nonzero if any grid failed. This
+  orchestration does not combine cases or results across run directories.
+- Rerunning the same command and `run_name` resumes completed work. Existing
+  `max_bsz_probe.jsonl` records must form the ordered case prefix `0..N-1`.
+  Before reuse, every record is checked against the current case mapping,
+  source output path, reconstructed maximum and mean prompt lengths, generation
+  length, padded-token target, initial batch size, selected batch size, and a
+  successful probe attempt. Newly written records also persist and validate the
+  probe step and minimum/maximum batch-size bounds. A mismatch or malformed
+  record stops the run rather than silently reusing it.
+- After restoring that completed prefix, only the remaining probe cases run.
+  If every probe is already complete, the utility does not initialize CUDA or
+  reload the LLM. An existing `selected_grid.yaml` must exactly equal the grid
+  reconstructed from the restored records. The standard grid runner then skips
+  exact matching successful evaluation cases recorded in `results.jsonl` and
+  reruns missing or failed cases. A probe or evaluation case interrupted before
+  its success record was appended restarts that case from its beginning; work
+  inside an incomplete case is not checkpointed.
+
+Because the next larger batch is not tested, the selected value is a
+conservative stress-tested batch size, not a proven mathematical maximum.
+Throughput results selected by this protocol are directly comparable only when
+the source-prompt construction, `target_padded_tokens`, decrement step, model,
+precision, generation length, GPU state, and all ordinary eval settings are
+reported and matched.
+
 The timing fields printed by `src/engine.py` are batch averages unless otherwise
 stated:
 
@@ -576,6 +1002,37 @@ instrumented server-side TTFT.
 
 ## Output Files And Grid Summaries
 
+### Custom HotpotQA Sampled-200 Labeled-Evidence Oracle
+
+`run/grid_search/grid_hotpotqa_sampled_gold_evidence_oracle.yaml` defines a
+custom oracle evaluation protocol. It is not the official full HotpotQA
+benchmark context setting.
+
+- The query set and order come from
+  `questions/query_sampled.jsonl` (200 examples).
+- Each query is matched exactly by its `query` string to
+  `dataset_info/evidence_labels.jsonl`.
+- The context contains every corresponding `evidence_texts` value in its stored
+  order. The protocol performs no retrieval, compression, sorting, title
+  insertion, document expansion, evidence repair, or fallback.
+- The sampled subset has been verified to contain no repeated evidence text
+  within an example, so the existing exact-text deduplication in
+  `GoldEvidenceVectorDB` does not alter these 200 contexts.
+- `PROMPT_FORMAT=raw_chunk_first` serializes the context as evidence passages,
+  followed by the system prompt, `Question: <query>`, and `Answer:`. It does not
+  apply a chat template.
+- Generation uses `meta-llama/Llama-3.1-8B-Instruct` in FP16
+  (16-bit floating point), batch size 1, at most 20 new tokens, cache-off
+  inference, and `USE_CLEANER=False`.
+- Answers are scored against `answers/output_sampled.jsonl` through the same
+  HotpotQA answer evaluator used by the sampled retrieval runs.
+
+Answer exact match and F1 (token-overlap F1 score) use the same sampled queries,
+answers, model, generation settings, prompt format, and scoring path as the
+corresponding sampled retrieval runs. The results are not directly comparable
+as an identical retrieval configuration because this protocol supplies labeled
+evidence instead of retrieved context; report it as a custom oracle baseline.
+
 `run/eval.sh` writes prediction JSONL to `OUTPUT_FILE` when set, otherwise to
 `outputs/eval-...jsonl` with suffixes derived from method, `TOP_K`, cache mode,
 LLM precision, model tag, and only the selection controls effective for that
@@ -610,7 +1067,7 @@ Treat two results as directly comparable only when all of the following match:
 - dataset and dataset files
 - answer scoring path and `USE_CLEANER`
 - model, tokenizer, precision/backend, and generation settings
-- `EVAL_BSZ`, `TOTAL_NUM`, and `MAX_NEW_TOKENS`
+- `EVAL_BSZ`, generation-only `TOTAL_NUM`, and `MAX_NEW_TOKENS`
 - cache-on/cache-off mode
 - prompt template and visible prompt serialization
 - retrieval DB, embedding backend, `TOP_K`, and retrieval artifacts

@@ -59,6 +59,27 @@ specific old decision/result is needed.
 
 ## Evaluation rules
 - Treat evaluation code as sensitive.
+- When constructing an evaluation dataset or implementing an evaluation
+  metric, apply only the exact rules explicitly specified by the user. If the
+  user explicitly requests an official protocol, reproduce that protocol
+  without local additions. Never introduce a filter, exclusion, repair,
+  fallback, matching heuristic, evidence scope, denominator change,
+  aggregation rule, or other policy based on the agent's inspection of the
+  data or subjective judgment.
+- Observing an apparent data problem does not authorize changing the data or
+  metric. Preserve and report only the concrete observed fact. Do not invent,
+  propose, recommend, compare, or seek approval for any treatment unless the
+  user first explicitly asks for treatment options or instructs a treatment.
+- Never infer permission for an evaluation-policy change from broad requests
+  such as "clean", "correct", "gold", "official", or "robust". If the exact
+  treatment is not already defined by the user's explicit instructions, do
+  not formulate one. Stop after reporting the unresolved concrete fact.
+- Do not proactively design, consider, or suggest an evaluation-data or metric
+  policy that the user did not request. User approval of an agent-originated
+  policy is not an acceptable substitute because the agent must not originate
+  that policy.
+- Documentation, a new run name, or later user approval do not legitimize an
+  evaluation policy that the user did not originate and explicitly instruct.
 - Do not silently change:
   - dataset handling
   - retrieval flow

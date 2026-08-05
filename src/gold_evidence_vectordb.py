@@ -15,7 +15,9 @@ class GoldEvidenceVectorDB(VectorDB):
 
     def __init__(self, evidence_file: str | Path):
         self.evidence_file = Path(evidence_file)
-        self.labels_by_query = load_text_evidence_labels(self.evidence_file)
+        self.labels_by_query = load_text_evidence_labels(
+            self.evidence_file, key_field="query"
+        )
         self.last_find_timings: dict[str, float] = {}
 
     def find_top_k_docs(

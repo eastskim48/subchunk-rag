@@ -20,6 +20,8 @@ export DATA_SUBDIR="${DATA_SUBDIR:-sent}"
 export CACHE_SUBDIR="${CACHE_SUBDIR:-cache}"
 export DB_DIR="${DB_DIR:-$DATASET_PATH/$DATA_SUBDIR/db}"
 export CACHE_DIR="${CACHE_DIR:-$DATASET_PATH/$DATA_SUBDIR/$CACHE_SUBDIR}"
+export QUERY_FILE="${QUERY_FILE:-$DATASET_PATH/questions/query.jsonl}"
+export ANSWER_FILE="${ANSWER_FILE:-$DATASET_PATH/answers/answer.jsonl}"
 export CHROMA_EMBED_BACKEND="${CHROMA_EMBED_BACKEND:-bge_small_v1_5}"
 export CHROMA_EMBED_DEVICE="${CHROMA_EMBED_DEVICE:-cpu}"
 export COLBERT_WINDOW_DIR="${COLBERT_WINDOW_DIR:-$DATASET_PATH/$DATA_SUBDIR/colbert_window}"
@@ -115,7 +117,7 @@ torchrun --nproc_per_node 1 --master_port "$TORCHRUN_MASTER_PORT" src/entrypoint
     --dataset="$DATASET" \
     --db_dir="$DB_DIR" \
     --cache_dir="$CACHE_DIR" \
-    --query_file="$DATASET_PATH/questions/query.jsonl" \
+    --query_file="$QUERY_FILE" \
     --top_k "$TOP_K" --max_new_tokens "$MAX_NEW_TOKENS" \
     --model_name "$MODEL_NAME" \
     --use_past_cache="$EVAL_USE_PAST_CACHE" \
@@ -124,7 +126,7 @@ torchrun --nproc_per_node 1 --master_port "$TORCHRUN_MASTER_PORT" src/entrypoint
     --model_load_in_4bit "$MODEL_LOAD_IN_4BIT" \
     --prompt_format "$PROMPT_FORMAT" \
     --output_file "$OUTPUT_FILE" \
-    --answer_file "$DATASET_PATH/answers/answer.jsonl" \
+    --answer_file "$ANSWER_FILE" \
     --bsz "$EVAL_BSZ" \
     --use_cleaner "$USE_CLEANER" \
     "${TOTAL_NUM_ARGS[@]}" \

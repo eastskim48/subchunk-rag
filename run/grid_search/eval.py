@@ -70,10 +70,12 @@ class GridRunner:
         self.logs_dir = self.results_dir / "logs"
         self.bsz_probe_dir = self.results_dir / "bsz_probe_outputs"
         self.eval_outputs_dir = self.results_dir / "eval_outputs"
+        self.eval_details_dir = self.results_dir / "eval_details"
         self.results_dir.mkdir(parents=True, exist_ok=True)
         self.logs_dir.mkdir(parents=True, exist_ok=True)
         self.bsz_probe_dir.mkdir(parents=True, exist_ok=True)
         self.eval_outputs_dir.mkdir(parents=True, exist_ok=True)
+        self.eval_details_dir.mkdir(parents=True, exist_ok=True)
         self._write_manifest()
 
     def _load_config(self) -> dict[str, Any]:
@@ -278,7 +280,11 @@ class GridRunner:
         probe_total_num = self._auto_bsz_probe_total_num_for_candidate(candidate)
         probe_env = dict(merged_eval_env)
         probe_env["EVAL_BSZ"] = str(candidate)
-        probe_env["TOTAL_NUM"] = str(probe_total_num)
+        if self.eval_script.name == "eval_retrieval_only.sh":
+            probe_env.pop("TOTAL_NUM", None)
+            probe_env["EVAL_PROBE_QUERY_LIMIT"] = str(probe_total_num)
+        else:
+            probe_env["TOTAL_NUM"] = str(probe_total_num)
         probe_env["OUTPUT_FILE"] = str(
             self.bsz_probe_dir / f"{log_prefix}__bsz={candidate}.jsonl"
         )
@@ -486,52 +492,78 @@ class GridRunner:
                 compressed = obj["compressed"]
                 conditional = obj.get("conditional") or {}
                 selected = compressed if obj.get("compress_method") else retrieval
+
+                def metric(section, new_name, legacy_name):
+                    return section.get(new_name, section.get(legacy_name))
+
                 summary.update(
                     {
                         "count": obj.get("count"),
                         "dataset": obj.get("dataset"),
                         "context_tokens": selected.get("context_tokens"),
-                        "evidence_char_exact_recall": selected.get(
-                            "evidence_char_exact_recall"
+                        "char_exact_recall": metric(
+                            selected, "char_exact_recall", "evidence_char_exact_recall"
                         ),
-                        "evidence_token_exact_recall": selected.get(
-                            "evidence_token_exact_recall"
+                        "token_exact_recall": metric(
+                            selected,
+                            "token_exact_recall",
+                            "evidence_token_exact_recall",
                         ),
-                        "all_evidence_char_exact": selected.get(
-                            "all_evidence_char_exact"
+                        "all_char_exact": metric(
+                            selected, "all_char_exact", "all_evidence_char_exact"
                         ),
-                        "all_evidence_token_exact": selected.get(
-                            "all_evidence_token_exact"
+                        "all_token_exact": metric(
+                            selected, "all_token_exact", "all_evidence_token_exact"
                         ),
-                        "evidence_char_partial_recall": selected.get(
-                            "evidence_char_partial_recall"
+                        "char_contiguous_partial_recall": metric(
+                            selected,
+                            "char_contiguous_partial_recall",
+                            "evidence_char_partial_recall",
                         ),
-                        "evidence_token_partial_recall": selected.get(
-                            "evidence_token_partial_recall"
+                        "token_contiguous_partial_recall": metric(
+                            selected,
+                            "token_contiguous_partial_recall",
+                            "evidence_token_partial_recall",
                         ),
-                        "retrieval_evidence_char_exact_recall": retrieval.get(
-                            "evidence_char_exact_recall"
+                        "retrieval_char_exact_recall": metric(
+                            retrieval,
+                            "char_exact_recall",
+                            "evidence_char_exact_recall",
                         ),
-                        "compressed_evidence_char_exact_recall": compressed.get(
-                            "evidence_char_exact_recall"
+                        "compressed_char_exact_recall": metric(
+                            compressed,
+                            "char_exact_recall",
+                            "evidence_char_exact_recall",
                         ),
-                        "retrieval_evidence_char_partial_recall": retrieval.get(
-                            "evidence_char_partial_recall"
+                        "retrieval_char_contiguous_partial_recall": metric(
+                            retrieval,
+                            "char_contiguous_partial_recall",
+                            "evidence_char_partial_recall",
                         ),
-                        "compressed_evidence_char_partial_recall": compressed.get(
-                            "evidence_char_partial_recall"
+                        "compressed_char_contiguous_partial_recall": metric(
+                            compressed,
+                            "char_contiguous_partial_recall",
+                            "evidence_char_partial_recall",
                         ),
-                        "conditional_evidence_char_exact_retention": conditional.get(
-                            "evidence_char_exact_retention"
+                        "conditional_char_exact_retention": metric(
+                            conditional,
+                            "char_exact_retention",
+                            "evidence_char_exact_retention",
                         ),
-                        "conditional_evidence_token_exact_retention": conditional.get(
-                            "evidence_token_exact_retention"
+                        "conditional_token_exact_retention": metric(
+                            conditional,
+                            "token_exact_retention",
+                            "evidence_token_exact_retention",
                         ),
-                        "conditional_evidence_char_partial_retention": conditional.get(
-                            "evidence_char_partial_retention"
+                        "conditional_char_contiguous_partial_retention": metric(
+                            conditional,
+                            "char_contiguous_partial_retention",
+                            "evidence_char_partial_retention",
                         ),
-                        "conditional_evidence_token_partial_retention": conditional.get(
-                            "evidence_token_partial_retention"
+                        "conditional_token_contiguous_partial_retention": metric(
+                            conditional,
+                            "token_contiguous_partial_retention",
+                            "evidence_token_partial_retention",
                         ),
                         "context_setup_time_sec": obj.get("setup_time_sec"),
                         "context_run_time_sec": obj.get("run_time_sec"),
@@ -562,6 +594,10 @@ class GridRunner:
             "avg_cached_rate": "avg cached rate",
             "avg_nocache_model_input_len": "avg no-cache model input len",
             "avg_nocache_query_only_len": "avg no-cache query-only len",
+            "avg_output_lens": "avg output lens",
+            "avg_output_token_lens_approx": "avg output token lens (approx)",
+            "avg_generated_token_count": "avg generated token count",
+            "avg_decode_step_sec": "avg decode step sec",
         }
         for key, label in metrics.items():
             for line in lines:
@@ -610,6 +646,10 @@ class GridRunner:
                 "throughput_requests_per_sec",
                 "throughput_batches_per_sec",
                 "ttft_per_batch_avg_sec",
+                "avg_output_lens",
+                "avg_output_token_lens_approx",
+                "avg_generated_token_count",
+                "avg_decode_step_sec",
             )
             if key not in row
         ]
@@ -633,6 +673,37 @@ class GridRunner:
     @staticmethod
     def _normalize_summary_row_for_csv(row: dict[str, Any]) -> dict[str, Any]:
         normalized = dict(row)
+        legacy_metric_names = {
+            "evidence_char_exact_recall": "char_exact_recall",
+            "evidence_token_exact_recall": "token_exact_recall",
+            "all_evidence_char_exact": "all_char_exact",
+            "all_evidence_token_exact": "all_token_exact",
+            "evidence_char_partial_recall": "char_contiguous_partial_recall",
+            "evidence_token_partial_recall": "token_contiguous_partial_recall",
+            "retrieval_evidence_char_exact_recall": "retrieval_char_exact_recall",
+            "compressed_evidence_char_exact_recall": "compressed_char_exact_recall",
+            "retrieval_evidence_char_partial_recall": (
+                "retrieval_char_contiguous_partial_recall"
+            ),
+            "compressed_evidence_char_partial_recall": (
+                "compressed_char_contiguous_partial_recall"
+            ),
+            "conditional_evidence_char_exact_retention": (
+                "conditional_char_exact_retention"
+            ),
+            "conditional_evidence_token_exact_retention": (
+                "conditional_token_exact_retention"
+            ),
+            "conditional_evidence_char_partial_retention": (
+                "conditional_char_contiguous_partial_retention"
+            ),
+            "conditional_evidence_token_partial_retention": (
+                "conditional_token_contiguous_partial_retention"
+            ),
+        }
+        for legacy_name, current_name in legacy_metric_names.items():
+            if current_name not in normalized and legacy_name in normalized:
+                normalized[current_name] = normalized[legacy_name]
         if normalized.get("COMPRESS_METHOD") in {None, ""} and normalized.get(
             "DATA_SUBDIR"
         ):
@@ -659,6 +730,10 @@ class GridRunner:
             "input_len": input_len,
             "exact_match": row.get("exact_match"),
             "f1": row.get("f1"),
+            "avg_output_lens": row.get("avg_output_lens"),
+            "avg_output_token_lens_approx": row.get("avg_output_token_lens_approx"),
+            "avg_generated_token_count": row.get("avg_generated_token_count"),
+            "avg_decode_step_sec": row.get("avg_decode_step_sec"),
             "prefill_per_batch_avg_sec": row.get("prefill_per_batch_avg_sec"),
             "decode_per_batch_avg_sec": row.get("decode_per_batch_avg_sec"),
             "elapsed_sec": row.get("elapsed_sec"),
@@ -680,6 +755,10 @@ class GridRunner:
             "input_len",
             "exact_match",
             "f1",
+            "avg_output_lens",
+            "avg_output_token_lens_approx",
+            "avg_generated_token_count",
+            "avg_decode_step_sec",
             "prefill_per_batch_avg_sec",
             "decode_per_batch_avg_sec",
             "elapsed_sec",
@@ -701,8 +780,7 @@ class GridRunner:
         rows: list[dict[str, Any]],
     ) -> list[str] | None:
         has_text_evidence = any(
-            "evidence_char_exact_recall" in row and "evidence_token_exact_recall" in row
-            for row in rows
+            "char_exact_recall" in row and "token_exact_recall" in row for row in rows
         )
         if not has_text_evidence:
             return None
@@ -719,25 +797,26 @@ class GridRunner:
             "FINAL_TOKEN_BUDGET",
             "count",
             "context_tokens",
-            "evidence_char_exact_recall",
-            "evidence_token_exact_recall",
-            "all_evidence_char_exact",
-            "all_evidence_token_exact",
-            "evidence_char_partial_recall",
-            "evidence_token_partial_recall",
-            "retrieval_evidence_char_exact_recall",
-            "compressed_evidence_char_exact_recall",
-            "retrieval_evidence_char_partial_recall",
-            "compressed_evidence_char_partial_recall",
-            "conditional_evidence_char_exact_retention",
-            "conditional_evidence_token_exact_retention",
-            "conditional_evidence_char_partial_retention",
-            "conditional_evidence_token_partial_retention",
+            "char_exact_recall",
+            "token_exact_recall",
+            "all_char_exact",
+            "all_token_exact",
+            "char_contiguous_partial_recall",
+            "token_contiguous_partial_recall",
+            "retrieval_char_exact_recall",
+            "compressed_char_exact_recall",
+            "retrieval_char_contiguous_partial_recall",
+            "compressed_char_contiguous_partial_recall",
+            "conditional_char_exact_retention",
+            "conditional_token_exact_retention",
+            "conditional_char_contiguous_partial_retention",
+            "conditional_token_contiguous_partial_retention",
             "context_setup_time_sec",
             "context_run_time_sec",
             "elapsed_sec",
             "eval_log_file",
             "OUTPUT_FILE",
+            "DETAILS_FILE",
         ]
         return [field for field in candidates if any(field in row for row in rows)]
 
@@ -864,6 +943,14 @@ class GridRunner:
                         "OUTPUT_FILE",
                         str(self.eval_outputs_dir / f"{attempt_log_prefix}.jsonl"),
                     )
+                    if self.eval_script.name == "eval_retrieval_only.sh":
+                        attempt_eval_env.setdefault(
+                            "DETAILS_FILE",
+                            str(
+                                self.eval_details_dir
+                                / f"{attempt_log_prefix}__contexts.jsonl"
+                            ),
+                        )
                     eval_stage = self._run_script(
                         self.eval_script, dataset, attempt_eval_env, attempt_log_prefix
                     )
@@ -882,6 +969,10 @@ class GridRunner:
                     if eval_stage.returncode == 0:
                         log_prefix = attempt_log_prefix
                         merged_eval_env["OUTPUT_FILE"] = attempt_eval_env["OUTPUT_FILE"]
+                        if "DETAILS_FILE" in attempt_eval_env:
+                            merged_eval_env["DETAILS_FILE"] = attempt_eval_env[
+                                "DETAILS_FILE"
+                            ]
                         break
                     if auto_bsz is None or not self._is_oom_failure(eval_stage.stdout):
                         log_prefix = attempt_log_prefix
@@ -937,6 +1028,8 @@ class GridRunner:
                     "EVAL_BSZ": merged_eval_env.get("EVAL_BSZ"),
                     "OUTPUT_FILE": merged_eval_env.get("OUTPUT_FILE"),
                 }
+                if "DETAILS_FILE" in merged_eval_env:
+                    result["DETAILS_FILE"] = merged_eval_env["DETAILS_FILE"]
                 result.update(preprocess_env)
                 result.update(eval_env)
                 result.update(summary)

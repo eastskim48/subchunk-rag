@@ -213,6 +213,25 @@ def load_predictions(prediction_file: str, use_clean_prediction: bool) -> list[s
     ]
 
 
+def validate_aligned_record_ids(
+    prediction_records: list[dict], ground_truth_records: list[dict]
+) -> None:
+    for row_index, (prediction_record, ground_truth_record) in enumerate(
+        zip(prediction_records, ground_truth_records)
+    ):
+        if "id" not in prediction_record:
+            raise ValueError(f"prediction record at row {row_index} is missing id")
+        if "id" not in ground_truth_record:
+            raise ValueError(f"ground-truth record at row {row_index} is missing id")
+        prediction_id = prediction_record["id"]
+        ground_truth_id = ground_truth_record["id"]
+        if prediction_id != ground_truth_id:
+            raise ValueError(
+                f"prediction/ground-truth ID mismatch at row {row_index}: "
+                f"{prediction_id!r} != {ground_truth_id!r}"
+            )
+
+
 class BaseEvaluator(ABC):
     """Common record-level evaluation loop for dataset-specific scorers."""
 
@@ -233,10 +252,12 @@ class BaseEvaluator(ABC):
         ground_truth_records: list[dict],
         show_examples: int = 10,
     ) -> dict:
-        if len(predictions) < len(ground_truth_records):
-            ground_truth_records = ground_truth_records[: len(predictions)]
-        elif len(predictions) > len(ground_truth_records):
-            predictions = predictions[: len(ground_truth_records)]
+        if len(predictions) != len(ground_truth_records):
+            raise ValueError(
+                "prediction/ground-truth count mismatch: "
+                f"{len(predictions)} predictions != "
+                f"{len(ground_truth_records)} ground-truth records"
+            )
 
         em_scores = []
         f1_scores = []
@@ -723,9 +744,20 @@ def evaluate(
     if use_clean_prediction is not None:
         use_cleaner = use_clean_prediction
 
-    predictions = load_predictions(prediction_file, use_clean_prediction=use_cleaner)
+    prediction_records = load_json_records(prediction_file)
     ground_truth_records = load_json_records(ground_truth_file)
     evaluator = build_evaluator(dataset)
+    if len(prediction_records) != len(ground_truth_records):
+        raise ValueError(
+            "prediction/ground-truth count mismatch: "
+            f"{len(prediction_records)} predictions != "
+            f"{len(ground_truth_records)} ground-truth records"
+        )
+    validate_aligned_record_ids(prediction_records, ground_truth_records)
+    predictions = [
+        extract_prediction_from_record(record, use_cleaner)
+        for record in prediction_records
+    ]
     metrics = evaluator.evaluate_records(
         predictions=predictions,
         ground_truth_records=ground_truth_records,

@@ -58,12 +58,38 @@ class DenseEmbeddingBackendTest(unittest.TestCase):
 
     def test_chroma_backend_names_are_bound_to_expected_models(self):
         self.assertEqual(
+            ChromaDB.DEFAULT_EMBED_BACKEND,
+            ChromaDB.BGE_SMALL_EMBED_BACKEND,
+        )
+        self.assertEqual(
             ChromaDB.DENSE_EMBED_BACKENDS["bge_small_v1_5"],
             BGE_SMALL_MODEL,
         )
         self.assertEqual(
             ChromaDB.DENSE_EMBED_BACKENDS["e5_small_v2"],
             E5_SMALL_MODEL,
+        )
+
+    def test_chroma_implicit_backend_uses_bge_small(self):
+        class FakeClient:
+            @staticmethod
+            def get_or_create_collection(**kwargs):
+                return kwargs
+
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch("vectordb.chromadb.PersistentClient", return_value=FakeClient()),
+            patch("vectordb.DenseEmbeddingFunction") as embedding_function,
+        ):
+            ChromaDB._get_chroma_client(
+                "/tmp/not-used",
+                embedding_device="cpu",
+                embedding_batch_size=32,
+            )
+
+        embedding_function.assert_called_once_with(
+            model_name=BGE_SMALL_MODEL,
+            function_name="bge_small_v1_5",
         )
 
     def test_chroma_dense_backend_does_not_mutate_shared_hnsw_config(self):

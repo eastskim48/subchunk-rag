@@ -9,7 +9,7 @@ from transformers import DynamicCache
 from chunk import RetrievableChunk
 
 from vectordb import VectorDB
-from utils import parse_json_query
+from utils import parse_json_query_record
 from model import LLMModel
 from compressor.factory import compress_docs, initialize_compressor
 import json
@@ -246,6 +246,8 @@ class QueryProcessor:
             "batch_padded_cache_lengths": batch_padded_cache_lengths,
             "batch_padded_prefill_total_lengths": batch_padded_prefill_total_lengths,
             "model_input_lengths": list(time_log.model_input_lengths or []),
+            "generated_token_counts": list(time_log.generated_token_counts or []),
+            "decode_steps": int(time_log.decode_steps),
             "nocache_prompt_stats": nocache_prompt_stats,
         }
 
@@ -278,6 +280,9 @@ class QueryProcessor:
         batch_padded_cache_lens = []
         batch_padded_prefill_total_lens = []
         output_lens = []
+        output_token_lens_approx = []
+        generated_token_counts = []
+        batch_decode_steps = []
         nocache_runtime_prompt_lens = []
         nocache_query_lens = []
         nocache_retained_chunk_counts = []
@@ -293,7 +298,7 @@ class QueryProcessor:
         with open(self.query_file, encoding="utf-8") as f:
             warmup_line = next(f, None)
             if warmup_line is not None:
-                warmup_query = parse_json_query(warmup_line)
+                warmup_query = parse_json_query_record(warmup_line)["query"]
                 warmup_result = self._run_batch(
                     batch_queries=[warmup_query],
                     batch_bsz=1,
@@ -304,9 +309,11 @@ class QueryProcessor:
 
         with open(self.query_file, encoding="utf-8") as f:
             batch_queries = []
+            batch_query_ids = []
             for line in tqdm(islice(f, total_num), total=total_num):
-                parsed_query = parse_json_query(line)
-                batch_queries.append(parsed_query)
+                query_record = parse_json_query_record(line)
+                batch_query_ids.append(query_record["id"])
+                batch_queries.append(query_record["query"])
 
                 if len(batch_queries) == bsz:
                     batch_count += 1
@@ -353,23 +360,44 @@ class QueryProcessor:
                     batch_latency = batch_result["batch_latency"]
                     time_log = batch_result["time_log"]
                     generated_texts = batch_result["generated_texts"]
+                    current_generated_token_counts = batch_result[
+                        "generated_token_counts"
+                    ]
                     batch_top_k_docs = batch_result["batch_top_k_docs"]
                     batch_latencies.append(batch_latency)
+                    batch_decode_steps.append(batch_result["decode_steps"])
                     elapsed += batch_latency
+                    generated_token_counts.extend(current_generated_token_counts)
                     output_lens.extend(len(g) for g in generated_texts)
+                    output_token_lens_approx.extend(
+                        len(
+                            self.model.tokenizer.encode(
+                                g,
+                                add_special_tokens=False,
+                            )
+                        )
+                        for g in generated_texts
+                    )
 
                     with open(self.output_file, "a", encoding="utf-8") as lf:
-                        for query, docs, text in zip(
-                            batch_queries, batch_top_k_docs, generated_texts
+                        for query_id, query, docs, text, generated_token_count in zip(
+                            batch_query_ids,
+                            batch_queries,
+                            batch_top_k_docs,
+                            generated_texts,
+                            current_generated_token_counts,
                         ):
                             log_entry = {
+                                "id": query_id,
                                 "question": query,
                                 "ctxs": self._ctxs_for_output(docs),
                                 "prediction": text,
+                                "generated_token_count": generated_token_count,
                             }
                             lf.write(json.dumps(log_entry, ensure_ascii=False) + "\n")
 
                     batch_queries = []
+                    batch_query_ids = []
                     prefill_time += time_log.prefill
                     decode_time += time_log.decode
 
@@ -418,19 +446,37 @@ class QueryProcessor:
                 batch_latency = batch_result["batch_latency"]
                 time_log = batch_result["time_log"]
                 generated_texts = batch_result["generated_texts"]
+                current_generated_token_counts = batch_result["generated_token_counts"]
                 batch_top_k_docs = batch_result["batch_top_k_docs"]
                 batch_latencies.append(batch_latency)
+                batch_decode_steps.append(batch_result["decode_steps"])
                 elapsed += batch_latency
+                generated_token_counts.extend(current_generated_token_counts)
                 output_lens.extend(len(g) for g in generated_texts)
+                output_token_lens_approx.extend(
+                    len(
+                        self.model.tokenizer.encode(
+                            g,
+                            add_special_tokens=False,
+                        )
+                    )
+                    for g in generated_texts
+                )
 
                 with open(self.output_file, "a", encoding="utf-8") as lf:
-                    for query, docs, text in zip(
-                        batch_queries, batch_top_k_docs, generated_texts
+                    for query_id, query, docs, text, generated_token_count in zip(
+                        batch_query_ids,
+                        batch_queries,
+                        batch_top_k_docs,
+                        generated_texts,
+                        current_generated_token_counts,
                     ):
                         log_entry = {
+                            "id": query_id,
                             "question": query,
                             "ctxs": self._ctxs_for_output(docs),
                             "prediction": text,
+                            "generated_token_count": generated_token_count,
                         }
                         lf.write(json.dumps(log_entry, ensure_ascii=False) + "\n")
 
@@ -553,6 +599,19 @@ class QueryProcessor:
             flush=True,
         )
         print(f"avg output lens: {sum(output_lens)/len(output_lens)}")
+        print(
+            "avg output token lens (approx): "
+            f"{sum(output_token_lens_approx) / len(output_token_lens_approx)}"
+        )
+        print(
+            "avg generated token count: "
+            f"{sum(generated_token_counts) / len(generated_token_counts)}"
+        )
+        total_decode_steps = sum(batch_decode_steps)
+        avg_decode_step_sec = (
+            decode_time / total_decode_steps if total_decode_steps > 0 else 0.0
+        )
+        print(f"avg decode step sec: {avg_decode_step_sec}")
         print(
             f"time per batch| total: {elapsed:.4f}, avg: {elapsed / batch_count:.4f}",
             flush=True,

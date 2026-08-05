@@ -174,11 +174,10 @@ For example:
 ```bash
 DATASET=dapr-nq-open \
 DATA_SUBDIR=sent-bge-small-v1.5-512-splitlong180 \
-SAMPLE_FILE=/mnt/nvme1/datasets/dapr-nq-open/dataset_info/evidence_labels.jsonl \
+EVIDENCE_FILE=/mnt/nvme1/datasets/dapr-nq-open/dataset_info/evidence_labels.jsonl \
 COMPRESS_METHOD=colbert_sliding_region \
 TOP_K=20 \
 RETAIN_TOKEN_RATIO=0.25 \
-TOTAL_NUM=2390 \
 EVAL_BSZ=32 \
 ./run/eval_retrieval_only.sh
 ```

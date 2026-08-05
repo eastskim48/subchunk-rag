@@ -24,6 +24,8 @@ class InferenceTimeLog:
     prefill: float
     decode: float
     model_input_lengths: Optional[List[int]] = None
+    generated_token_counts: Optional[List[int]] = None
+    decode_steps: int = 0
 
 
 class LLMModel:
@@ -389,7 +391,7 @@ class LLMModel:
         prefill_attention_mask: torch.Tensor,
         first_token_ids: torch.Tensor,
         max_new_tokens: int,
-    ) -> List[torch.Tensor]:
+    ) -> Tuple[List[torch.Tensor], int]:
         """Greedily decode a batch whose prompt prefix is already cached."""
 
         num_requests = first_token_ids.shape[0]
@@ -410,10 +412,13 @@ class LLMModel:
         active_mask = first_token_ids.squeeze(-1) != eos_token_id
         active_request_indices = torch.nonzero(active_mask, as_tuple=False).squeeze(-1)
         if active_request_indices.numel() == 0:
-            return [
-                generated_tokens[idx, : int(generated_lengths[idx])].detach().cpu()
-                for idx in range(num_requests)
-            ]
+            return (
+                [
+                    generated_tokens[idx, : int(generated_lengths[idx])].detach().cpu()
+                    for idx in range(num_requests)
+                ],
+                0,
+            )
 
         active_caches = self._select_cache_rows(prefilled_past_key_values, active_mask)
         active_attention_mask = prefill_attention_mask[active_mask]
@@ -424,6 +429,7 @@ class LLMModel:
             device=device,
         )
         padded_cache_length = int(prefilled_past_key_values[0][0].shape[2])
+        decode_steps = 0
 
         for _ in range(max_new_tokens - 1):
             if next_token_id.numel() == 0:
@@ -456,6 +462,7 @@ class LLMModel:
                 past_key_values=active_caches,
                 return_dict=True,
             )
+            decode_steps += 1
 
             next_token_id = outputs.logits[:, -1, :].argmax(dim=-1, keepdim=True)
             generated_tokens[
@@ -478,10 +485,26 @@ class LLMModel:
             active_attention_mask = active_attention_mask[active_local_mask]
             active_caches = self._select_cache_rows(active_caches, active_local_mask)
 
-        return [
-            generated_tokens[idx, : int(generated_lengths[idx])].detach().cpu()
-            for idx in range(num_requests)
-        ]
+        return (
+            [
+                generated_tokens[idx, : int(generated_lengths[idx])].detach().cpu()
+                for idx in range(num_requests)
+            ],
+            decode_steps,
+        )
+
+    def _generated_token_counts(self, generated_answers) -> List[int]:
+        """Count generated IDs through the first EOS, including that EOS."""
+
+        eos_token_id = self.tokenizer.eos_token_id
+        counts = []
+        for answer in generated_answers:
+            token_ids = answer.tolist() if hasattr(answer, "tolist") else list(answer)
+            if eos_token_id is not None and eos_token_id in token_ids:
+                counts.append(token_ids.index(eos_token_id) + 1)
+            else:
+                counts.append(len(token_ids))
+        return counts
 
     def generate_response(
         self,
@@ -644,8 +667,11 @@ class LLMModel:
                     top_k=None,
                 )
                 generated_answers = outputs.sequences[:, prompt_length:]
+                decode_steps = int(
+                    outputs.sequences.shape[1] - output_tokens.sequences.shape[1]
+                )
             else:
-                generated_answers = self._decode_with_prefilled_cache(
+                generated_answers, decode_steps = self._decode_with_prefilled_cache(
                     prefilled_past_key_values=past_key_values,
                     effective_lengths=effective_lengths,
                     prefill_attention_mask=prefill_attention_mask,
@@ -657,9 +683,15 @@ class LLMModel:
             torch.cuda.synchronize()
         end_decode = time.perf_counter()
         unit_decode = end_decode - start_decode
+        generated_answer_ids = (
+            generated_answers.detach().cpu().tolist()
+            if isinstance(generated_answers, torch.Tensor)
+            else [answer.tolist() for answer in generated_answers]
+        )
+        generated_token_counts = self._generated_token_counts(generated_answer_ids)
 
         generated_text = self.tokenizer.batch_decode(
-            [answer.tolist() for answer in generated_answers],
+            generated_answer_ids,
             skip_special_tokens=True,
         )
 
@@ -669,6 +701,8 @@ class LLMModel:
                 decode=unit_decode,
                 prefill=unit_prefill,
                 model_input_lengths=[int(length) for length in model_input_lengths],
+                generated_token_counts=generated_token_counts,
+                decode_steps=decode_steps,
             ),
             responses,
         )

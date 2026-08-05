@@ -42,9 +42,36 @@ class TextEvidenceCoverageTest(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            labels = load_text_evidence_labels(path)
+            labels = load_text_evidence_labels(path, key_field="query")
 
             self.assertEqual(set(labels), {"q1", "q2"})
+
+    def test_loads_repeated_query_texts_by_stable_id(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "labels.jsonl"
+            path.write_text(
+                "\n".join(
+                    [
+                        (
+                            '{"id":7,"query":"repeated",'
+                            '"evidence_passage_ids":["7-0"],'
+                            '"evidence_texts":["first"]}'
+                        ),
+                        (
+                            '{"id":9,"query":"repeated",'
+                            '"evidence_passage_ids":["9-0"],'
+                            '"evidence_texts":["second"]}'
+                        ),
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            labels = load_text_evidence_labels(path)
+
+            self.assertEqual(set(labels), {7, 9})
+            self.assertEqual(labels[7]["evidence_texts"], ["first"])
+            self.assertEqual(labels[9]["evidence_texts"], ["second"])
 
     def test_longest_common_substring_requires_contiguity(self):
         self.assertEqual(
@@ -66,10 +93,7 @@ class TextEvidenceCoverageTest(unittest.TestCase):
             "evidence_passage_ids": ["0-0"],
             "evidence_texts": ["cdefgh"],
         }
-        scorer = TextEvidenceCoverageScorer(
-            metric_tokenizer=CharacterTokenizer(),
-            passage_recall_threshold=0.8,
-        )
+        scorer = TextEvidenceCoverageScorer(metric_tokenizer=CharacterTokenizer())
 
         score = scorer.score(
             label=label,
@@ -77,27 +101,36 @@ class TextEvidenceCoverageTest(unittest.TestCase):
             compressed_context="xxcdefyy",
         )
 
-        self.assertEqual(score["retrieval"]["evidence_char_exact_recall"], 1.0)
-        self.assertEqual(score["retrieval"]["evidence_token_exact_recall"], 1.0)
-        self.assertEqual(score["compressed"]["evidence_char_exact_recall"], 0.0)
-        self.assertEqual(score["compressed"]["evidence_token_exact_recall"], 0.0)
+        self.assertEqual(score["retrieval"]["char_exact_recall"], 1.0)
+        self.assertEqual(score["retrieval"]["token_exact_recall"], 1.0)
+        self.assertEqual(score["compressed"]["char_exact_recall"], 0.0)
+        self.assertEqual(score["compressed"]["token_exact_recall"], 0.0)
         self.assertAlmostEqual(
-            score["compressed"]["evidence_char_partial_recall"], 4 / 6
+            score["compressed"]["char_contiguous_partial_recall"], 4 / 6
         )
         self.assertAlmostEqual(
-            score["compressed"]["evidence_token_partial_recall"], 4 / 7
+            score["compressed"]["token_contiguous_partial_recall"], 4 / 7
         )
-        self.assertEqual(score["conditional"]["evidence_char_exact_retention"], 0.0)
+        self.assertEqual(score["conditional"]["char_exact_retention"], 0.0)
         self.assertAlmostEqual(
-            score["conditional"]["evidence_char_partial_retention"], 4 / 6
+            score["conditional"]["char_contiguous_partial_retention"], 4 / 6
         )
 
         score["retrieval"]["context_tokens"] = 20
         score["compressed"]["context_tokens"] = 8
-        summary = summarize_text_evidence_records([score], passage_recall_threshold=0.8)
-        self.assertEqual(summary["primary_metric"], "evidence_char_exact_recall")
-        self.assertEqual(summary["retrieval"]["all_evidence_char_exact"], 1.0)
-        self.assertEqual(summary["compressed"]["all_evidence_char_exact"], 0.0)
+        summary = summarize_text_evidence_records([score])
+        self.assertEqual(summary["primary_metric"], "char_exact_recall")
+        self.assertEqual(summary["retrieval"]["all_char_exact"], 1.0)
+        self.assertEqual(summary["compressed"]["all_char_exact"], 0.0)
+        self.assertNotIn(
+            "char_contiguous_partial_recall_at_threshold", score["compressed"]
+        )
+        self.assertNotIn(
+            "token_contiguous_partial_recall_at_threshold", score["compressed"]
+        )
+        self.assertNotIn(
+            "worst_passage_char_contiguous_partial_recall", score["compressed"]
+        )
 
     def test_scattered_characters_do_not_count_as_exact_or_partial_sequence(self):
         label = {
@@ -113,10 +146,10 @@ class TextEvidenceCoverageTest(unittest.TestCase):
             compressed_context="a1b2c3d4e5f6g7h",
         )
 
-        self.assertEqual(score["retrieval"]["evidence_char_exact_recall"], 0.0)
-        self.assertEqual(score["retrieval"]["evidence_token_exact_recall"], 0.0)
-        self.assertEqual(score["retrieval"]["evidence_char_partial_recall"], 1 / 8)
-        self.assertEqual(score["retrieval"]["evidence_token_partial_recall"], 2 / 9)
+        self.assertEqual(score["retrieval"]["char_exact_recall"], 0.0)
+        self.assertEqual(score["retrieval"]["token_exact_recall"], 0.0)
+        self.assertEqual(score["retrieval"]["char_contiguous_partial_recall"], 1 / 8)
+        self.assertEqual(score["retrieval"]["token_contiguous_partial_recall"], 2 / 9)
 
     def test_whitespace_runs_are_normalized_but_inserted_separator_is_not_removed(self):
         label = {
@@ -141,8 +174,8 @@ class TextEvidenceCoverageTest(unittest.TestCase):
             compressed_context="small pox",
         )
 
-        self.assertEqual(normalized["retrieval"]["evidence_char_exact_recall"], 1.0)
-        self.assertEqual(separated["retrieval"]["evidence_char_exact_recall"], 0.0)
+        self.assertEqual(normalized["retrieval"]["char_exact_recall"], 1.0)
+        self.assertEqual(separated["retrieval"]["char_exact_recall"], 0.0)
 
     def test_multiple_passages_report_passage_and_all_evidence_exact_recall(self):
         label = {
@@ -158,9 +191,9 @@ class TextEvidenceCoverageTest(unittest.TestCase):
             compressed_context="alpha only",
         )
 
-        self.assertEqual(score["retrieval"]["evidence_char_exact_recall"], 0.5)
-        self.assertEqual(score["retrieval"]["any_evidence_char_exact"], 1.0)
-        self.assertEqual(score["retrieval"]["all_evidence_char_exact"], 0.0)
+        self.assertEqual(score["retrieval"]["char_exact_recall"], 0.5)
+        self.assertEqual(score["retrieval"]["any_char_exact"], 1.0)
+        self.assertEqual(score["retrieval"]["all_char_exact"], 0.0)
 
     def test_source_metadata_is_not_required_or_checked(self):
         label = {
@@ -178,8 +211,8 @@ class TextEvidenceCoverageTest(unittest.TestCase):
             compressed_context="evidence",
         )
 
-        self.assertEqual(score["retrieval"]["evidence_char_exact_recall"], 1.0)
-        self.assertEqual(score["compressed"]["evidence_char_exact_recall"], 1.0)
+        self.assertEqual(score["retrieval"]["char_exact_recall"], 1.0)
+        self.assertEqual(score["compressed"]["char_exact_recall"], 1.0)
 
 
 if __name__ == "__main__":
