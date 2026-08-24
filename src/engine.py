@@ -66,7 +66,6 @@ class QueryProcessor:
         if self.use_past_cache and self.compress in {
             "provence",
             "exit",
-            "carrot",
             "xrag_jina",
             "xrag_jina_cass",
         }:

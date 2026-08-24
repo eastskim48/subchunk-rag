@@ -17,7 +17,6 @@ from compressor.methods.dense import (
     DenseSlidingRegionMaxCompressor,
     DenseSlidingRegionAvgCompressor,
 )
-from compressor.methods.carrot import CARROTCompressor
 from compressor.methods.ml_selector import EXITCompressor, ProvenceCompressor
 from compressor.methods.summarization import Summarizer
 from compressor.methods.xrag import (
@@ -45,7 +44,6 @@ COMPRESSOR_TYPES = {
     "rerank_and_region": ColBERTRerankAndRegionCompressor,
     "exit": EXITCompressor,
     "provence": ProvenceCompressor,
-    "carrot": CARROTCompressor,
     "xrag_jina": XRAGJinaRerankerCompressor,
     "xrag_jina_cass": XRAGJinaCASSCompressor,
 }

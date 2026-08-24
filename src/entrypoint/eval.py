@@ -59,7 +59,6 @@ def main(
     if use_past_cache and compress_method in {
         "provence",
         "exit",
-        "carrot",
         "xrag_jina",
         "xrag_jina_cass",
     }:

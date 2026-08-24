@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import itertools
 import json
 import os
@@ -23,6 +24,8 @@ class CompletedStage:
 
 
 class GridRunner:
+    _MAX_ARTIFACT_PREFIX_BYTES = 180
+
     def __init__(self, config_path: str):
         self.config_path = Path(config_path)
         self.repo_root = Path(__file__).resolve().parents[2]
@@ -54,7 +57,7 @@ class GridRunner:
             k: self._stringify(v)
             for k, v in self.config.get("eval_fixed_env", {}).items()
         }
-        self.preprocess_groups = self.config.get("preprocess_groups", [])
+        self.eval_groups = self.config.get("eval_groups", [{"name": "default"}])
         self.eval_axes = self.config.get("eval_axes", {})
         self.eval_cases = self.config.get("eval_cases", [])
         self._validate_eval_config()
@@ -99,7 +102,7 @@ class GridRunner:
             "fixed_env": self.fixed_env,
             "eval_fixed_env": self.eval_fixed_env,
             "auto_eval_bsz": self.config.get("auto_eval_bsz", {}),
-            "preprocess_groups": self.preprocess_groups,
+            "eval_groups": self.eval_groups,
             "eval_axes": self.eval_axes,
             "eval_cases": self.eval_cases,
         }
@@ -122,6 +125,17 @@ class GridRunner:
         if value is None:
             return ""
         return str(value)
+
+    @classmethod
+    def _compact_artifact_prefix(cls, prefix: str) -> str:
+        encoded = prefix.encode("utf-8")
+        if len(encoded) <= cls._MAX_ARTIFACT_PREFIX_BYTES:
+            return prefix
+        digest = hashlib.sha256(encoded).hexdigest()[:16]
+        suffix = f"__sha256={digest}"
+        prefix_budget = cls._MAX_ARTIFACT_PREFIX_BYTES - len(suffix.encode("utf-8"))
+        readable_prefix = encoded[:prefix_budget].decode("utf-8", errors="ignore")
+        return f"{readable_prefix}{suffix}"
 
     def _coerce_bool(self, value: Any) -> bool:
         if isinstance(value, bool):
@@ -166,6 +180,10 @@ class GridRunner:
             "max",
             "auto_max",
         }
+
+    def _auto_bsz_skip_probe(self) -> bool:
+        config = self._auto_bsz_config()
+        return self._coerce_bool(config.get("skip_probe", False))
 
     def _auto_bsz_candidates(self) -> list[int]:
         config = self._auto_bsz_config()
@@ -276,11 +294,13 @@ class GridRunner:
         merged_eval_env: dict[str, str],
         log_prefix: str,
         candidate: int,
+        eval_script: Path | None = None,
     ) -> CompletedStage:
+        eval_script = eval_script or self.eval_script
         probe_total_num = self._auto_bsz_probe_total_num_for_candidate(candidate)
         probe_env = dict(merged_eval_env)
         probe_env["EVAL_BSZ"] = str(candidate)
-        if self.eval_script.name == "eval_retrieval_only.sh":
+        if eval_script.name == "eval_retrieval_only.sh":
             probe_env.pop("TOTAL_NUM", None)
             probe_env["EVAL_PROBE_QUERY_LIMIT"] = str(probe_total_num)
         else:
@@ -293,7 +313,7 @@ class GridRunner:
             f"[bsz-probe] dataset={dataset} bsz={candidate} total_num={probe_total_num}"
         )
         probe_stage = self._run_script(
-            self.eval_script, dataset, probe_env, probe_log_prefix
+            eval_script, dataset, probe_env, probe_log_prefix
         )
         probe_payload = {
             "dataset": dataset,
@@ -317,11 +337,12 @@ class GridRunner:
         merged_eval_env: dict[str, str],
         log_prefix: str,
         candidates: list[int],
+        eval_script: Path | None = None,
     ) -> int | None:
         last_ok = None
         for candidate in candidates:
             probe_stage = self._run_bsz_probe(
-                dataset, merged_eval_env, log_prefix, candidate
+                dataset, merged_eval_env, log_prefix, candidate, eval_script
             )
             if probe_stage.returncode == 0:
                 last_ok = candidate
@@ -342,6 +363,7 @@ class GridRunner:
         merged_eval_env: dict[str, str],
         log_prefix: str,
         candidates: list[int],
+        eval_script: Path | None = None,
     ) -> int | None:
         last_ok = None
         low = 0
@@ -350,7 +372,7 @@ class GridRunner:
             mid = (low + high) // 2
             candidate = candidates[mid]
             probe_stage = self._run_bsz_probe(
-                dataset, merged_eval_env, log_prefix, candidate
+                dataset, merged_eval_env, log_prefix, candidate, eval_script
             )
             if probe_stage.returncode == 0:
                 last_ok = candidate
@@ -368,23 +390,39 @@ class GridRunner:
         return last_ok
 
     def _select_auto_bsz(
-        self, dataset: str, merged_eval_env: dict[str, str], log_prefix: str
+        self,
+        dataset: str,
+        merged_eval_env: dict[str, str],
+        log_prefix: str,
+        eval_script: Path | None = None,
     ) -> int | None:
         if not self._auto_bsz_enabled():
             return None
 
         candidates = self._auto_bsz_candidates()
+        if self._auto_bsz_skip_probe():
+            selected = candidates[-1]
+            self._print_status(
+                f"[bsz-selected-without-probe] dataset={dataset} "
+                f"EVAL_BSZ={selected} candidates={candidates}"
+            )
+            self._log_event(
+                f"auto_bsz selected_without_probe dataset={dataset} "
+                f"env={merged_eval_env} EVAL_BSZ={selected}"
+            )
+            return selected
+
         search_mode = self._auto_bsz_search_mode()
         self._print_status(
             f"[bsz-search] dataset={dataset} mode={search_mode} candidates={candidates}"
         )
         if search_mode == "binary":
             last_ok = self._select_auto_bsz_binary(
-                dataset, merged_eval_env, log_prefix, candidates
+                dataset, merged_eval_env, log_prefix, candidates, eval_script
             )
         else:
             last_ok = self._select_auto_bsz_linear(
-                dataset, merged_eval_env, log_prefix, candidates
+                dataset, merged_eval_env, log_prefix, candidates, eval_script
             )
 
         if last_ok is None:
@@ -876,11 +914,13 @@ class GridRunner:
     def run(self):
         dataset = self.dataset
         dataset_slug = dataset.replace("/", "_")
-        for preprocess_group in self.preprocess_groups:
-            preprocess_name = preprocess_group["name"]
+        for eval_group in self.eval_groups:
+            preprocess_name = eval_group["name"]
+            eval_script = self.repo_root / eval_group.get(
+                "eval_script", self.config.get("eval_script", "run/eval.sh")
+            )
             preprocess_env = {
-                k: self._stringify(v)
-                for k, v in preprocess_group.get("env", {}).items()
+                k: self._stringify(v) for k, v in eval_group.get("env", {}).items()
             }
             merged_group_env = dict(self.fixed_env)
             merged_group_env.update(preprocess_env)
@@ -895,6 +935,7 @@ class GridRunner:
                         "/", "_"
                     )
                 )
+                log_prefix_base = self._compact_artifact_prefix(log_prefix_base)
                 if not self._auto_bsz_enabled() and self._has_completed_result(
                     preprocess_name, preprocess_env, eval_env, merged_eval_env
                 ):
@@ -908,7 +949,7 @@ class GridRunner:
                     )
                     continue
                 auto_bsz = self._select_auto_bsz(
-                    dataset, merged_eval_env, log_prefix_base
+                    dataset, merged_eval_env, log_prefix_base, eval_script
                 )
                 if auto_bsz is not None:
                     merged_eval_env["EVAL_BSZ"] = str(auto_bsz)
@@ -924,6 +965,7 @@ class GridRunner:
                         "/", "_"
                     )
                 )
+                log_prefix = self._compact_artifact_prefix(log_prefix)
                 self._print_status(
                     f"[start] dataset={dataset} eval={preprocess_name} "
                     f'env={eval_env} EVAL_BSZ={merged_eval_env.get("EVAL_BSZ", "")}'
@@ -943,7 +985,7 @@ class GridRunner:
                         "OUTPUT_FILE",
                         str(self.eval_outputs_dir / f"{attempt_log_prefix}.jsonl"),
                     )
-                    if self.eval_script.name == "eval_retrieval_only.sh":
+                    if eval_script.name == "eval_retrieval_only.sh":
                         attempt_eval_env.setdefault(
                             "DETAILS_FILE",
                             str(
@@ -952,7 +994,7 @@ class GridRunner:
                             ),
                         )
                     eval_stage = self._run_script(
-                        self.eval_script, dataset, attempt_eval_env, attempt_log_prefix
+                        eval_script, dataset, attempt_eval_env, attempt_log_prefix
                     )
                     run_attempts.append(
                         {

@@ -85,7 +85,7 @@ class ColBERTEncoder:
     ):
         if repo_path is None:
             raise ValueError(
-                "repo_path is required; do not use /tmp for the official ColBERT repo"
+                "repo_path is required; use the managed official ColBERT repository"
             )
         Checkpoint, ColBERTConfig = import_official_colbert(
             repo_path,

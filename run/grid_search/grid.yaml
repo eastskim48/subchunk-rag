@@ -19,7 +19,7 @@ fixed_env:
 eval_fixed_env:
   USE_CLEANER: "False"
 
-preprocess_groups:
+eval_groups:
   - name: colbert_sliding_region
 
 eval_axes:
