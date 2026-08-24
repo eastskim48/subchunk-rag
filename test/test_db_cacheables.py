@@ -17,6 +17,7 @@ from chunk import CacheableChunk
 from colbert_metadata import ColBERTMetadataReader, ColBERTMetadataWriter
 from materialize.colbert_materializer import (
     WindowSpec,
+    _ColBERTArtifactWriter,
     _validate_center_unit_against_db_manifest,
     build_colbert_window_artifact,
     validate_colbert_candidate_ids_against_db,
@@ -223,6 +224,7 @@ class DBCacheablesTest(unittest.TestCase):
     ):
         class FakeEncoder:
             captured_units = []
+            encoded_specs = []
 
             def __init__(self, **kwargs):
                 del kwargs
@@ -240,10 +242,10 @@ class DBCacheablesTest(unittest.TestCase):
                 self.captured_units.append((list(sentences), window_token_budget))
                 return [
                     WindowSpec(
-                        text=text,
+                        text=f"context::{text}",
                         center_start=0,
                         center_end=len(text),
-                        selected_indices=[idx],
+                        selected_indices=[0, 1],
                         addition_order=[idx],
                         truncated_center=False,
                     )
@@ -251,6 +253,7 @@ class DBCacheablesTest(unittest.TestCase):
                 ]
 
             def encode_windows(self, specs):
+                self.encoded_specs.extend(specs)
                 return [torch.ones((1, self.dim), dtype=torch.float32) for _ in specs]
 
         cacheables = [
@@ -302,7 +305,6 @@ class DBCacheablesTest(unittest.TestCase):
                 docs_dir="/path/that/does/not/exist",
                 output_dir=output_dir,
                 db_dir="/fake/db",
-                center_unit="subchunk",
             )
             data_index = json.loads(
                 (Path(output_dir) / "data" / "index.json").read_text(encoding="utf-8")
@@ -317,11 +319,114 @@ class DBCacheablesTest(unittest.TestCase):
             [(["stored first", "stored second"], 180)],
         )
         self.assertEqual(
+            [spec.text for spec in FakeEncoder.encoded_specs],
+            ["stored first", "stored second"],
+        )
+        self.assertEqual(
+            [spec.selected_indices for spec in FakeEncoder.encoded_specs],
+            [[0], [1]],
+        )
+        self.assertEqual(
             list(metadata_reader.iter_cacheable_ids()),
             ["doc.txt::sent_0", "doc.txt::sent_1"],
         )
+        self.assertEqual(
+            metadata_reader.window_ids_for_cacheable_ids(
+                ["doc.txt::sent_0", "doc.txt::sent_1"]
+            ),
+            [
+                ["doc.txt::sent_0", "doc.txt::sent_1"],
+                ["doc.txt::sent_0", "doc.txt::sent_1"],
+            ],
+        )
         metadata_reader.close()
         self.assertEqual(summary["num_cacheables"], 2)
+        self.assertEqual(summary["center_unit"], "subchunk_only")
+        self.assertEqual(
+            summary["artifact_variant"],
+            "subchunk_only_encoding_contextual_regions",
+        )
+
+    def test_artifact_writer_carries_document_overflow_into_full_batches(self):
+        class FakeEncoder:
+            dim = 2
+
+            def __init__(self):
+                self.encoded_batches = []
+
+            def encode_windows(self, specs):
+                self.encoded_batches.append([spec.text for spec in specs])
+                return [
+                    torch.full((1, self.dim), index, dtype=torch.float32)
+                    for index, _ in enumerate(specs)
+                ]
+
+        def specs(prefix, count):
+            return [
+                WindowSpec(
+                    text=f"{prefix}{index}",
+                    center_start=0,
+                    center_end=2,
+                    selected_indices=list(range(count)),
+                    addition_order=[index],
+                    truncated_center=False,
+                )
+                for index in range(count)
+            ]
+
+        encoder = FakeEncoder()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            writer = _ColBERTArtifactWriter(
+                encoder=encoder,
+                vectors_path=temp_path / "vectors.fp16.bin",
+                metadata_path=temp_path / "metadata.sqlite3",
+                batch_size=4,
+            )
+            first_specs = specs("a", 3)
+            second_specs = specs("b", 2)
+            third_specs = specs("c", 4)
+            writer.add_document(
+                "doc-a",
+                [f"a{index}" for index in range(3)],
+                first_specs,
+            )
+            writer.add_document(
+                "doc-b",
+                [f"b{index}" for index in range(2)],
+                second_specs,
+            )
+            writer.add_document(
+                "doc-c",
+                [f"c{index}" for index in range(4)],
+                third_specs,
+            )
+            writer.finalize()
+
+            reader = ColBERTMetadataReader(temp_path / "metadata.sqlite3")
+            try:
+                self.assertEqual(
+                    list(reader.iter_cacheable_ids()),
+                    ["a0", "a1", "a2", "b0", "b1", "c0", "c1", "c2", "c3"],
+                )
+                self.assertEqual(
+                    reader.window_ids_for_cacheable_ids(["b0"]),
+                    [["b0", "b1"]],
+                )
+            finally:
+                reader.close()
+
+        self.assertEqual(
+            encoder.encoded_batches,
+            [
+                ["a0", "a1", "a2", "b0"],
+                ["b1", "c0", "c1", "c2"],
+                ["c3"],
+            ],
+        )
+        self.assertEqual(writer.num_docs, 3)
+        self.assertEqual(writer.total_cacheables, 9)
+        self.assertEqual(writer.total_center_tokens, 9)
 
 
 if __name__ == "__main__":

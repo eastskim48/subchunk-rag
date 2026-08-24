@@ -516,12 +516,12 @@ def validate_config(config: dict[str, Any]) -> tuple[dict[str, Any], str]:
     probe = config.get("max_prompt_bsz_probe")
     if not isinstance(probe, dict):
         raise ValueError("grid must define max_prompt_bsz_probe")
-    groups = config.get("preprocess_groups") or []
+    groups = config.get("eval_groups") or []
     if len(groups) != 1:
-        raise ValueError("this utility requires exactly one preprocess_group")
+        raise ValueError("this utility requires exactly one eval_group")
     preprocess_name = stringify(groups[0].get("name"))
     if not preprocess_name:
-        raise ValueError("preprocess_groups[0].name is required")
+        raise ValueError("eval_groups[0].name is required")
     fixed_env = config.get("fixed_env") or {}
     eval_fixed_env = config.get("eval_fixed_env") or {}
     prompt_format = stringify(fixed_env.get("PROMPT_FORMAT", "raw_chunk_first"))

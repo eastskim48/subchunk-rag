@@ -12,12 +12,17 @@ from chunk import RetrievableChunk
 class TokenBudgetMixin:
     """Resolve ratio/absolute budgets and cache token lengths consistently."""
 
-    def _initialize_token_budget(self) -> None:
+    def _initialize_token_budget(self, require_budget: bool = True) -> None:
         # Grid configs use an empty string to explicitly clear an inherited
         # budget controller; treat it the same as an unset environment value.
         retain_token_ratio = (os.getenv("RETAIN_TOKEN_RATIO") or "").strip() or None
         final_token_budget = (os.getenv("FINAL_TOKEN_BUDGET") or "").strip() or None
-        if bool(retain_token_ratio) == bool(final_token_budget):
+        if retain_token_ratio is not None and final_token_budget is not None:
+            raise ValueError(
+                "exactly one of RETAIN_TOKEN_RATIO or FINAL_TOKEN_BUDGET may be "
+                "set when a token budget is used"
+            )
+        if require_budget and retain_token_ratio is None and final_token_budget is None:
             raise ValueError(
                 "exactly one of RETAIN_TOKEN_RATIO or FINAL_TOKEN_BUDGET must be set"
             )
@@ -75,8 +80,8 @@ class TokenBudgetMixin:
                 unique_cacheables.append(cacheable)
         return sum(self._cacheable_token_lens(unique_cacheables))
 
-    def _resolve_final_token_budget(self, docs: List[RetrievableChunk]) -> int:
-        """Return the absolute prompt-token budget for one retrieved context."""
+    def _resolve_final_token_budget(self, docs: List[RetrievableChunk]) -> int | None:
+        """Return the absolute prompt-token budget, or None when it is optional."""
 
         if self.retain_token_ratio is None:
             return self.final_token_budget

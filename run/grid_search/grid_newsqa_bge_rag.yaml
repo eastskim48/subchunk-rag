@@ -1,0 +1,64 @@
+run_name: newsqa-0822
+dataset: newsqa
+
+dataset_prefix: /mnt/nvme1/datasets
+
+eval_script: run/eval.sh
+results_root: outputs/grid_08
+
+fixed_env:
+  MAX_NEW_TOKENS: "20"
+  MODEL_NAME: "meta-llama/Llama-3.1-8B-Instruct"
+  MODEL_LOAD_IN_4BIT: "False"
+  MEASURE_PROMPT_STATS: "True"
+  PROMPT_FORMAT: "raw_chunk_first"
+  CHROMA_EMBED_BACKEND: "bge_small_v1_5"
+  COLBERT_QUERY_MAXLEN: "32"
+  COLBERT_QUERY_MINLEN: ""
+  COLBERT_QUERY_TRUNCATION_SIDE: "right"
+  COLBERT_REGION_GROUP_ORDER: "retrieval"
+  FINAL_TOKEN_BUDGET: ""
+  RETAIN_TOKEN_RATIO: ""
+
+eval_fixed_env:
+  USE_CLEANER: "False"
+  EVAL_USE_PAST_CACHE: "False"
+
+eval_groups:
+  - name: newsqa_consensus_rag
+
+eval_cases:
+- DATA_SUBDIR: sent-bge-small-v1.5-512-splitlong180
+  COMPRESS_METHOD: colbert_sliding_region
+  TOP_K: "40"
+  RETAIN_TOKEN_RATIO: "0.15"
+  EVAL_BSZ: "1"
+- DATA_SUBDIR: sent-bge-small-v1.5-512-splitlong180
+  COMPRESS_METHOD: colbert_sliding_region
+  TOP_K: "20"
+  RETAIN_TOKEN_RATIO: "0.25"
+  EVAL_BSZ: "1"
+#- DATA_SUBDIR: vanilla-bge-small-v1.5-128
+#  COMPRESS_METHOD: ""
+#  TOP_K: "10"
+#  EVAL_BSZ: "1"
+#- DATA_SUBDIR: vanilla-bge-small-v1.5-128
+#  COMPRESS_METHOD: ""
+#  TOP_K: "20"
+#  EVAL_BSZ: "1"
+#- DATA_SUBDIR: vanilla-bge-small-v1.5-256
+#  COMPRESS_METHOD: ""
+#  TOP_K: "10"
+#  EVAL_BSZ: "1"
+#- DATA_SUBDIR: vanilla-bge-small-v1.5-256
+#  COMPRESS_METHOD: ""
+#  TOP_K: "20"
+#  EVAL_BSZ: "1"
+#- DATA_SUBDIR: vanilla-bge-small-v1.5-512
+#  COMPRESS_METHOD: ""
+#  TOP_K: "10"
+#  EVAL_BSZ: "1"
+#- DATA_SUBDIR: vanilla-bge-small-v1.5-512
+#  COMPRESS_METHOD: ""
+#  TOP_K: "20"
+#  EVAL_BSZ: "1"

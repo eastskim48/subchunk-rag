@@ -10,9 +10,20 @@ from compressor.methods.colbert import (
     FixedChunkColBERTRerankCompressor,
     ColBERTSlidingRegionCompressor,
 )
-from compressor.methods.dense import DenseCompressor
+from compressor.methods.dense import (
+    DenseCompressor,
+    DenseOnlineCompressor,
+    DenseSlidingSubchunkCompressor,
+    DenseSlidingRegionMaxCompressor,
+    DenseSlidingRegionAvgCompressor,
+)
+from compressor.methods.carrot import CARROTCompressor
 from compressor.methods.ml_selector import EXITCompressor, ProvenceCompressor
 from compressor.methods.summarization import Summarizer
+from compressor.methods.xrag import (
+    XRAGJinaCASSCompressor,
+    XRAGJinaRerankerCompressor,
+)
 
 # Evaluation runs reuse one compressor instance so model/artifact initialization
 # and query-encoder warmup are not repeated for every batch.
@@ -23,6 +34,10 @@ compressor_warmed = False
 COMPRESSOR_TYPES = {
     "summ": Summarizer,
     "dense": DenseCompressor,
+    "dense_online": DenseOnlineCompressor,
+    "dense_sliding_subchunk": DenseSlidingSubchunkCompressor,
+    "dense_sliding_region_max": DenseSlidingRegionMaxCompressor,
+    "dense_sliding_region_avg": DenseSlidingRegionAvgCompressor,
     "colbert_subchunk": ColBERTSubchunkCompressor,
     "colbert_rerank": ColBERTRerankCompressor,
     "colbert_chunk_rerank": FixedChunkColBERTRerankCompressor,
@@ -30,6 +45,9 @@ COMPRESSOR_TYPES = {
     "rerank_and_region": ColBERTRerankAndRegionCompressor,
     "exit": EXITCompressor,
     "provence": ProvenceCompressor,
+    "carrot": CARROTCompressor,
+    "xrag_jina": XRAGJinaRerankerCompressor,
+    "xrag_jina_cass": XRAGJinaCASSCompressor,
 }
 
 
@@ -44,9 +62,7 @@ def _ensure_compressor(option):
     if not compressor_warmed:
         if hasattr(compressor, "warmup_query_encoder"):
             warmup_time = compressor.warmup_query_encoder()
-            print(
-                f"ColBERT query encoder warmup completed in {warmup_time:.4f} seconds"
-            )
+            print(f"Query encoder warmup completed in {warmup_time:.4f} seconds")
         compressor_warmed = True
     return compressor
 

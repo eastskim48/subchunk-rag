@@ -178,12 +178,6 @@ class ColBERTWindowEncoder(colbert_encoder.ColBERTEncoder):
         if not sentences:
             return []
 
-        if window_token_budget > self.doc_maxlen:
-            raise ValueError(
-                "ColBERT window token budget cannot exceed official doc_maxlen: "
-                f"budget={window_token_budget}, doc_maxlen={self.doc_maxlen}"
-            )
-
         sentence_token_counts = self.token_counts_without_specials(sentences)
         specs: list[WindowSpec | None] = [None] * len(sentences)
         states: list[dict[str, Any] | None] = []
@@ -294,8 +288,7 @@ class _ColBERTArtifactWriter:
         self.total_center_tokens = 0
         self.truncated_centers = 0
         self.embedding_dim: int | None = None
-        self.pending_docs: list[dict[str, Any]] = []
-        self.pending_window_count = 0
+        self.pending_items: list[dict[str, Any]] = []
         self.vector_handle = vectors_path.open("wb")
         self.metadata_writer = ColBERTMetadataWriter(metadata_path)
 
@@ -304,70 +297,78 @@ class _ColBERTArtifactWriter:
         doc_id: str,
         cacheable_ids: list[str],
         specs: list[WindowSpec],
+        region_membership_specs: list[WindowSpec] | None = None,
     ) -> None:
-        self.pending_docs.append(
-            {
-                "doc_id": doc_id,
-                "cacheable_ids": cacheable_ids,
-                "specs": specs,
-            }
-        )
-        self.pending_window_count += len(specs)
-        if self.pending_window_count >= self.batch_size:
-            self.flush()
+        if region_membership_specs is None:
+            region_membership_specs = specs
+        if len(region_membership_specs) != len(specs):
+            raise ValueError(
+                "encoding and region-membership specs must have the same length: "
+                f"encoding={len(specs)}, region={len(region_membership_specs)}"
+            )
+        for cacheable_id, spec, region_spec in zip(
+            cacheable_ids, specs, region_membership_specs
+        ):
+            window_ids = [
+                str(cacheable_ids[idx])
+                for idx in region_spec.selected_indices
+                if isinstance(idx, int) and 0 <= idx < len(cacheable_ids)
+            ]
+            self.pending_items.append(
+                {
+                    "cacheable_id": cacheable_id,
+                    "spec": spec,
+                    "window_ids": window_ids,
+                }
+            )
+        self.truncated_centers += sum(1 for spec in specs if spec.truncated_center)
+        self.num_docs += 1
+        while len(self.pending_items) >= self.batch_size:
+            self._flush_count(self.batch_size)
+
+    def _flush_count(self, count: int) -> None:
+        if count <= 0 or count > len(self.pending_items):
+            raise ValueError(
+                "flush count must be within the pending item count: "
+                f"count={count}, pending={len(self.pending_items)}"
+            )
+        items = self.pending_items[:count]
+        vectors = self.encoder.encode_windows([item["spec"] for item in items])
+        if len(vectors) != len(items):
+            raise ValueError(
+                "ColBERT encoder output count does not match the input count: "
+                f"vectors={len(vectors)}, inputs={len(items)}"
+            )
+        metadata_records = []
+        for item, vector in zip(items, vectors):
+            if self.embedding_dim is None:
+                self.embedding_dim = int(vector.shape[1])
+            row_index = self.total_cacheables
+            self.offsets.append(self.total_center_tokens)
+            expected_dim = self.embedding_dim or self.encoder.dim
+            if int(vector.shape[1]) != expected_dim:
+                raise ValueError(
+                    f"embedding dim mismatch for {item['cacheable_id']}: "
+                    f"{vector.shape[1]} != {expected_dim}"
+                )
+            vector = vector.contiguous().to(torch.float16).cpu()
+            self.vector_handle.write(vector.numpy().tobytes(order="C"))
+            self.total_center_tokens += int(vector.shape[0])
+            metadata_records.append(
+                [
+                    str(item["cacheable_id"]),
+                    row_index,
+                    item["window_ids"],
+                ]
+            )
+            self.total_cacheables += 1
+        self.metadata_writer.add_cacheables(metadata_records)
+        del self.pending_items[:count]
 
     def flush(self) -> None:
-        if not self.pending_docs:
+        if not self.pending_items:
             return
-
-        flat_specs = [
-            spec for pending_doc in self.pending_docs for spec in pending_doc["specs"]
-        ]
-        flat_vectors = self.encoder.encode_windows(flat_specs) if flat_specs else []
-        cursor = 0
-        metadata_records = []
-
-        for pending_doc in self.pending_docs:
-            specs = pending_doc["specs"]
-            vectors = flat_vectors[cursor : cursor + len(specs)]
-            cursor += len(specs)
-            doc_token_counts = [int(vector.shape[0]) for vector in vectors]
-            if vectors and self.embedding_dim is None:
-                self.embedding_dim = int(vectors[0].shape[1])
-
-            cacheable_ids = pending_doc["cacheable_ids"]
-            for cacheable_id, vector, spec in zip(cacheable_ids, vectors, specs):
-                row_index = self.total_cacheables
-                self.offsets.append(self.total_center_tokens)
-                expected_dim = self.embedding_dim or self.encoder.dim
-                if int(vector.shape[1]) != expected_dim:
-                    raise ValueError(
-                        f"embedding dim mismatch for {cacheable_id}: "
-                        f"{vector.shape[1]} != {expected_dim}"
-                    )
-                vector = vector.contiguous().to(torch.float16).cpu()
-                self.vector_handle.write(vector.numpy().tobytes(order="C"))
-                self.total_center_tokens += int(vector.shape[0])
-                window_ids = [
-                    str(cacheable_ids[idx])
-                    for idx in spec.selected_indices
-                    if isinstance(idx, int) and 0 <= idx < len(cacheable_ids)
-                ]
-                metadata_records.append(
-                    [
-                        str(cacheable_id),
-                        row_index,
-                        window_ids,
-                    ]
-                )
-                self.total_cacheables += 1
-            self.truncated_centers += sum(1 for spec in specs if spec.truncated_center)
-            self.num_docs += 1
-
-        self.metadata_writer.add_cacheables(metadata_records)
-
-        self.pending_docs = []
-        self.pending_window_count = 0
+        self._flush_count(len(self.pending_items))
 
     def finalize(self) -> None:
         self.flush()
@@ -440,7 +441,7 @@ def build_colbert_window_artifact(
     disable_cpu_extension: bool = True,
     verify_tensorization: bool = True,
     mask_punctuation: bool | None = None,
-    center_unit: str = "subchunk",
+    center_unit: str = "subchunk_only",
     fixed_chunk_size: int | None = None,
 ) -> dict[str, Any]:
     """Encode source windows and write the contextualized candidate store."""
@@ -535,18 +536,21 @@ def build_colbert_window_artifact(
                 "fixed_chunk_size must be larger than prompt-visible token overhead: "
                 f"fixed_chunk_size={fixed_chunk_size}, overhead={visible_token_overhead}"
             )
+    region_token_budget = int(window_token_budget or 0)
+    encoder_max_length = 0 if center_unit == "subchunk_only" else region_token_budget
     encoder = ColBERTWindowEncoder(
         model_name=model_name,
         repo_path=repo_path,
         device=device or ("cuda" if torch.cuda.is_available() else "cpu"),
         batch_size=batch_size,
-        max_length=window_token_budget,
+        max_length=encoder_max_length,
         mask_punctuation=mask_punctuation,
         disable_cpu_extension=disable_cpu_extension,
         verify_tensorization=verify_tensorization,
     )
-    effective_token_budget = encoder.max_length
-    content_token_budget = effective_token_budget
+    if region_token_budget <= 0:
+        region_token_budget = encoder.doc_maxlen
+    content_token_budget = region_token_budget
 
     vectors_file = "vectors.fp16.bin"
     offsets_file = "offsets.npy"
@@ -577,8 +581,13 @@ def build_colbert_window_artifact(
 
                 units = [cacheable.text for cacheable in cacheables]
                 cacheable_ids = [str(cacheable.id) for cacheable in cacheables]
+                region_membership_specs = None
                 if center_unit in {"subchunk", "subchunk_only"}:
                     if center_unit == "subchunk_only":
+                        region_membership_specs = encoder.build_centered_windows(
+                            sentences=units,
+                            window_token_budget=content_token_budget,
+                        )
                         specs = [
                             WindowSpec(
                                 text=unit,
@@ -653,6 +662,7 @@ def build_colbert_window_artifact(
                 doc_id=doc_id,
                 cacheable_ids=cacheable_ids,
                 specs=specs,
+                region_membership_specs=region_membership_specs,
             )
         writer.finalize()
     except BaseException:
@@ -676,7 +686,8 @@ def build_colbert_window_artifact(
         "repo_path": repo_path,
         "device": encoder.device,
         "batch_size": batch_size,
-        "window_token_budget": effective_token_budget,
+        "window_token_budget": region_token_budget,
+        "sentence_encoding_max_length": encoder.max_length,
         "official_doc_maxlen": encoder.doc_maxlen,
         "official_query_maxlen": encoder.query_maxlen,
         "mask_punctuation": bool(encoder.checkpoint.colbert_config.mask_punctuation),
@@ -699,6 +710,14 @@ def build_colbert_window_artifact(
         "failed_docs": failed_docs,
         "build_time_sec": time.perf_counter() - start_time,
     }
+    if center_unit == "subchunk_only":
+        summary.update(
+            {
+                "artifact_variant": "subchunk_only_encoding_contextual_regions",
+                "embedding_source": "data/vectors.fp16.bin",
+                "region_membership_source": "data/region_payloads.json",
+            }
+        )
     index_path.write_text(
         json.dumps(summary, ensure_ascii=False, indent=2),
         encoding="utf-8",

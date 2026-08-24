@@ -2,6 +2,24 @@
 
 ## Key Paths
 
+### `dataset/`
+
+- Store dataset-specific official-source download and CPU-side construction
+  entry points here.
+- Each completed dataset root must provide `documents/`,
+  `questions/query.jsonl`, and `answers/answer.jsonl` for the existing database
+  preprocessing and evaluation paths.
+- `dataset/get_hotpotqa.sh` is the public one-command HotpotQA entry point;
+  dataset launchers follow the `dataset/get_<dataset>.sh` naming convention.
+- `dataset/get_hotpot_full.sh` constructs the separate custom HotpotQA corpus
+  containing all 5,486,212 pages in the official processed Wikipedia archive;
+  it does not apply the 66,705-title pooled-corpus restriction.
+- Its `dataset/hotpotqa/prepare.py` implementation downloads and verifies the
+  official HotpotQA sources, constructs the project's custom
+  distractor-development full-Wikipedia corpus, validates supporting facts,
+  and builds the query, answer, and evidence inputs. Database and ColBERT
+  artifact construction are intentionally separate GPU stages.
+
 ### `run/`
 - Store experiment scripts here.
 - Use this directory for reproducible execution entry points.
@@ -151,6 +169,12 @@ Build the DB and candidate artifacts in separate steps:
   remains the default; `dense` builds the baseline embedding artifact directly
   from persisted DB cacheables. The script invokes the
   `entrypoint/materialize_candidate_store.py` Python entrypoint.
+
+The ColBERT candidate-store default is `COLBERT_WINDOW_CENTER_UNIT=subchunk_only`.
+The materializer encodes each sentence without neighboring context and stores
+contextual centered-window membership separately for sliding-region scoring.
+Set `COLBERT_WINDOW_CENTER_UNIT=subchunk` explicitly only for the former
+contextual-encoding ablation.
 
 The DB preprocessor defaults to `splitter=sentence`. It creates and opens a
 Chroma DB only when `MATERIALIZE_DB=True`, so cache-only runs have no DB side

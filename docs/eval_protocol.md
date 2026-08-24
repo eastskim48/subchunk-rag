@@ -252,6 +252,24 @@ answer text, but retrieval against the 66,705-page joined corpus remains a
 custom evaluation protocol and is not directly comparable to evaluation on
 the original ten context passages per query.
 
+`dataset/get_hotpot_full.sh` defines a separate custom corpus-construction
+condition. It keeps the same 7,405 official distractor-development questions,
+verbatim answers, query order, supporting-fact validation, and evidence-span
+rules, but writes every one of the 5,486,212 pages in the verified official
+processed October 1, 2017 Wikipedia archive into the shared retrieval corpus.
+It applies neither query-specific ten-context filtering nor the 66,581-title
+pooled development-context restriction used to construct the 66,705-page
+corpus. Context-title matching remains only for linking official supporting
+facts to evidence labels; it does not decide which pages enter retrieval.
+
+The complete-Wikipedia corpus is stored under a separate dataset root and must
+use separate DBs, ColBERT artifacts, run names, and result directories. Results
+from the 5,486,212-page and 66,705-page corpora are not directly comparable as
+the same retrieval condition because corpus size and distractor population
+change. No full-corpus DB, artifact, or evaluation result exists merely from
+running the dataset constructor; those are separate materialization and
+evaluation stages.
+
 `run/grid_search/grid_hotpotqa.yaml` is the custom generation grid for this
 7,405-query distractor-development/full-Wikipedia-join condition. It copies
 the seven retrieval/compression cases and all model, prompt, generation, and
@@ -608,6 +626,39 @@ single-consensus-answer results. DAPR-NQ evidence results are also not directly
 comparable as the same metric target because DAPR-NQ labels passages, whereas
 this custom NewsQA protocol labels an answer span.
 
+### Test-Only NewsQA Region Sentence-Pruning Comparison
+
+`test/compare_newsqa_region_sentence_pruning_evidence.py` implements a custom,
+test-only three-way diagnostic over the same 4,293-row NewsQA consensus-answer
+population and the same all-retrieved-context evidence scope. It is not an
+official NewsQA protocol and does not change production compression or
+evaluation logic. One invocation shares the retrieved documents, encoded query,
+materialized B=180 region memberships, full-region ColBERT MaxSim scores, final
+context budget, and evidence scorer across all three variants:
+
+- `original` applies the existing globally ranked full-region selection,
+  stable sentence-ID deduplication, and add-then-check budget rule.
+- `post_prune_after_budget` first completes that original selection, then removes
+  every selected sentence that contains no token attaining the maximum
+  similarity for any query token in any accepted region. Released budget is not
+  refilled.
+- `prune_during_greedy` traverses the same unchanged full-region score order but
+  retains and budget-charges only sentences containing a MaxSim-winning token
+  when each region is considered. This can admit additional lower-ranked
+  regions.
+
+If multiple sentence tokens tie at a query token's region-wide maximum, every
+sentence containing a tied token is retained. Overlapping regions are still
+deduplicated by stable sentence ID. The runner requires an explicit `TOP_K` and
+exactly one explicit retained-token ratio or final token budget; it does not
+define a new default experiment point. It writes one summary JSON file and one
+per-query JSONL detail file containing all three compressed contexts.
+
+The three variants are directly comparable within one invocation because only
+the timing of sentence pruning and its budget accounting differs. They are not
+directly comparable as the same compression condition to earlier NewsQA runs
+that did not apply this test-only pruning protocol.
+
 ColBERT compression queries optionally use `COLBERT_QUERY_MAXLEN` and
 `COLBERT_QUERY_TRUNCATION_SIDE`. `right` preserves the query head and `left`
 preserves the query tail when truncation is necessary. Unless explicitly
@@ -646,8 +697,157 @@ and cache construction settings.
 `provence` and `exit` currently emit compressed prompt text directly and are
 cache-off only. They must not be run with `EVAL_USE_PAST_CACHE=True`.
 
+`provence` always uses the exact retrieved `RetrievableChunk.text` as its
+context and sets `always_select_title=True`. Because the project does not pass
+a separate title, the checkpoint treats the first sentence of that retrieved
+text as its title. When at least one sentence exceeds the pruning threshold,
+that first sentence is retained as well.
+
+`PROVENCE_REORDER` accepts exactly `True` or `False` and defaults to
+`False`. The false condition preserves all retrieved chunks in retrieval
+order. The true condition applies the official Provence reranking rule:
+descending `reranking_score` order followed by the official fixed top-5
+slice. The adapter requests unreordered checkpoint outputs so it can retain
+each original document ID, then applies the same NumPy `argsort`, reverse,
+and top-5 operations locally to the pruned contexts and their document objects.
+
+Results from different `PROVENCE_REORDER` values are separate reranking
+conditions and are not directly comparable as identical compression settings.
+Provence results produced before fixed title selection was introduced are also
+not directly comparable because the retained context can differ.
+
+`exit` always loads the Gemma base classifier with the official fixed NF4
+4-bit configuration: FP16 computation, double quantization, and CUDA execution.
+It uses the exact retrieved `RetrievableChunk.text` as the full context and
+applies the official spaCy `en_core_web_sm` `senter` pipeline to obtain the
+candidate sentences scored against that context.
+There is no FP16 EXIT loading mode. EXIT results produced before this fixed
+4-bit loader was introduced are not directly comparable because quantization
+can change Yes/No probabilities and threshold-boundary sentence selections.
+
+Provence and EXIT results produced before the switch from reconstructed
+cacheable text to exact retrieved `RetrievableChunk.text` are not directly
+comparable as identical compression conditions. The retrieval results remain
+unchanged, but the compressor input, selected sentences, and final prompt
+content can differ.
+
 `TOP_K=0` is a context-free cache-off baseline and must not be used with
 `EVAL_USE_PAST_CACHE=True`.
+
+### Runtime Dense Compression
+
+`COMPRESS_METHOD=dense_online` is the runtime-embedding counterpart of the
+materialized `dense` selector. It collects the exact non-empty cacheable texts
+attached to the retrieved chunks and deduplicates candidates by stable
+subchunk ID before embedding. Each stable ID is embedded on its first
+occurrence in the evaluation process and its float32 CPU vector is reused in
+later evaluation batches. It embeds each query with the same configured dense
+encoder and query-prefix policy, and computes normalized-vector dot products
+on the configured encoder device. The occurrence-level scores are restored in
+the original retrieved order before applying the same stable-ID
+deduplication, global ranking, shared token-budget policy, and source-order
+prompt assembly as `dense`. Anonymous candidates without a stable ID are not
+retained across evaluation batches.
+
+This condition requires exactly one of `RETAIN_TOKEN_RATIO` and
+`FINAL_TOKEN_BUDGET`. It does not read `DENSE_EMBED_DIR` or create a dense
+artifact. `DENSE_EMBED_MODEL`, `DENSE_EMBED_DEVICE`, and
+`DENSE_EMBED_BATCH_SIZE` control its runtime encoder.
+
+`dense_online` is suitable for answer-quality comparison when the dataset,
+retrieval result, candidate texts, generator, prompt, cache mode, dense model,
+and token budget match the comparison condition. Its compression latency is an
+online encoding cost and is not directly comparable to materialized `dense`
+latency. CPU and CUDA dense encoding are not guaranteed to be bit-identical, so
+the encoder device must be reported with results.
+
+`COMPRESS_METHOD=dense_sliding_region_max` and
+`COMPRESS_METHOD=dense_sliding_region_avg` use the exact query-independent
+sliding-region memberships stored in the configured ColBERT window artifact.
+They do not use that artifact's ColBERT vectors. At runtime, each stable-ID
+non-empty member subchunk is encoded once on its first occurrence in the
+evaluation process, stored as a float32 CPU vector, and reused across both
+overlapping regions and later evaluation batches. Each evaluation batch moves
+only its unique candidate vectors to the configured encoder device for the
+query-candidate matrix multiplication. A repeated stable subchunk ID must have
+identical text.
+
+- `dense_sliding_region_max` assigns each region the maximum score among its
+  member subchunks.
+- `dense_sliding_region_avg` assigns each region the arithmetic mean score
+  among its member subchunks. The mean is unweighted; each member subchunk
+  contributes once regardless of token length.
+
+Both methods use the existing sliding-region global ranking, stable-ID
+deduplication across overlapping regions, add-then-check token-budget policy,
+contiguous-run construction, source-order prompt assembly, and configured
+region-group ordering. They require exactly one of `RETAIN_TOKEN_RATIO` and
+`FINAL_TOKEN_BUDGET`. Direct comparison between max and avg requires the same
+physical DB, artifact region membership, retrieval results, dense encoder and
+device, token budget, prompt, generator, and evaluation population. Their
+online dense encoding latency is not directly comparable to ColBERT artifact
+scoring latency or materialized `dense` latency.
+
+`run/grid_search/grid_hotpotqa_dense_sliding_region.yaml` evaluates these
+runtime dense methods in one custom two-suite grid. Its active population is
+the 1,000-row seed-42 HotpotQA subset stored in
+`questions/query_sampled_seed42_1000.jsonl`; answer generation uses the aligned
+`answers/output_sampled_seed42_1000.jsonl`, while evidence evaluation joins the
+same stable query IDs to `dataset_info/evidence_labels.jsonl`. This is a custom
+sampled population over the project's full-wiki retrieval corpus, not the
+official HotpotQA ten-context condition.
+
+The grid runs `dense_online`, `dense_sliding_region_max`, and
+`dense_sliding_region_avg` with the same physical DB, BGE-M3 runtime encoder,
+`TOP_K=20`, retained-token ratio `0.25`, generator, and prompt settings. Both
+sliding-region cases use the same explicit `colbert_window` artifact only for
+stored region membership. Each case is run once with `run/eval.sh` for answer
+quality and once with `run/eval_retrieval_only.sh` for supporting-fact evidence
+coverage. Results are directly comparable across the three methods within one
+suite; answer-generation and evidence metrics measure different outputs and
+must not be compared as the same metric.
+
+The evidence-only suite uses `DENSE_EMBED_BATCH_SIZE=256`; the RAG suite uses
+`DENSE_EMBED_BATCH_SIZE=128` because BGE-M3 shares the GPU with the generator.
+All three methods use the same dense batch size within each suite. Runtime
+cache reuse does not change region membership, max/avg aggregation, ranking,
+token-budget, prompt, or metric rules. However, CUDA float16 encoder outputs
+can vary at small numerical scale when candidate batch composition changes,
+and GPU dot products are not guaranteed to be bit-identical to the former CPU
+dot products. Results before and after this cache revision represent the same
+evaluation protocol and are directly comparable as method results, but they
+are not guaranteed to reproduce identical selected subchunks or metric values
+bit for bit.
+
+### Frozen-Retrieval NQ Scorer Ablation
+
+`test/run_nq_materialized_dense_regions.py` implements a custom scorer-quality
+ablation for the 2,390-query DAPR-NQ/NQ-open exact-question intersection. It is
+not an official Natural Questions protocol. The `snapshot` command performs
+BGE-small top-20 retrieval once against the active physical
+`sent-bge-small-v1.5-512-splitlong180/db` database and stores the ordered
+`RetrievableChunk` payloads for every query. Both dense scorer conditions must
+replay that same snapshot; they do not rerun Chroma retrieval during quality
+evaluation.
+
+The `materialize` command takes the union of retrieved coarse chunks and reads
+the existing `colbert_window` artifact only for its stored CASS region
+memberships. For every referenced region, it concatenates the complete ordered
+member text exactly as `dense_sliding_subchunk` does and materializes one
+normalized float32 vector. It does not encode individual sentences and does
+not aggregate sentence scores. BGE-small and BGE-M3 artifacts must record the
+same snapshot SHA-256, ColBERT artifact-index SHA-256, region count, and region
+token budget. No ColBERT vector or new ColBERT artifact is created.
+
+Quality evaluation uses the saved top-20 order, retained-token ratio 0.25,
+`COLBERT_REGION_GROUP_ORDER=retrieval`, Llama-3.1-8B-Instruct in FP16,
+cache-off generation, `raw_chunk_first`, 20 maximum new tokens, no prediction
+cleaner, and evaluation batch size 28. The inherited CASS global ranking,
+overlap deduplication, add-then-check token-budget rule, contiguous-run
+construction, and prompt assembly remain unchanged. Offline dense
+materialization time and snapshot-replay time are not compression-latency
+measurements. Compression latency is measured separately at batch size 1; it
+must not be inferred from the batch-28 quality run.
 
 ## Retrieval And Artifacts
 
@@ -740,6 +940,15 @@ ColBERT-window artifact construction is CUDA-only and uses the same
 cross-check is disabled by fixed build policy rather than exposed as an
 experiment environment variable; this does not change stored tensor values or
 runtime scoring.
+
+The default ColBERT candidate-store build uses `center_unit=subchunk_only`.
+Each sentence is encoded independently, while contextual centered-window
+membership is materialized separately and becomes the unchanged sliding-region
+selection unit. `COLBERT_WINDOW_CENTER_UNIT=subchunk` remains an explicit
+contextual-encoding ablation. Results from independently encoded and
+contextually encoded artifacts are not directly comparable as the same
+encoding condition, even when their retrieval inputs, region membership,
+scoring, and token budget are identical.
 
 `COMPRESS_METHOD=colbert_subchunk` selects the global ColBERT subchunk
 selector. This factory key replaces the former `colbert_window` key; the old
@@ -871,6 +1080,14 @@ fp16 runs are different inference backends and should be reported separately.
 different batch sizes should not be treated as identical unless equivalence has
 been checked.
 
+`test/profile_nq_colbert_end_to_end.py` is a custom latency-breakdown protocol
+for the 2,390-query DAPR-NQ/NQ-open exact-question intersection defined above.
+By default it processes the complete active query file independently at batch
+sizes 1 and 32. `--total_num N` remains an explicit leading-N diagnostic
+override. Results from the former default first-1,000-query condition are not
+directly comparable to the new complete-2,390-query default because the query
+population and number of measured batches differ.
+
 ### Longest-Prompt Stress Selection For Throughput Batch Size
 
 `test/probe_max_bsz_and_eval.py` implements a custom batch-size selection
@@ -990,6 +1207,108 @@ renaming the configuration field. The former fixed-artifact pre-filter changed
 its coarse scoring artifact and chunk alignment, so its results are not
 directly comparable to the new `rerank_and_region`. The post-filter method was
 removed and has no replacement.
+
+### Custom Fixed-Configuration CARROT Baseline
+
+`COMPRESS_METHOD=carrot` is a custom local integration of the fixed-configuration
+CARROT chunk-combination selector. It is not a reproduction of CARROT's full
+retrieval and learned-configuration pipeline.
+
+- The candidates are the chunks returned by the configured project vector DB;
+  the method does not build CARROT's BGE-M3/FAISS index or apply its 256-token
+  chunking.
+- The default reranker is
+  `jinaai/jina-reranker-v2-base-multilingual`. The default fixed search controls
+  are `CARROT_MAX_ITERATIONS=10`, `CARROT_C=2.4`, and
+  `CARROT_LAMBDA=0.1`. `CARROT_SOFT_BUDGET=8192` is the token-cost
+  normalization denominator for the soft length penalty, independently of the
+  optional hard budget.
+  `CARROT_BATCH_SIZE` controls reranker call batching and `CARROT_MAX_LENGTH`
+  controls its pair-input limit.
+- Each Monte Carlo tree-search state is an ordered subset of the retrieved
+  chunks. The reranker scores the query paired with the state contents in that
+  order. Each candidate's content is the exact retrieved
+  `RetrievableChunk.text`, not a reconstruction from its cacheable units. The
+  output contains clones of the selected chunks in the chosen order, with each
+  retrieved text represented as one prompt-visible cacheable.
+- At most one of `FINAL_TOKEN_BUDGET` and `RETAIN_TOKEN_RATIO` may be set. A
+  retained ratio is converted to an absolute per-query budget by the shared
+  token-budget policy. If both are unset, CARROT runs without a hard token
+  constraint.
+- Candidate context cost is computed by serializing every selected retrieved
+  text as `<stripped RetrievableChunk.text>\n\n` and tokenizing the complete
+  serialized context once with the tokenizer named by `MODEL_NAME`. The same
+  representation is used to resolve a retained-ratio budget. System-prompt,
+  question, and answer-prefix tokens are not part of this context budget.
+- When a hard budget is configured, a candidate whose context cost exceeds the
+  resolved budget is discarded before reranker evaluation. Final selection also
+  filters to states at or below the same budget. `CARROT_LAMBDA` remains a soft
+  length penalty in both modes and does not replace the optional hard
+  constraint.
+- CARROT is cache-off only. In hard-budget runs, selection can validly produce
+  an empty context, which the current batched key-value (KV) cache assembly path
+  does not support.
+- Online reranker loading, Monte Carlo tree search, reranker scoring, prompt
+  construction, and LLM inference are included in their corresponding runtime
+  measurements. There is no CARROT-specific offline artifact-build time.
+
+CARROT results produced before the switch from reconstructed cacheable text to
+exact retrieved `RetrievableChunk.text` are not directly comparable as
+identical compression conditions. A CARROT result is directly comparable to
+another local baseline only when the common dataset, retrieval result,
+generator, prompt, cache mode, and resolved context budget match. It is not
+directly comparable to a full-pipeline CARROT result that uses CARROT's own
+chunking, retrieval index, or learned configuration agent.
+
+### Custom XRAG Jina Reranking Conditions
+
+The following Natural Questions (NQ) conditions are custom local applications
+of the XRAG Jina reranking postprocessor. They are not the official XRAG
+benchmark protocol.
+
+- The inspected XRAG source revision is
+  `6897f44801a5e9a1931a13f38231adddd83d83cc`. It pins
+  `llama-index-postprocessor-flag-embedding-reranker==0.2.0` and
+  `FlagEmbedding==1.2.10`, and configures
+  `jinaai/jina-reranker-v2-base-multilingual` with a return count of 10.
+- The released source passes `top_k=10`, while the pinned postprocessor
+  constructor accepts `top_n`. The local `XRAG_TOP_N=10` setting is the
+  minimum loading-compatibility correction that preserves the released return
+  count. The pinned FlagEmbedding loader also omits the
+  `trust_remote_code=True` argument required by the Jina model; the local
+  loader adds only that compatibility argument.
+- Each query is paired independently with every retrieved
+  `RetrievableChunk.text`. Scores are computed in 32-bit floating point
+  (FP32), with scoring batch size 256. The candidates are sorted by descending
+  score. Python's stable sort preserves original retrieval order when scores
+  are equal, and the first `XRAG_TOP_N=10` candidates are returned.
+- The official pinned scoring path defaults to a combined query-passage
+  `max_length=512`. These custom runs instead set
+  `XRAG_MAX_LENGTH=1024`, as explicitly requested, so a fixed 512-token
+  passage is not forced to share a 512-token pair limit with the query and
+  special tokens. This is an evaluation-condition change, not an official XRAG
+  default. Results from `XRAG_MAX_LENGTH=1024` are not directly comparable as
+  identical conditions to literal 512-limit results.
+- `COMPRESS_METHOD=xrag_jina` retrieves `TOP_K=20` from the custom
+  `vanilla-bge-small-v1.5-512` database, reranks those 20 candidates, and
+  returns the top 10 whole retrieved chunks. It applies no generator-token
+  budget or packing rule. Each returned `RetrievableChunk.text` becomes one
+  prompt-visible cacheable unit.
+- The direct custom subchunk comparison uses
+  `sent-bge-small-v1.5-512-splitlong180`, `TOP_K=10`, and no compressor.
+- `COMPRESS_METHOD=xrag_jina_cass` retrieves `TOP_K=20` from the same custom
+  subchunk database, reranks to 10, and then applies Context-Aware Subchunk
+  Selection (CASS), implemented by `colbert_sliding_region`, with
+  `RETAIN_TOKEN_RATIO=0.5`. The retained-ratio budget is resolved only over
+  the reranked 10 chunks and their existing cacheable subchunks. CASS selection,
+  overlap handling, and add-then-check budget behavior are otherwise unchanged.
+- Both XRAG methods are cache-off only. One reranker instance is loaded and
+  reused for the run. With 20 candidates, all query-passage pairs for one query
+  fit in one scoring batch. Model loading remains setup time, while online
+  reranker scoring remains compression time.
+- Default filenames for either XRAG method include
+  `xrtopn10-xrml1024`, making both the return count and changed pair-input
+  limit explicit.
 
 `ttft_per_batch_avg_sec` in grid summaries is derived as:
 

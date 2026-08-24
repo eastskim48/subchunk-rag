@@ -10,7 +10,11 @@ from chunk import RetrievableChunk
 from colbert_artifact import FixedChunkColBERTArtifact
 from compressor.base import Compressor
 from compressor.methods.colbert.base import ColBERTWindowCompressorBase
-from compressor.methods.colbert.scoring import score_maxsim
+from compressor.methods.colbert.scoring import (
+    aggregate_sentence_maxsim,
+    score_maxsim,
+    sentence_token_maxsim,
+)
 from encoder.colbert import ColBERTEncoder, default_colbert_repo_path
 
 
@@ -28,10 +32,10 @@ class _ColBERTRerankMixin:
     def _score_coarse_chunk(
         query_vector: torch.Tensor, vectors: list[torch.Tensor]
     ) -> float:
-        nonempty_vectors = [vector for vector in vectors if vector.numel() > 0]
-        if not nonempty_vectors:
-            return float("-inf")
-        return score_maxsim(query_vector, torch.cat(nonempty_vectors, dim=0))
+        sentence_scores = sentence_token_maxsim(query_vector, vectors)
+        return aggregate_sentence_maxsim(sentence_scores, [list(range(len(vectors)))])[
+            0
+        ]
 
     def _rerank_chunk_indices(
         self,
@@ -39,21 +43,37 @@ class _ColBERTRerankMixin:
         query_vector: torch.Tensor,
         profile: dict[str, float | int] | None = None,
     ) -> list[int]:
-        scored_chunks = []
-        for chunk_idx, doc in enumerate(docs):
+        self._coarse_sentence_scores_by_source_id = {}
+        vectors_by_doc = []
+        for doc in docs:
             lookup_start = time.perf_counter()
             vectors = self.artifact.vectors_for_doc(doc)
             self._profile_add(
                 profile, "artifact_lookup_time", time.perf_counter() - lookup_start
             )
-            score_start = time.perf_counter()
-            score = self._score_coarse_chunk(query_vector, vectors)
-            self._profile_add(
-                profile,
-                "coarse_rerank_score_time",
-                time.perf_counter() - score_start,
-            )
-            scored_chunks.append((score, chunk_idx))
+            vectors_by_doc.append(vectors)
+
+        score_start = time.perf_counter()
+        all_sentence_vectors = [
+            vector for vectors in vectors_by_doc for vector in vectors
+        ]
+        sentence_scores = sentence_token_maxsim(query_vector, all_sentence_vectors)
+        sentence_groups = []
+        offset = 0
+        for vectors in vectors_by_doc:
+            next_offset = offset + len(vectors)
+            sentence_groups.append(list(range(offset, next_offset)))
+            self._coarse_sentence_scores_by_source_id[id(vectors)] = sentence_scores[
+                offset:next_offset
+            ]
+            offset = next_offset
+        chunk_scores = aggregate_sentence_maxsim(sentence_scores, sentence_groups)
+        self._profile_add(
+            profile,
+            "coarse_rerank_score_time",
+            time.perf_counter() - score_start,
+        )
+        scored_chunks = list(zip(chunk_scores, range(len(docs))))
 
         sort_start = time.perf_counter()
         scored_chunks.sort(key=lambda item: item[0], reverse=True)

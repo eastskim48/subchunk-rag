@@ -28,7 +28,7 @@ from compressor.methods.colbert import (
     ColBERTSlidingRegionCompressor,
     _resolve_configured_retrieval_chunk_size,
 )
-from compressor.methods.colbert.scoring import score_maxsim
+from compressor.methods.colbert.scoring import score_maxsim, sentence_token_maxsim
 from compressor.methods.dense import DenseCompressor
 from compressor.methods.summarization import Summarizer
 from colbert_artifact import build_db_manifest_reference
@@ -236,8 +236,13 @@ class ColBERTWindowOptimizationTest(unittest.TestCase):
             RetrievableChunk(id="doc-a", text="a"),
         ]
 
-        output = summarizer.compress_batch_top_k_docs([docs], ["query"])[0]
+        with patch(
+            "compressor.methods.colbert.rerank.sentence_token_maxsim",
+            wraps=sentence_token_maxsim,
+        ) as sentence_scorer:
+            output = summarizer.compress_batch_top_k_docs([docs], ["query"])[0]
 
+        self.assertEqual(sentence_scorer.call_count, 1)
         self.assertEqual([str(doc.id) for doc in output], ["doc-a", "doc-b"])
         self.assertTrue(
             all(
@@ -246,6 +251,61 @@ class ColBERTWindowOptimizationTest(unittest.TestCase):
             )
         )
         self.assertEqual(summarizer.last_profile["selected_doc_count"], 2)
+
+    def test_rerank_and_region_reuses_coarse_sentence_scores_for_regions(self):
+        class FakeArtifact:
+            def __init__(self, vectors_by_doc):
+                self.vectors_by_doc = vectors_by_doc
+
+            def vectors_for_doc(self, doc):
+                return self.vectors_by_doc[str(doc.id)]
+
+        summarizer = object.__new__(ColBERTRerankAndRegionCompressor)
+        first_vectors = [
+            torch.tensor([[5.0, 0.0]], dtype=torch.float16),
+            torch.tensor([[0.0, 5.0]], dtype=torch.float16),
+        ]
+        second_vectors = [torch.tensor([[4.0, 4.0]], dtype=torch.float16)]
+        summarizer.artifact = FakeArtifact(
+            {"doc-a": first_vectors, "doc-b": second_vectors}
+        )
+        first_cacheables = [
+            CacheableChunk(id="doc-a::sent_0", text="alpha"),
+            CacheableChunk(id="doc-a::sent_1", text="beta"),
+        ]
+        docs = [
+            RetrievableChunk(
+                id="doc-a", text="alpha beta", cacheables=first_cacheables
+            ),
+            RetrievableChunk(
+                id="doc-b",
+                text="gamma",
+                cacheables=[CacheableChunk(id="doc-b::sent_0", text="gamma")],
+            ),
+        ]
+        query_vector = torch.tensor([[1.0, 0.0], [0.0, 1.0]], dtype=torch.float32)
+
+        ranked_indices = summarizer._rerank_chunk_indices(docs, query_vector, {})
+        regions = [
+            {
+                "chunk_idx": 0,
+                "selected_indices": (0, 1),
+                "source_cacheables": first_cacheables,
+                "source_vectors": first_vectors,
+            }
+        ]
+        with patch(
+            "compressor.methods.colbert.region.sentence_token_maxsim"
+        ) as region_sentence_scorer:
+            region_scores = summarizer._score_sliding_regions_vectorized(
+                query_vector, regions
+            )
+
+        self.assertEqual(ranked_indices, [0, 1])
+        region_sentence_scorer.assert_not_called()
+        self.assertEqual(
+            region_scores[0], score_maxsim(query_vector, torch.cat(first_vectors))
+        )
 
     def test_factory_registers_only_the_new_colbert_rerank_names(self):
         self.assertIs(
@@ -591,16 +651,29 @@ class ColBERTWindowOptimizationTest(unittest.TestCase):
     def test_colbert_region_document_restores_source_order_after_score_order_selection(
         self,
     ):
-        doc = RetrievableChunk(id="doc0", text="alpha beta gamma")
+        source_cacheables = [
+            CacheableChunk(id="doc0::sent_0", text="alpha"),
+            CacheableChunk(id="doc0::sent_1", text="beta"),
+            CacheableChunk(id="doc0::sent_2", text="gamma"),
+        ]
+        doc = RetrievableChunk(
+            id="doc0", text="alpha beta gamma", cacheables=source_cacheables
+        )
         selected_cacheables = [
             CacheableChunk(
-                id="doc0::region_2", text="gamma", chunk_start=11, chunk_end=16
+                id="doc0::region_2",
+                text="gamma",
+                sentence_ids=["doc0::sent_2"],
             ),
             CacheableChunk(
-                id="doc0::region_0", text="alpha", chunk_start=0, chunk_end=5
+                id="doc0::region_0",
+                text="alpha",
+                sentence_ids=["doc0::sent_0"],
             ),
             CacheableChunk(
-                id="doc0::region_1", text="beta", chunk_start=6, chunk_end=10
+                id="doc0::region_1",
+                text="beta",
+                sentence_ids=["doc0::sent_1"],
             ),
         ]
 
@@ -616,9 +689,11 @@ class ColBERTWindowOptimizationTest(unittest.TestCase):
             [cacheable.text for cacheable in output_doc.cacheables],
             ["alpha", "beta", "gamma"],
         )
-        self.assertEqual(
-            [cacheable.chunk_end for cacheable in output_doc.cacheables],
-            [5, 10, 16],
+        self.assertTrue(
+            all(
+                cacheable.chunk_start is None and cacheable.chunk_end is None
+                for cacheable in output_doc.cacheables
+            )
         )
 
     def test_colbert_selection_splits_noncontiguous_novel_region_runs(self):
@@ -655,7 +730,9 @@ class ColBERTWindowOptimizationTest(unittest.TestCase):
             final_token_budget=3,
         )
         output_doc = ColBERTSlidingRegionCompressor._build_region_document(
-            RetrievableChunk(id="doc0", text="alpha beta gamma"),
+            RetrievableChunk(
+                id="doc0", text="alpha beta gamma", cacheables=source_cacheables
+            ),
             [cacheable for _, cacheable in selected],
         )
 
@@ -725,7 +802,9 @@ class ColBERTWindowOptimizationTest(unittest.TestCase):
             final_token_budget=2,
         )
         output_doc = ColBERTSlidingRegionCompressor._build_region_document(
-            RetrievableChunk(id="doc0", text="alpha beta gamma"),
+            RetrievableChunk(
+                id="doc0", text="alpha beta gamma", cacheables=source_cacheables
+            ),
             [cacheable for _, cacheable in selected],
         )
 
@@ -800,7 +879,9 @@ class ColBERTWindowOptimizationTest(unittest.TestCase):
         self.assertTrue(small_ids.issubset(large_ids))
         self.assertEqual(small_ids, {"doc0::region_1::dedup_1_1"})
         output_doc = ColBERTSlidingRegionCompressor._build_region_document(
-            RetrievableChunk(id="doc0", text="alpha beta gamma"),
+            RetrievableChunk(
+                id="doc0", text="alpha beta gamma", cacheables=source_cacheables
+            ),
             [cacheable for _, cacheable in large],
         )
         self.assertEqual(
@@ -870,14 +951,32 @@ class ColBERTWindowOptimizationTest(unittest.TestCase):
 
                 output_doc = ColBERTSlidingRegionCompressor._build_region_document(
                     RetrievableChunk(
-                        id="doc0", text=" ".join(f"s{i}" for i in range(4))
+                        id="doc0",
+                        text=" ".join(f"s{i}" for i in range(4)),
+                        cacheables=source_cacheables,
                     ),
                     selected_cacheables,
                 )
-                ordered_starts = [
-                    cacheable.chunk_start for cacheable in output_doc.cacheables
+                ordered_ids = [
+                    sentence_id
+                    for cacheable in output_doc.cacheables
+                    for sentence_id in cacheable.sentence_ids
                 ]
-                self.assertEqual(ordered_starts, sorted(ordered_starts))
+                selected_id_set = set(ordered_ids)
+                self.assertEqual(
+                    ordered_ids,
+                    [
+                        source.id
+                        for source in source_cacheables
+                        if source.id in selected_id_set
+                    ],
+                )
+                self.assertTrue(
+                    all(
+                        cacheable.chunk_start is None and cacheable.chunk_end is None
+                        for cacheable in output_doc.cacheables
+                    )
+                )
 
                 used_tokens = sum(
                     source_cacheables[int(sentence_id.rsplit("_", 1)[1])].chunk_size
@@ -970,7 +1069,9 @@ class ColBERTWindowOptimizationTest(unittest.TestCase):
                 id="doc0::sent_3", text="four", chunk_start=14, chunk_end=18
             ),
         ]
-        doc = RetrievableChunk(id="doc0::ret_0", text="one two three four")
+        doc = RetrievableChunk(
+            id="doc0::ret_0", text="one two three four", cacheables=cacheables
+        )
 
         def fake_regions(doc, chunk_idx, profile=None):
             del doc, profile
@@ -1053,7 +1154,7 @@ class ColBERTWindowOptimizationTest(unittest.TestCase):
             final_token_budget=3,
         )
         output_doc = ColBERTSlidingRegionCompressor._build_region_document(
-            RetrievableChunk(id="doc0", text="alpha beta gamma"),
+            RetrievableChunk(id="doc0", text="alpha beta gamma", cacheables=cacheables),
             [cacheable for _, cacheable in selected],
         )
 

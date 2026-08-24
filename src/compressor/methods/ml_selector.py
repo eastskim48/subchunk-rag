@@ -5,9 +5,16 @@ import re
 from contextlib import redirect_stderr, redirect_stdout
 from typing import List
 
+import numpy as np
+import spacy
 import torch
 from dotenv import load_dotenv
-from transformers import AutoModel, AutoModelForCausalLM, AutoTokenizer
+from transformers import (
+    AutoModel,
+    AutoModelForCausalLM,
+    AutoTokenizer,
+    BitsAndBytesConfig,
+)
 
 from chunk import CacheableChunk, RetrievableChunk
 from compressor.base import Compressor
@@ -41,6 +48,15 @@ class OfficialSentenceSelector(Compressor):
             for cacheable in getattr(doc, "cacheables", [])
             if isinstance(cacheable.text, str) and cacheable.text.strip()
         ]
+
+    @staticmethod
+    def _get_document_text(doc: RetrievableChunk) -> str:
+        text = getattr(doc, "text", None)
+        return text if isinstance(text, str) and text.strip() else ""
+
+    def _get_document_texts(self, doc: RetrievableChunk) -> List[str]:
+        text = self._get_document_text(doc)
+        return [text] if text else []
 
     def _build_text_document(
         self, doc: RetrievableChunk, text: str, source: str
@@ -98,6 +114,8 @@ class OfficialSentenceSelector(Compressor):
 class ProvenceCompressor(OfficialSentenceSelector):
     """Select context with the official Provence pruning model."""
 
+    _RERANK_TOP_K = 5
+
     def __init__(self):
         super().__init__()
         load_dotenv()
@@ -107,6 +125,13 @@ class ProvenceCompressor(OfficialSentenceSelector):
         )
         self.threshold = float(os.getenv("PROVENCE_THRESHOLD", "0.5"))
         self.batch_size = int(os.getenv("PROVENCE_BATCH_SIZE", "256"))
+        reorder_value = os.getenv("PROVENCE_REORDER", "False").strip().lower()
+        if reorder_value not in {"true", "false"}:
+            raise ValueError(
+                "PROVENCE_REORDER must be exactly True or False "
+                f"(case-insensitive), got {reorder_value!r}"
+            )
+        self.reorder = reorder_value == "true"
         self.device = os.getenv(
             "PROVENCE_DEVICE", "cuda" if torch.cuda.is_available() else "cpu"
         )
@@ -224,7 +249,9 @@ class ProvenceCompressor(OfficialSentenceSelector):
                 question=query,
                 context=context,
                 threshold=self.threshold,
+                always_select_title=True,
                 enable_warnings=False,
+                reorder=False,
             )
         pruned_context = self._extract_pruned_context(result)
         return self._greedy_match_indices(chunk_texts, pruned_context)
@@ -253,7 +280,9 @@ class ProvenceCompressor(OfficialSentenceSelector):
                 context=contexts,
                 threshold=self.threshold,
                 batch_size=self.batch_size,
+                always_select_title=True,
                 enable_warnings=False,
+                reorder=False,
             )
         pruned_contexts = self._extract_pruned_contexts(results, len(contexts))
         for (doc_idx, chunk_texts), pruned_context in zip(
@@ -264,20 +293,43 @@ class ProvenceCompressor(OfficialSentenceSelector):
             )
         return selections
 
-    def _compress_texts_batch(
-        self, chunk_texts_per_doc: List[List[str]], query: str
-    ) -> List[str]:
-        non_empty_docs = [
-            (idx, chunk_texts)
-            for idx, chunk_texts in enumerate(chunk_texts_per_doc)
-            if chunk_texts
+    def _compress_texts_batch_with_doc_indices(
+        self,
+        batch_chunk_texts_per_doc: List[List[List[str]]],
+        batch_queries: List[str],
+    ) -> tuple[List[List[str]], List[List[int]]]:
+        compressed_batches = [
+            ["" for _ in chunk_texts_per_doc]
+            for chunk_texts_per_doc in batch_chunk_texts_per_doc
         ]
-        compressed_texts = ["" for _ in chunk_texts_per_doc]
-        if not non_empty_docs:
-            return compressed_texts
+        output_doc_indices = [
+            list(range(len(chunk_texts_per_doc)))
+            for chunk_texts_per_doc in batch_chunk_texts_per_doc
+        ]
+        active_query_indices = []
+        active_doc_indices = []
+        questions = []
+        contexts = []
+        for query_idx, (chunk_texts_per_doc, query) in enumerate(
+            zip(batch_chunk_texts_per_doc, batch_queries)
+        ):
+            doc_indices = [
+                doc_idx
+                for doc_idx, chunk_texts in enumerate(chunk_texts_per_doc)
+                if chunk_texts
+            ]
+            if not doc_indices:
+                continue
+            active_query_indices.append(query_idx)
+            active_doc_indices.append(doc_indices)
+            questions.append(query)
+            contexts.append(
+                [" ".join(chunk_texts_per_doc[doc_idx]) for doc_idx in doc_indices]
+            )
 
-        contexts = [[" ".join(chunk_texts)] for _, chunk_texts in non_empty_docs]
-        questions = [query] * len(contexts)
+        if not questions:
+            return compressed_batches, output_doc_indices
+
         with (
             open(os.devnull, "w") as devnull,
             redirect_stdout(devnull),
@@ -288,26 +340,133 @@ class ProvenceCompressor(OfficialSentenceSelector):
                 context=contexts,
                 threshold=self.threshold,
                 batch_size=self.batch_size,
+                always_select_title=True,
                 enable_warnings=False,
+                reorder=False,
             )
-        pruned_contexts = self._extract_pruned_contexts(results, len(contexts))
-        for (doc_idx, _), pruned_context in zip(non_empty_docs, pruned_contexts):
-            compressed_texts[doc_idx] = pruned_context
-        return compressed_texts
+        if not isinstance(results, dict):
+            raise ValueError("Provence batch output must be a dictionary.")
+        pruned_batches = results.get("pruned_context")
+        if not isinstance(pruned_batches, list) or len(pruned_batches) != len(
+            questions
+        ):
+            actual = (
+                len(pruned_batches)
+                if isinstance(pruned_batches, list)
+                else type(pruned_batches).__name__
+            )
+            raise ValueError(
+                "Provence returned an unexpected number of query-level outputs: "
+                f"expected {len(questions)}, got {actual}."
+            )
+
+        reranking_batches = results.get("reranking_score")
+        if self.reorder and (
+            not isinstance(reranking_batches, list)
+            or len(reranking_batches) != len(questions)
+        ):
+            actual = (
+                len(reranking_batches)
+                if isinstance(reranking_batches, list)
+                else type(reranking_batches).__name__
+            )
+            raise ValueError(
+                "Provence returned an unexpected number of query-level "
+                f"reranking scores: expected {len(questions)}, got {actual}."
+            )
+
+        for active_idx, (pruned_contexts, doc_indices) in enumerate(
+            zip(pruned_batches, active_doc_indices)
+        ):
+            if not isinstance(pruned_contexts, list) or len(pruned_contexts) != len(
+                doc_indices
+            ):
+                actual = (
+                    len(pruned_contexts)
+                    if isinstance(pruned_contexts, list)
+                    else type(pruned_contexts).__name__
+                )
+                raise ValueError(
+                    "Provence returned an unexpected number of document outputs "
+                    f"for active query {active_idx}: expected {len(doc_indices)}, "
+                    f"got {actual}."
+                )
+            if not all(isinstance(text, str) for text in pruned_contexts):
+                raise ValueError("Provence document outputs must all be strings.")
+            query_idx = active_query_indices[active_idx]
+            if self.reorder:
+                reranking_scores = reranking_batches[active_idx]
+                if not isinstance(reranking_scores, (list, tuple, np.ndarray)) or len(
+                    reranking_scores
+                ) != len(doc_indices):
+                    actual = (
+                        len(reranking_scores)
+                        if isinstance(reranking_scores, (list, tuple, np.ndarray))
+                        else type(reranking_scores).__name__
+                    )
+                    raise ValueError(
+                        "Provence returned an unexpected number of document "
+                        f"reranking scores for active query {active_idx}: "
+                        f"expected {len(doc_indices)}, got {actual}."
+                    )
+                ranked_positions = np.argsort(reranking_scores)[::-1][
+                    : self._RERANK_TOP_K
+                ]
+                output_doc_indices[query_idx] = [
+                    doc_indices[int(position)] for position in ranked_positions
+                ]
+                compressed_batches[query_idx] = [
+                    pruned_contexts[int(position)] for position in ranked_positions
+                ]
+                continue
+            for doc_idx, pruned_context in zip(doc_indices, pruned_contexts):
+                compressed_batches[query_idx][doc_idx] = pruned_context
+        return compressed_batches, output_doc_indices
+
+    def _compress_texts_batch(
+        self,
+        batch_chunk_texts_per_doc: List[List[List[str]]],
+        batch_queries: List[str],
+    ) -> List[List[str]]:
+        compressed_batches, _ = self._compress_texts_batch_with_doc_indices(
+            batch_chunk_texts_per_doc,
+            batch_queries,
+        )
+        return compressed_batches
 
     def compress_batch_top_k_docs(
         self, batch_top_k_docs: List[List[RetrievableChunk]], batch_queries: List[str]
     ):
+        if len(batch_top_k_docs) != len(batch_queries):
+            raise ValueError(
+                "Provence requires one retrieved-document batch per query: "
+                f"got {len(batch_top_k_docs)} document batches and "
+                f"{len(batch_queries)} queries."
+            )
+        batch_chunk_texts_per_doc = [
+            [self._get_document_texts(doc) for doc in docs] for docs in batch_top_k_docs
+        ]
+        compressed_text_batches, output_doc_indices = (
+            self._compress_texts_batch_with_doc_indices(
+                batch_chunk_texts_per_doc,
+                batch_queries,
+            )
+        )
         compressed_batches = []
-        for docs, query in zip(batch_top_k_docs, batch_queries):
-            chunk_texts_per_doc = [self._get_chunk_texts(doc) for doc in docs]
-            compressed_texts = self._compress_texts_batch(chunk_texts_per_doc, query)
+        for docs, chunk_texts_per_doc, compressed_texts, doc_indices in zip(
+            batch_top_k_docs,
+            batch_chunk_texts_per_doc,
+            compressed_text_batches,
+            output_doc_indices,
+        ):
             compressed_docs = []
-            for doc, chunk_texts, compressed_text in zip(
-                docs, chunk_texts_per_doc, compressed_texts
-            ):
+            for doc_idx, compressed_text in zip(doc_indices, compressed_texts):
+                doc = docs[doc_idx]
+                chunk_texts = chunk_texts_per_doc[doc_idx]
                 if not chunk_texts:
-                    compressed_docs.append(doc.clone())
+                    compressed_docs.append(
+                        self._build_text_document(doc, "", "provence")
+                    )
                     continue
                 compressed_docs.append(
                     self._build_text_document(doc, compressed_text, "provence")
@@ -337,26 +496,43 @@ class EXITCompressor(OfficialSentenceSelector):
         self.max_input_tokens = int(os.getenv("EXIT_MAX_INPUT_TOKENS", "2048"))
         self.batch_size = int(os.getenv("EXIT_BATCH_SIZE", "8"))
 
+        if not self.device.startswith("cuda") or not torch.cuda.is_available():
+            raise RuntimeError("EXIT requires CUDA for its fixed 4-bit model load")
+
         print(
             "exit compression enabled. "
-            f"Initializing base model: {self.base_model_name}, adapter: {self.adapter_name}"
+            f"Initializing 4-bit base model: {self.base_model_name}, "
+            f"adapter: {self.adapter_name}"
         )
-
-        model_kwargs = {}
-        if self.device == "cuda" and torch.cuda.is_available():
-            model_kwargs["torch_dtype"] = torch.float16
 
         base_model = AutoModelForCausalLM.from_pretrained(
             self.base_model_name,
-            **model_kwargs,
+            device_map={"": self.device},
+            torch_dtype=torch.float16,
+            quantization_config=BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_compute_dtype=torch.float16,
+                bnb_4bit_quant_type="nf4",
+                bnb_4bit_use_double_quant=True,
+            ),
         )
-        self.model = PeftModel.from_pretrained(base_model, self.adapter_name).to(
-            self.device
-        )
+        self.model = PeftModel.from_pretrained(base_model, self.adapter_name)
         self.model.eval()
         self.tokenizer = AutoTokenizer.from_pretrained(self.base_model_name)
         self.yes_token_id = self.tokenizer.encode("Yes", add_special_tokens=False)[0]
         self.no_token_id = self.tokenizer.encode("No", add_special_tokens=False)[0]
+        self.sentence_splitter = spacy.load(
+            "en_core_web_sm",
+            disable=[
+                "tok2vec",
+                "tagger",
+                "parser",
+                "attribute_ruler",
+                "lemmatizer",
+                "ner",
+            ],
+        )
+        self.sentence_splitter.enable_pipe("senter")
 
     @staticmethod
     def _build_prompt(query: str, context: str, sentence: str) -> str:
@@ -392,6 +568,13 @@ class EXITCompressor(OfficialSentenceSelector):
             return selected
         return [max(range(len(scores)), key=lambda idx: scores[idx])] if scores else []
 
+    def _split_document_sentences(self, document_text: str) -> List[str]:
+        return [
+            sentence.text.strip()
+            for sentence in self.sentence_splitter(document_text).sents
+            if sentence.text.strip()
+        ]
+
     def _select_sentence_indices(self, chunk_texts: List[str], query: str) -> List[int]:
         context = " ".join(chunk_texts)
         prompts = [
@@ -407,17 +590,20 @@ class EXITCompressor(OfficialSentenceSelector):
         self, batch_top_k_docs: List[List[RetrievableChunk]], batch_queries: List[str]
     ):
         compressed_batches = [
-            [doc.clone() for doc in docs] for docs in batch_top_k_docs
+            [self._build_text_document(doc, "", "exit") for doc in docs]
+            for docs in batch_top_k_docs
         ]
         prompt_records = []
         prompts = []
 
         for query_idx, (docs, query) in enumerate(zip(batch_top_k_docs, batch_queries)):
             for doc_idx, doc in enumerate(docs):
-                chunk_texts = self._get_chunk_texts(doc)
+                context = self._get_document_text(doc)
+                if not context:
+                    continue
+                chunk_texts = self._split_document_sentences(context)
                 if not chunk_texts:
                     continue
-                context = " ".join(chunk_texts)
                 for sentence_idx, sentence in enumerate(chunk_texts):
                     prompt_records.append(
                         (query_idx, doc_idx, sentence_idx, chunk_texts)

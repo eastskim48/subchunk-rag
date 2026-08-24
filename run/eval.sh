@@ -46,7 +46,7 @@ export TORCHRUN_MASTER_PORT="${TORCHRUN_MASTER_PORT:-29500}"
 
 USES_TOKEN_BUDGET=False
 case "$COMPRESS_METHOD" in
-    dense|colbert_subchunk|colbert_sliding_region|rerank_and_region)
+    dense|dense_online|dense_sliding_region_max|dense_sliding_region_avg|colbert_subchunk|colbert_sliding_region|rerank_and_region|xrag_jina_cass)
         USES_TOKEN_BUDGET=True
         ;;
 esac
@@ -56,6 +56,17 @@ if [ "$USES_TOKEN_BUDGET" = "True" ]; then
        { [ -z "${RETAIN_TOKEN_RATIO:-}" ] && [ -z "${FINAL_TOKEN_BUDGET:-}" ]; }; then
         echo "exactly one of RETAIN_TOKEN_RATIO or FINAL_TOKEN_BUDGET must be set for $COMPRESS_METHOD" >&2
         exit 1
+    fi
+fi
+
+CARROT_USES_TOKEN_BUDGET=False
+if [ "$COMPRESS_METHOD" = "carrot" ]; then
+    if [ -n "${RETAIN_TOKEN_RATIO:-}" ] && [ -n "${FINAL_TOKEN_BUDGET:-}" ]; then
+        echo "at most one of RETAIN_TOKEN_RATIO or FINAL_TOKEN_BUDGET may be set for carrot" >&2
+        exit 1
+    fi
+    if [ -n "${RETAIN_TOKEN_RATIO:-}" ] || [ -n "${FINAL_TOKEN_BUDGET:-}" ]; then
+        CARROT_USES_TOKEN_BUDGET=True
     fi
 fi
 
@@ -69,7 +80,7 @@ if [ "$PROMPT_FORMAT" != "raw_chunk_first" ]; then
     PROMPT_FORMAT_TAG="${PROMPT_FORMAT_TAG// /_}"
     OUTPUT_SUFFIX="pf${PROMPT_FORMAT_TAG}-$OUTPUT_SUFFIX"
 fi
-if [ "$USES_TOKEN_BUDGET" = "True" ]; then
+if [ "$USES_TOKEN_BUDGET" = "True" ] || [ "$CARROT_USES_TOKEN_BUDGET" = "True" ]; then
     if [ -n "${RETAIN_TOKEN_RATIO:-}" ]; then
         OUTPUT_SUFFIX="rtr${RETAIN_TOKEN_RATIO}-$OUTPUT_SUFFIX"
     elif [ -n "${FINAL_TOKEN_BUDGET:-}" ]; then
@@ -84,6 +95,9 @@ if { [ "$COMPRESS_METHOD" = "colbert_rerank" ] || [ "$COMPRESS_METHOD" = "rerank
 fi
 if { [ "$COMPRESS_METHOD" = "colbert_sliding_region" ] || [ "$COMPRESS_METHOD" = "rerank_and_region" ]; } && [ "$COLBERT_REGION_GROUP_ORDER" != "retrieval" ]; then
     OUTPUT_SUFFIX="rgo${COLBERT_REGION_GROUP_ORDER}-$OUTPUT_SUFFIX"
+fi
+if { [ "$COMPRESS_METHOD" = "xrag_jina" ] || [ "$COMPRESS_METHOD" = "xrag_jina_cass" ]; } && [ -n "${XRAG_TOP_N:-}" ] && [ -n "${XRAG_MAX_LENGTH:-}" ]; then
+    OUTPUT_SUFFIX="xrtopn${XRAG_TOP_N}-xrml${XRAG_MAX_LENGTH}-$OUTPUT_SUFFIX"
 fi
 if [ "$MODEL_LOAD_IN_4BIT" = "True" ] || [ "$MODEL_LOAD_IN_4BIT" = "true" ] || [ "$MODEL_LOAD_IN_4BIT" = "1" ]; then
     OUTPUT_SUFFIX="llm4bit-$OUTPUT_SUFFIX"

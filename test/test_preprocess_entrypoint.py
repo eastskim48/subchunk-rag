@@ -44,7 +44,7 @@ class PreprocessEntrypointTest(unittest.TestCase):
         self.assertNotIn("prefix_title", parameter_names)
         self.assertNotIn("title_separator", parameter_names)
         self.assertNotIn("validate_against_db", parameter_names)
-        self.assertEqual(parameters["center_unit"].default, "subchunk")
+        self.assertEqual(parameters["center_unit"].default, "subchunk_only")
 
     def test_fixed_retrievable_chunk_preserves_source_span_metadata(self):
         cacheable = CacheableChunk(

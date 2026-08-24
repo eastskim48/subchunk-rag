@@ -56,9 +56,15 @@ def main(
     disable_rope = _coerce_bool(disable_rope)
     use_front_bos_cache = _coerce_bool(use_front_bos_cache)
     model_load_in_4bit = _coerce_bool(model_load_in_4bit)
-    if use_past_cache and compress_method in {"provence", "exit"}:
+    if use_past_cache and compress_method in {
+        "provence",
+        "exit",
+        "carrot",
+        "xrag_jina",
+        "xrag_jina_cass",
+    }:
         raise ValueError(
-            f"compress_method='{compress_method}' now emits compressed text directly and is cache-off only; "
+            f"compress_method='{compress_method}' is cache-off only; "
             "set use_past_cache=False."
         )
     if use_past_cache and prompt_format != "raw_chunk_first":

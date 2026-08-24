@@ -323,7 +323,13 @@ class ChromaDB(VectorDB):
 
     @staticmethod
     def _serialize_cacheables(cacheables: List[CacheableChunk]) -> str:
-        return json.dumps([cacheable.to_payload() for cacheable in cacheables])
+        payloads = []
+        for cacheable in cacheables:
+            payload = cacheable.to_payload()
+            payload.pop("chunk_size", None)
+            payload.pop("sentence_texts", None)
+            payloads.append(payload)
+        return json.dumps(payloads)
 
     @staticmethod
     def _deserialize_cacheables(value) -> List[CacheableChunk]:

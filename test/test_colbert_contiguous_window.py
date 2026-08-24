@@ -104,6 +104,21 @@ class ColBERTContiguousWindowTest(unittest.TestCase):
         self.assertEqual(specs[2].selected_indices, [2])
         self.assertEqual(specs[2].addition_order, [2])
 
+    def test_region_budget_can_exceed_encoder_document_limit(self):
+        encoder = object.__new__(ColBERTWindowEncoder)
+        encoder.doc_maxlen = 40
+        encoder.doc_token_overhead = 0
+        encoder.token_counts_without_specials = lambda sentences: [
+            int(sentence) for sentence in sentences
+        ]
+
+        specs = encoder.build_centered_windows(
+            ["30", "30", "30"],
+            window_token_budget=90,
+        )
+
+        self.assertEqual(specs[1].selected_indices, [0, 1, 2])
+
     def test_generated_encoder_windows_are_contiguous(self):
         encoder = object.__new__(ColBERTWindowEncoder)
         encoder.doc_maxlen = 1000

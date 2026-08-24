@@ -15,7 +15,11 @@ from compressor.methods.colbert.rerank import (
     _ColBERTRerankMixin,
     _configured_colbert_rerank_keep,
 )
-from compressor.methods.colbert.scoring import score_maxsim
+from compressor.methods.colbert.scoring import (
+    aggregate_sentence_maxsim,
+    score_maxsim,
+    sentence_token_maxsim,
+)
 
 
 def _configured_region_group_order() -> str:
@@ -81,17 +85,29 @@ class ColBERTSlidingRegionCompressor(ColBERTWindowCompressorBase):
     def _build_region_document(
         doc: RetrievableChunk, selected_cacheables: list[CacheableChunk]
     ) -> RetrievableChunk:
+        source_order_by_id = {
+            str(cacheable.id): source_idx
+            for source_idx, cacheable in enumerate(doc.cacheables)
+        }
+
+        def source_order(cacheable: CacheableChunk) -> int:
+            if not cacheable.sentence_ids:
+                raise ValueError(
+                    f"selected ColBERT region {cacheable.id!r} has no source IDs"
+                )
+            first_source_id = str(cacheable.sentence_ids[0])
+            if first_source_id not in source_order_by_id:
+                raise ValueError(
+                    "selected ColBERT region references a source ID outside its "
+                    f"retrieval chunk: region={cacheable.id!r}, "
+                    f"source_id={first_source_id!r}, chunk={doc.id!r}"
+                )
+            return source_order_by_id[first_source_id]
+
         cloned = doc.clone()
         cloned.cacheables = [
             cacheable.clone()
-            for _, cacheable in sorted(
-                enumerate(selected_cacheables),
-                key=lambda item: (
-                    item[1].chunk_start is None,
-                    item[1].chunk_start if item[1].chunk_start is not None else item[0],
-                    item[0],
-                ),
-            )
+            for cacheable in sorted(selected_cacheables, key=source_order)
         ]
         return cloned
 
@@ -228,71 +244,26 @@ class ColBERTSlidingRegionCompressor(ColBERTWindowCompressorBase):
                 )
             return scores
 
-        nonempty_items = [
-            (idx, vectors)
-            for idx, vectors in enumerate(sentence_vectors)
-            if vectors.numel() > 0
-        ]
-        if nonempty_items:
-            sentence_ids = torch.repeat_interleave(
-                torch.tensor(
-                    [idx for idx, _ in nonempty_items],
-                    dtype=torch.long,
-                    device=query_vector.device,
-                ),
-                torch.tensor(
-                    [int(vectors.shape[0]) for _, vectors in nonempty_items],
-                    dtype=torch.long,
-                    device=query_vector.device,
-                ),
-            )
-            all_vectors = torch.cat(
-                [vectors for _, vectors in nonempty_items], dim=0
-            ).to(query_vector.device)
-        else:
-            sentence_ids = torch.empty(
-                (0,), dtype=torch.long, device=query_vector.device
-            )
-            dim = int(query_vector.shape[1]) if query_vector.dim() == 2 else 0
-            all_vectors = torch.empty(
-                (0, dim), dtype=torch.float32, device=query_vector.device
-            )
-
-        query_float = query_vector.to(torch.float32)
-        sentence_scores_t = torch.full(
-            (query_float.shape[0], len(sentence_vectors)),
-            float("-inf"),
-            dtype=torch.float32,
-            device=query_float.device,
+        precomputed_by_source_id = getattr(
+            self, "_coarse_sentence_scores_by_source_id", {}
         )
-        if all_vectors.numel() > 0:
-            sims = torch.matmul(query_float, all_vectors.to(torch.float32).T)
-            index = sentence_ids.unsqueeze(0).expand(query_float.shape[0], -1)
-            sentence_scores_t.scatter_reduce_(
-                1, index, sims, reduce="amax", include_self=True
-            )
-        sentence_scores = sentence_scores_t.T
+        precomputed_rows = []
+        for cache_key, sentence_idx in sentence_index_by_key.items():
+            source_id, source_idx, _ = cache_key
+            source_scores = precomputed_by_source_id.get(source_id)
+            if source_scores is None or source_idx >= len(source_scores):
+                precomputed_rows = []
+                break
+            if sentence_idx != len(precomputed_rows):
+                precomputed_rows = []
+                break
+            precomputed_rows.append(source_scores[source_idx])
 
-        max_region_sentences = max(
-            (len(indices) for indices in region_sentence_indices), default=0
-        )
-        if max_region_sentences == 0:
-            scores = [float("-inf")] * len(regions)
+        if len(precomputed_rows) == len(sentence_vectors):
+            sentence_scores = torch.stack(precomputed_rows)
         else:
-            padded_region_indices = [
-                list(indices) + [-1] * (max_region_sentences - len(indices))  # padding
-                for indices in region_sentence_indices
-            ]
-            region_index_tensor = torch.tensor(
-                padded_region_indices,
-                dtype=torch.long,
-                device=sentence_scores.device,
-            )
-            valid = region_index_tensor >= 0
-            gathered = sentence_scores[region_index_tensor.clamp_min(0)]
-            gathered = gathered.masked_fill(~valid.unsqueeze(-1), float("-inf"))
-            region_scores = gathered.max(dim=1).values.sum(dim=1)
-            scores = [float(value) for value in region_scores.detach().cpu().tolist()]
+            sentence_scores = sentence_token_maxsim(query_vector, sentence_vectors)
+        scores = aggregate_sentence_maxsim(sentence_scores, region_sentence_indices)
 
         for region_idx in fallback_regions:
             region = regions[region_idx]
@@ -324,7 +295,6 @@ class ColBERTSlidingRegionCompressor(ColBERTWindowCompressorBase):
         source_cacheables = region["source_cacheables"]
         for run in runs:
             run_cacheables = [source_cacheables[idx] for idx in run]
-            first = run_cacheables[0]
             cacheables.append(
                 CacheableChunk(
                     id=f"{region['region_id']}::dedup_{run[0]}_{run[-1]}",
@@ -333,7 +303,6 @@ class ColBERTSlidingRegionCompressor(ColBERTWindowCompressorBase):
                     chunk_size=self.region_token_budget,
                     sentence_ids=[cacheable.id for cacheable in run_cacheables],
                     sentence_texts=[cacheable.text for cacheable in run_cacheables],
-                    chunk_start=first.chunk_start,
                 )
             )
         return cacheables

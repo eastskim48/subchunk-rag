@@ -36,7 +36,7 @@ def main(
     repo_path: str | None = None,
     disable_cpu_extension: bool = True,
     validation_batch_size: int = 2048,
-    center_unit: str = "subchunk",
+    center_unit: str = "subchunk_only",
     fixed_chunk_size: int | None = None,
 ):
     normalized_backend = backend.strip().lower()

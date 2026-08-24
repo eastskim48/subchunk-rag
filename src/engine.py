@@ -63,9 +63,15 @@ class QueryProcessor:
         }
         if self.compress is not None:
             print(f"using compress method: {self.compress}")
-        if self.use_past_cache and self.compress in {"provence", "exit"}:
+        if self.use_past_cache and self.compress in {
+            "provence",
+            "exit",
+            "carrot",
+            "xrag_jina",
+            "xrag_jina_cass",
+        }:
             raise ValueError(
-                f"compress_method='{self.compress}' emits compressed text directly and is cache-off only; "
+                f"compress_method='{self.compress}' is cache-off only; "
                 "set use_past_cache=False."
             )
 
