@@ -36,3 +36,8 @@ test/*
 !test/build_hotpotqa_embedder_vanilla_dbs.py
 dataset_info/
 docs/handoff.md
+
+/test/
+/docs/
+/notebooks/
+/AGENTS.md
