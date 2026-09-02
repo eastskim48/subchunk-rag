@@ -121,6 +121,7 @@ else
     OUTPUT_PATH_SUFFIX="-topk${TOP_K}-$OUTPUT_SUFFIX"
 fi
 OUTPUT_FILE="${OUTPUT_FILE:-./outputs/eval-$DATASET-$DATA_SUBDIR${OUTPUT_PATH_SUFFIX}.jsonl}"
+mkdir -p "$(dirname "$OUTPUT_FILE")"
 
 TOTAL_NUM_ARGS=()
 if [ -n "$TOTAL_NUM" ]; then

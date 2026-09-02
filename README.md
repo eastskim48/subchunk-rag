@@ -19,37 +19,40 @@ pip install -r requirements.txt
 ```
 
 Run every command below from the repository root. With `DATASET_PREFIX=.`, the
-dataset and its preprocessing artifacts are stored under `./hotpotqa`.
+dataset and its preprocessing artifacts are stored under `./dapr-nq-open`.
 
 ## Dataset Construction
 
-Build the project's custom HotpotQA retrieval dataset from the official
-HotpotQA distractor-development data and processed Wikipedia archive:
+Build the project's custom Document-Aware Passage Retrieval Natural Questions
+(DAPR-NQ)/Natural Questions Open (NQ-open) dataset:
 
 ```bash
-DATASET_PREFIX=. ./dataset/get_hotpotqa.sh
+DATASET_PREFIX=. ./dataset/get_nq.sh
 ```
 
-`get_hotpotqa.sh` downloads and verifies the source files and constructs the
-66,705-document corpus with all 7,405 questions and answers under
-`./hotpotqa`.
+`get_nq.sh` downloads and verifies the pinned DAPR-NQ and NQ-open source files,
+then constructs the 108,626-document corpus with all 2,390 custom intersection
+questions and answers under `./dapr-nq-open`.
 
-This is a custom retrieval corpus constructed by this project; it is not the
-official HotpotQA ten-context evaluation setting. Dataset construction does not
+This is a custom dataset constructed by this project by exact question matching
+between the DAPR-NQ test split and the NQ-open development split; it is not an
+official Natural Questions benchmark setting. Dataset construction does not
 build the vector database or ColBERT artifact.
 
-`DATASET_PREFIX` selects the parent directory that contains the `hotpotqa`
-dataset directory. The examples below use `DATASET_PREFIX=.` consistently;
-replace `.` with another parent directory when needed.
+`DATASET_PREFIX` selects the parent directory that contains the
+`dapr-nq-open` dataset directory. The examples below use `DATASET_PREFIX=.`
+consistently; replace `.` with another parent directory when needed.
 
 ## Preprocess
 
 Database preprocessing and ColBERT artifact construction are separate stages.
-First, build the representative sentence-based BGE-small-en-v1.5 database:
+First, build the representative BGE-small-en-v1.5 retrieval database of
+512-token chunks with sentence-based encoding units. Under this custom
+preprocessing configuration, sentences longer than 180 tokens are split:
 
 ```bash
 DATASET_PREFIX=. \
-DATASET=hotpotqa \
+DATASET=dapr-nq-open \
 PREPROCESS_SUBDIR=sent-bge-small-v1.5-512-splitlong180 \
 SPLITTER=sentence \
 RETRIEVABLE_CHUNK_SIZE=512 \
@@ -65,13 +68,13 @@ DB_BATCH_SIZE=5461 \
 ```
 
 This writes the database to
-`./hotpotqa/sent-bge-small-v1.5-512-splitlong180/db`.
+`./dapr-nq-open/sent-bge-small-v1.5-512-splitlong180/db`.
 
 Then build the matching ColBERT artifact:
 
 ```bash
 DATASET_PREFIX=. \
-DATASET=hotpotqa \
+DATASET=dapr-nq-open \
 PREPROCESS_SUBDIR=sent-bge-small-v1.5-512-splitlong180 \
 CANDIDATE_STORE_BACKEND=colbert \
 COLBERT_WINDOW_BATCH_SIZE=6144 \
@@ -81,15 +84,15 @@ bash ./run/materialize_candidate_store.sh
 ```
 
 This writes the artifact to
-`./hotpotqa/sent-bge-small-v1.5-512-splitlong180/colbert_window`.
+`./dapr-nq-open/sent-bge-small-v1.5-512-splitlong180/colbert_window`.
 
 ## Representative Experiment
 
-Run the cache-off Subchunk-RAG experiment over all 7,405 questions:
+Run the cache-off Subchunk-RAG experiment over all 2,390 questions:
 
 ```bash
 DATASET_PREFIX=. \
-DATASET=hotpotqa \
+DATASET=dapr-nq-open \
 DATA_SUBDIR=sent-bge-small-v1.5-512-splitlong180 \
 COMPRESS_METHOD=colbert_sliding_region \
 CHROMA_EMBED_BACKEND=bge_small_v1_5 \
@@ -97,7 +100,7 @@ MODEL_NAME=meta-llama/Llama-3.1-8B-Instruct \
 EVAL_USE_PAST_CACHE=False \
 TOP_K=20 \
 RETAIN_TOKEN_RATIO=0.25 \
-TOTAL_NUM=7405 \
+TOTAL_NUM=2390 \
 ./run/eval.sh
 ```
 
@@ -105,10 +108,10 @@ With `DATASET_PREFIX=.`, `run/eval.sh` reads the files produced by the
 dataset and preprocessing commands above:
 
 ```text
-./hotpotqa/questions/query.jsonl
-./hotpotqa/answers/answer.jsonl
-./hotpotqa/sent-bge-small-v1.5-512-splitlong180/db
-./hotpotqa/sent-bge-small-v1.5-512-splitlong180/colbert_window
+./dapr-nq-open/questions/query.jsonl
+./dapr-nq-open/answers/answer.jsonl
+./dapr-nq-open/sent-bge-small-v1.5-512-splitlong180/db
+./dapr-nq-open/sent-bge-small-v1.5-512-splitlong180/colbert_window
 ```
 
 All remaining evaluation settings use the defaults in `run/eval.sh`.

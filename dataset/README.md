@@ -13,3 +13,5 @@ Available entry points:
 - `get_hotpot_full.sh`: the same HotpotQA queries and answers with every page
   in the official processed October 2017 Wikipedia archive as the shared
   retrieval corpus.
+- `get_nq.sh`: custom DAPR-NQ test / official NQ-open development
+  exact-question intersection with all DAPR NaturalQuestions parent documents.

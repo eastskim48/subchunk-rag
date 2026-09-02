@@ -23,7 +23,9 @@ from typing import Any, Iterable
 from transformers import AutoTokenizer
 
 OFFICIAL_DEV_URL = (
-    "http://curtis.ml.cmu.edu/datasets/hotpot/hotpot_dev_distractor_v1.json"
+    "https://huggingface.co/datasets/RAGLAB/data/resolve/"
+    "c33b09b7fa5099b89830e84f9bdff78329268d9b/"
+    "eval_datasets/HotPotQA/hotpot_dev_distractor_v1.json?download=true"
 )
 OFFICIAL_WIKI_URL = (
     "https://nlp.stanford.edu/projects/hotpotqa/"
