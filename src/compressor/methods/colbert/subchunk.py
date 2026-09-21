@@ -41,7 +41,7 @@ class ColBERTSubchunkCompressor(ColBERTWindowCompressorBase):
         deduped = []
         for score, candidate in scored_candidates:
             cacheable_id = candidate.get("cacheable_id")
-            if not cacheable_id:
+            if cacheable_id is None:
                 deduped.append((score, candidate))
                 continue
             existing = best_by_id.get(cacheable_id)

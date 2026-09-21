@@ -120,7 +120,7 @@ class SentenceParser(UnitParser):
             from blingfire import text_to_sentences
         except ImportError as exc:
             raise ImportError(
-                "splitter='sentence' or splitter='semantic' requires blingfire to be installed"
+                "splitter='sentence' requires blingfire to be installed"
             ) from exc
 
         sentence_texts = [

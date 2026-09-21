@@ -46,7 +46,7 @@ export TORCHRUN_MASTER_PORT="${TORCHRUN_MASTER_PORT:-29500}"
 
 USES_TOKEN_BUDGET=False
 case "$COMPRESS_METHOD" in
-    dense|dense_online|dense_sliding_region_max|dense_sliding_region_avg|colbert_subchunk|colbert_sliding_region|rerank_and_region|xrag_jina_cass)
+    dense|dense_online|dense_sliding_region_max|dense_sliding_region_avg|colbert_subchunk|colbert_sliding_region|xrag_jina_cass)
         USES_TOKEN_BUDGET=True
         ;;
 esac
@@ -87,13 +87,7 @@ if [ "$USES_TOKEN_BUDGET" = "True" ] || [ "$CARROT_USES_TOKEN_BUDGET" = "True" ]
         OUTPUT_SUFFIX="ftb${FINAL_TOKEN_BUDGET}-$OUTPUT_SUFFIX"
     fi
 fi
-if [ "$COMPRESS_METHOD" = "colbert_chunk_rerank" ] && [ -n "${COLBERT_CHUNK_RERANK_KEEP:-}" ]; then
-    OUTPUT_SUFFIX="ccrk${COLBERT_CHUNK_RERANK_KEEP}-$OUTPUT_SUFFIX"
-fi
-if { [ "$COMPRESS_METHOD" = "colbert_rerank" ] || [ "$COMPRESS_METHOD" = "rerank_and_region" ]; } && [ -n "${COLBERT_RERANK_KEEP:-}" ]; then
-    OUTPUT_SUFFIX="crk${COLBERT_RERANK_KEEP}-$OUTPUT_SUFFIX"
-fi
-if { [ "$COMPRESS_METHOD" = "colbert_sliding_region" ] || [ "$COMPRESS_METHOD" = "rerank_and_region" ]; } && [ "$COLBERT_REGION_GROUP_ORDER" != "retrieval" ]; then
+if [ "$COMPRESS_METHOD" = "colbert_sliding_region" ] && [ "$COLBERT_REGION_GROUP_ORDER" != "retrieval" ]; then
     OUTPUT_SUFFIX="rgo${COLBERT_REGION_GROUP_ORDER}-$OUTPUT_SUFFIX"
 fi
 if { [ "$COMPRESS_METHOD" = "xrag_jina" ] || [ "$COMPRESS_METHOD" = "xrag_jina_cass" ]; } && [ -n "${XRAG_TOP_N:-}" ] && [ -n "${XRAG_MAX_LENGTH:-}" ]; then

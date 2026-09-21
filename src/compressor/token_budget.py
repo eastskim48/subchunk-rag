@@ -4,7 +4,7 @@ import math
 import os
 from typing import List
 
-from transformers import AutoTokenizer
+from materialize.db_manifest import read_db_build_manifest
 
 from chunk import RetrievableChunk
 
@@ -12,7 +12,9 @@ from chunk import RetrievableChunk
 class TokenBudgetMixin:
     """Resolve ratio/absolute budgets and cache token lengths consistently."""
 
-    def _initialize_token_budget(self, require_budget: bool = True) -> None:
+    def _initialize_token_budget(
+        self, require_budget: bool = True, *, db_dir: str | None = None
+    ) -> None:
         # Grid configs use an empty string to explicitly clear an inherited
         # budget controller; treat it the same as an unset environment value.
         retain_token_ratio = (os.getenv("RETAIN_TOKEN_RATIO") or "").strip() or None
@@ -46,8 +48,20 @@ class TokenBudgetMixin:
                 "MODEL_NAME must be set for final token-budget accounting; "
                 "the final prompt budget must use the evaluated LLM tokenizer"
             )
-        self.budget_tokenizer_name = model_name
-        self.budget_tokenizer = AutoTokenizer.from_pretrained(model_name)
+        if db_dir is None:
+            raise ValueError(
+                "DB_DIR or DATASET_PATH/DATA_SUBDIR is required for tokenizer validation"
+            )
+        manifest = read_db_build_manifest(db_dir)
+        if manifest is None:
+            raise FileNotFoundError(f"missing DB build manifest: {db_dir}")
+        tokenizer_name = manifest.get("tokenizer_name")
+        if tokenizer_name != model_name:
+            raise ValueError(
+                "DB tokenizer_name does not match MODEL_NAME: "
+                f"db={tokenizer_name!r}, runtime={model_name!r}, db_dir={db_dir!r}"
+            )
+        self.budget_tokenizer_name = tokenizer_name
         self._token_len_cache: dict[str, int] = {}
 
     @staticmethod
@@ -73,7 +87,7 @@ class TokenBudgetMixin:
                 if not text:
                     continue
                 cacheable_id = getattr(cacheable, "id", None)
-                if cacheable_id:
+                if cacheable_id is not None:
                     if cacheable_id in seen_ids:
                         continue
                     seen_ids.add(cacheable_id)
@@ -90,83 +104,30 @@ class TokenBudgetMixin:
             return 0
         return max(1, math.ceil(retrieved_tokens * self.retain_token_ratio))
 
-    def _stored_prompt_token_count(self, cacheable) -> int | None:
+    def _stored_prompt_token_count(self, cacheable) -> int:
         prompt_token_count = getattr(cacheable, "prompt_token_count", None)
         if prompt_token_count is None:
-            return None
-        prompt_tokenizer_name = getattr(cacheable, "prompt_tokenizer_name", None)
-        if prompt_tokenizer_name != self.budget_tokenizer_name:
-            return None
+            raise ValueError(
+                "missing prompt_token_count for subchunk "
+                f"{getattr(cacheable, 'id', None)!r}"
+            )
         return int(prompt_token_count)
 
     def _cacheable_token_len(self, cacheable) -> int:
+        stored_token_count = self._stored_prompt_token_count(cacheable)
         cacheable_id = getattr(cacheable, "id", None)
-        if cacheable_id:
+        if cacheable_id is not None:
             cached = self._token_len_cache.get(cacheable_id)
             if cached is not None:
                 return cached
-        stored_token_count = self._stored_prompt_token_count(cacheable)
-        if stored_token_count is not None:
-            if cacheable_id:
-                self._token_len_cache[cacheable_id] = stored_token_count
-            return stored_token_count
-        token_len = self._prompt_visible_token_count(cacheable)
-        if cacheable_id:
-            self._token_len_cache[cacheable_id] = token_len
-        return token_len
+            self._token_len_cache[cacheable_id] = stored_token_count
+        return stored_token_count
 
     def _cacheable_token_lens(self, cacheables) -> list[int]:
-        lengths: list[int | None] = []
-        missing = []
-        missing_positions = []
-        for position, cacheable in enumerate(cacheables):
-            cacheable_id = getattr(cacheable, "id", None)
-            cached = self._token_len_cache.get(cacheable_id) if cacheable_id else None
-            if cached is None:
-                stored_token_count = self._stored_prompt_token_count(cacheable)
-                if stored_token_count is not None:
-                    if cacheable_id:
-                        self._token_len_cache[cacheable_id] = stored_token_count
-                    lengths.append(stored_token_count)
-                    continue
-                lengths.append(None)
-                missing.append(cacheable)
-                missing_positions.append(position)
-            else:
-                lengths.append(cached)
-
-        if missing:
-            token_lengths = self._prompt_visible_token_counts(missing)
-            for cacheable, position, token_len in zip(
-                missing, missing_positions, token_lengths
-            ):
-                lengths[position] = token_len
-                cacheable_id = getattr(cacheable, "id", None)
-                if cacheable_id:
-                    self._token_len_cache[cacheable_id] = token_len
-
-        return [int(length) for length in lengths if length is not None]
+        return [self._cacheable_token_len(cacheable) for cacheable in cacheables]
 
     def _format_budget_cacheable_text(self, cacheable) -> str:
         return f"{cacheable.text.strip()}\n\n"
-
-    def _prompt_visible_token_count(self, cacheable) -> int:
-        return self._prompt_visible_token_counts([cacheable])[0]
-
-    def _prompt_visible_token_counts(self, cacheables) -> list[int]:
-        texts = [
-            self._format_budget_cacheable_text(cacheable) for cacheable in cacheables
-        ]
-        if not texts:
-            return []
-        encoded = self.budget_tokenizer(
-            texts,
-            padding=False,
-            truncation=False,
-            add_special_tokens=False,
-            verbose=False,
-        )
-        return [len(input_ids) for input_ids in encoded["input_ids"]]
 
     @staticmethod
     def _unique_cacheables(cacheables) -> list:
@@ -174,7 +135,7 @@ class TokenBudgetMixin:
         seen_ids = set()
         for cacheable in cacheables:
             cacheable_id = getattr(cacheable, "id", None)
-            if cacheable_id:
+            if cacheable_id is not None:
                 if cacheable_id in seen_ids:
                     continue
                 seen_ids.add(cacheable_id)

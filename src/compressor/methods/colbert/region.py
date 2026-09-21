@@ -4,19 +4,19 @@ import os
 import time
 from typing import List
 
+import numba
+import numpy as np
 import torch
 
 from chunk import CacheableChunk, RetrievableChunk
+from colbert_artifact import LEGACY_RESIDUAL_STORAGE_FORMAT, RESIDUAL_STORAGE_FORMAT
 from compressor.methods.colbert.base import (
     ColBERTWindowCompressorBase,
     _resolve_configured_retrieval_chunk_size,
 )
-from compressor.methods.colbert.rerank import (
-    _ColBERTRerankMixin,
-    _configured_colbert_rerank_keep,
-)
 from compressor.methods.colbert.scoring import (
     aggregate_sentence_maxsim,
+    direct_2bit_sentence_token_maxsim,
     score_maxsim,
     sentence_token_maxsim,
 )
@@ -50,6 +50,13 @@ class ColBERTSlidingRegionCompressor(ColBERTWindowCompressorBase):
         super().__init__()
         self.region_group_order = _configured_region_group_order()
         self._sliding_region_spec_cache = {}
+        # Keep 2-bit artifacts on the optimized reconstruct-then-MaxSim path.
+        self._use_direct_2bit_maxsim = False
+        if self._use_direct_2bit_maxsim and self.artifact.data.token_records is None:
+            raise ValueError(
+                "direct 2-bit MaxSim requires an artifact with token_records_file; "
+                "rebuild the 2-bit artifact with the current converter"
+            )
         self.region_token_budget = int(self.artifact.index["window_token_budget"])
         if self.region_token_budget <= self.encoder.doc_token_overhead:
             raise ValueError(
@@ -60,6 +67,24 @@ class ColBERTSlidingRegionCompressor(ColBERTWindowCompressorBase):
         _validate_retrieval_chunk_larger_than_region(
             retrieval_chunk_size, self.region_token_budget
         )
+
+    def warmup_query_encoder(self) -> float:
+        started = time.perf_counter()
+        super().warmup_query_encoder()
+        if self._use_direct_2bit_maxsim:
+            numba.set_num_threads(min(torch.get_num_threads(), numba.get_num_threads()))
+            data = self.artifact.data
+            direct_2bit_sentence_token_maxsim(
+                torch.zeros((1, data.embedding_dim), dtype=torch.float32),
+                np.zeros((1,), dtype=np.int32),
+                np.zeros((1, data.embedding_dim // 4), dtype=np.uint8),
+                data.centroids,
+                data.bucket_weights,
+                np.ones((1,), dtype=np.float32),
+                np.asarray([0, 1], dtype=np.int64),
+            )
+        self.query_encoder_warmup_time = time.perf_counter() - started
+        return self.query_encoder_warmup_time
 
     def clear_inter_batch_cache(self) -> None:
         super().clear_inter_batch_cache()
@@ -158,11 +183,13 @@ class ColBERTSlidingRegionCompressor(ColBERTWindowCompressorBase):
         if not cacheables:
             return []
         parent_doc_id = self._source_parent_document_id(doc, cacheables)
-        lookup_start = time.perf_counter()
-        vectors = self.artifact.vectors_for_doc(doc)
-        self._profile_add(
-            profile, "artifact_lookup_time", time.perf_counter() - lookup_start
-        )
+        vectors = None
+        if not getattr(self, "_use_direct_2bit_maxsim", False):
+            lookup_start = time.perf_counter()
+            vectors = self.artifact.vectors_for_doc(doc)
+            self._profile_add(
+                profile, "artifact_lookup_time", time.perf_counter() - lookup_start
+            )
 
         region_specs = self._cached_sliding_region_specs(doc, cacheables)
 
@@ -184,13 +211,106 @@ class ColBERTSlidingRegionCompressor(ColBERTWindowCompressorBase):
         self._profile_add(profile, "region_count", len(regions))
         return regions
 
+    def _score_sliding_regions_direct_2bit(
+        self,
+        query_vector: torch.Tensor,
+        regions,
+        profile: dict[str, float | int] | None = None,
+    ) -> list[float]:
+        sentence_refs = sorted(
+            {
+                (region["chunk_idx"], idx)
+                for region in regions
+                for idx in region["selected_indices"]
+                if 0 <= idx < len(region["source_cacheables"])
+            }
+        )
+        sentence_index = {ref: idx for idx, ref in enumerate(sentence_refs)}
+        regions_by_chunk = {region["chunk_idx"]: region for region in regions}
+        data = self.artifact.data
+        rows = []
+        lengths = []
+        for chunk_idx, source_idx in sentence_refs:
+            cacheable = regions_by_chunk[chunk_idx]["source_cacheables"][source_idx]
+            cacheable_id = getattr(cacheable, "id", None)
+            row = data.row_for_id(cacheable_id) if cacheable_id is not None else None
+            if row is not None:
+                start = int(data.offsets[row])
+                end = int(data.offsets[row + 1])
+                if end <= start:
+                    row = None
+            rows.append(row)
+            lengths.append(
+                0
+                if row is None
+                else int(data.offsets[row + 1]) - int(data.offsets[row])
+            )
+
+        region_sentence_indices = [
+            [
+                sentence_index[(region["chunk_idx"], idx)]
+                for idx in region["selected_indices"]
+                if (region["chunk_idx"], idx) in sentence_index
+            ]
+            for region in regions
+        ]
+
+        lookup_start = time.perf_counter()
+        valid_rows = [row for row in rows if row is not None]
+        ranges = []
+        for row in valid_rows:
+            start = int(data.offsets[row])
+            end = int(data.offsets[row + 1])
+            if ranges and start == ranges[-1][1]:
+                ranges[-1] = (ranges[-1][0], end)
+            else:
+                ranges.append((start, end))
+        if ranges:
+            token_records = np.concatenate(
+                [np.asarray(data.token_records[start:end]) for start, end in ranges]
+            )
+            codes = token_records["code"]
+            packed_residuals = token_records["residuals"]
+            token_norms = token_records["norm"]
+        else:
+            codes = np.empty((0,), dtype=np.int32)
+            packed_residuals = np.empty((0, data.embedding_dim // 4), dtype=np.uint8)
+            token_norms = np.empty((0,), dtype=np.float32)
+        sentence_offsets = np.empty(len(lengths) + 1, dtype=np.int64)
+        sentence_offsets[0] = 0
+        np.cumsum(np.asarray(lengths, dtype=np.int64), out=sentence_offsets[1:])
+        self._profile_add(
+            profile, "artifact_lookup_time", time.perf_counter() - lookup_start
+        )
+
+        score_start = time.perf_counter()
+        sentence_scores = direct_2bit_sentence_token_maxsim(
+            query_vector,
+            codes,
+            packed_residuals,
+            data.centroids,
+            data.bucket_weights,
+            token_norms,
+            sentence_offsets,
+        )
+        self._profile_add(
+            profile, "sentence_maxsim_time", time.perf_counter() - score_start
+        )
+        aggregate_start = time.perf_counter()
+        sentence_scores = sentence_token_maxsim(query_vector, sentence_vectors)
+        scores = aggregate_sentence_maxsim(sentence_scores, region_sentence_indices)
+        self._profile_add(
+            profile, "region_score_time", time.perf_counter() - aggregate_start
+        )
+        return scores
+
     @staticmethod
     def _sentence_score_cache_key(region, idx: int):
         cacheables = region["source_cacheables"]
         raw_cacheable_id = getattr(cacheables[idx], "id", None)
         source_vectors = region.get("source_vectors")
         source_key = id(source_vectors) if source_vectors is not None else "no_source"
-        if raw_cacheable_id:
+        if raw_cacheable_id is not None:
             return (source_key, idx, str(raw_cacheable_id))
         return (source_key, region["chunk_idx"], idx)
 
@@ -204,6 +324,10 @@ class ColBERTSlidingRegionCompressor(ColBERTWindowCompressorBase):
 
         if not regions:
             return []
+        if getattr(self, "_use_direct_2bit_maxsim", False):
+            return self._score_sliding_regions_direct_2bit(
+                query_vector, regions, profile
+            )
 
         sentence_index_by_key: dict[tuple, int] = {}
         sentence_vectors = []
@@ -244,25 +368,7 @@ class ColBERTSlidingRegionCompressor(ColBERTWindowCompressorBase):
                 )
             return scores
 
-        precomputed_by_source_id = getattr(
-            self, "_coarse_sentence_scores_by_source_id", {}
-        )
-        precomputed_rows = []
-        for cache_key, sentence_idx in sentence_index_by_key.items():
-            source_id, source_idx, _ = cache_key
-            source_scores = precomputed_by_source_id.get(source_id)
-            if source_scores is None or source_idx >= len(source_scores):
-                precomputed_rows = []
-                break
-            if sentence_idx != len(precomputed_rows):
-                precomputed_rows = []
-                break
-            precomputed_rows.append(source_scores[source_idx])
-
-        if len(precomputed_rows) == len(sentence_vectors):
-            sentence_scores = torch.stack(precomputed_rows)
-        else:
-            sentence_scores = sentence_token_maxsim(query_vector, sentence_vectors)
+        sentence_scores = sentence_token_maxsim(query_vector, sentence_vectors)
         scores = aggregate_sentence_maxsim(sentence_scores, region_sentence_indices)
 
         for region_idx in fallback_regions:
@@ -300,7 +406,6 @@ class ColBERTSlidingRegionCompressor(ColBERTWindowCompressorBase):
                     id=f"{region['region_id']}::dedup_{run[0]}_{run[-1]}",
                     text=" ".join(cacheable.text for cacheable in run_cacheables),
                     parent_doc_id=region["parent_doc_id"],
-                    chunk_size=self.region_token_budget,
                     sentence_ids=[cacheable.id for cacheable in run_cacheables],
                     sentence_texts=[cacheable.text for cacheable in run_cacheables],
                 )
@@ -404,11 +509,6 @@ class ColBERTSlidingRegionCompressor(ColBERTWindowCompressorBase):
             if chunk_idx not in selected_index_set
         ]
 
-    def _region_chunk_indices(self, docs, query_vector, profile) -> set[int]:
-        """Return retrieval-chunk indices eligible for region construction."""
-
-        return set(range(len(docs)))
-
     def compress_batch_top_k_docs(
         self, batch_top_k_docs: List[List[RetrievableChunk]], batch_queries: List[str]
     ):
@@ -422,17 +522,13 @@ class ColBERTSlidingRegionCompressor(ColBERTWindowCompressorBase):
 
         for docs, query_vector in zip(batch_top_k_docs, query_vectors):
             summarized_docs = [self._build_unselected_document(doc) for doc in docs]
-            allowed_indices = self._region_chunk_indices(docs, query_vector, profile)
-            gated_docs = [doc for idx, doc in enumerate(docs) if idx in allowed_indices]
             budget_start = time.perf_counter()
-            final_token_budget = self._resolve_final_token_budget(gated_docs)
+            final_token_budget = self._resolve_final_token_budget(docs)
             self._profile_add(
                 profile, "budget_time", time.perf_counter() - budget_start
             )
             regions = []
             for chunk_idx, doc in enumerate(docs):
-                if chunk_idx not in allowed_indices:
-                    continue
                 regions.extend(self._sliding_regions_for_doc(doc, chunk_idx, profile))
             if not regions:
                 summarized_batches.append(summarized_docs)
@@ -473,19 +569,3 @@ class ColBERTSlidingRegionCompressor(ColBERTWindowCompressorBase):
 
         self.last_profile = profile
         return summarized_batches
-
-
-class ColBERTRerankAndRegionCompressor(
-    _ColBERTRerankMixin, ColBERTSlidingRegionCompressor
-):
-    """Gate region selection with coarse ColBERT chunk reranking."""
-
-    def __init__(self):
-        self.rerank_keep = _configured_colbert_rerank_keep()
-        super().__init__()
-
-    def _region_chunk_indices(self, docs, query_vector, profile) -> set[int]:
-        ranked_indices = self._rerank_chunk_indices(docs, query_vector, profile)
-        allowed_indices = set(ranked_indices[: self.rerank_keep])
-        self._profile_add(profile, "rerank_kept_chunk_count", len(allowed_indices))
-        return allowed_indices

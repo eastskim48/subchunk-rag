@@ -1,6 +1,5 @@
 """Dense embedding adapter and Chroma-backed retrieval database."""
 
-import json
 import chromadb
 import abc
 import copy
@@ -11,6 +10,7 @@ import numpy as np
 from typing import Dict, List
 
 from chunk import RetrievableChunk, CacheableChunk
+from subchunk_store import load_subchunks, cacheables_from_metadata, pack_subchunk_range
 from encoder.dense import (
     BGE_SMALL_MODEL,
     BGE_M3_MODEL,
@@ -266,6 +266,7 @@ class ChromaDB(VectorDB):
         embedding_device: str,
         embedding_batch_size: int,
     ):
+        self.db_dir = os.path.realpath(db_dir)
         self.db = self._get_chroma_client(
             db_dir,
             embedding_device=embedding_device,
@@ -321,28 +322,6 @@ class ChromaDB(VectorDB):
             ),
         )
 
-    @staticmethod
-    def _serialize_cacheables(cacheables: List[CacheableChunk]) -> str:
-        payloads = []
-        for cacheable in cacheables:
-            payload = cacheable.to_payload()
-            payload.pop("chunk_size", None)
-            payload.pop("sentence_texts", None)
-            payloads.append(payload)
-        return json.dumps(payloads)
-
-    @staticmethod
-    def _deserialize_cacheables(value) -> List[CacheableChunk]:
-        if not value:
-            return []
-        if isinstance(value, str):
-            value = json.loads(value)
-        return [
-            CacheableChunk.from_payload(item)
-            for item in value
-            if isinstance(item, dict)
-        ]
-
     def find_top_k_docs(self, top_k: int, queries: List[str]):
         if top_k < 0:
             raise ValueError(f"top_k must be non-negative, got {top_k}")
@@ -371,8 +350,8 @@ class ChromaDB(VectorDB):
             for doc_id, text, metadata in zip(ids, documents, metadatas):
                 metadata = dict(metadata or {})
                 deserialize_start = time.perf_counter()
-                cacheables = self._deserialize_cacheables(
-                    metadata.pop("cacheables_json", None)
+                cacheables = cacheables_from_metadata(
+                    metadata, load_subchunks(self.db_dir)
                 )
                 cacheable_deserialize_time += time.perf_counter() - deserialize_start
                 if text is None:
@@ -410,17 +389,11 @@ class ChromaDB(VectorDB):
         metadatas = []
         for chunk in chunks:
             metadata = dict(chunk.metadata)
-            metadata["cacheables_json"] = self._serialize_cacheables(
-                getattr(chunk, "cacheables", None) or []
-            )
-            if chunk.chunk_size is not None:
-                metadata["chunk_size"] = chunk.chunk_size
-            if chunk.token_count is not None:
-                metadata["token_count"] = chunk.token_count
-            if chunk.cache_unit is not None:
-                metadata["cache_unit"] = chunk.cache_unit
-            if chunk.token_budget is not None:
-                metadata["token_budget"] = chunk.token_budget
+            metadata.pop("token_budget", None)
+            ids = [cacheable.id for cacheable in chunk.cacheables]
+            metadata.update(pack_subchunk_range(ids))
+            metadata.pop("subchunk_ids", None)
+            metadata.pop("cacheables_json", None)
             metadatas.append(metadata)
         self.db.upsert(
             documents=[chunk.text for chunk in chunks],

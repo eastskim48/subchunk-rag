@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 import time
 from argparse import ArgumentParser
@@ -62,6 +63,80 @@ def write_jsonl(path: Path, records: list[dict[str, Any]]) -> None:
             handle.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 
+def run_compression_only(
+    *,
+    dataset: str,
+    query_records: list[dict[str, Any]],
+    vectordb,
+    query_file: str,
+    db_dir: str,
+    top_k: int,
+    bsz: int,
+    compress_method: str,
+    setup_time: float,
+    output_file: str,
+) -> None:
+    compress_elapsed = 0.0
+    processed_queries = 0
+    processed_batches = 0
+    run_start = time.perf_counter()
+    for start in tqdm(
+        range(0, len(query_records), bsz),
+        total=(len(query_records) + bsz - 1) // bsz,
+    ):
+        batch = query_records[start : start + bsz]
+        batch_queries = [record["query"] for record in batch]
+        batch_docs = vectordb.find_top_k_docs(top_k=top_k, queries=batch_queries)
+
+        compress_start = time.perf_counter()
+        compressed_batch_docs = compress_docs(
+            batch_queries, batch_docs, option=compress_method
+        )
+        compress_elapsed += time.perf_counter() - compress_start
+
+        if len(compressed_batch_docs) != len(batch_queries):
+            raise ValueError(
+                "compressed batch size differs from query batch size: "
+                f"{len(compressed_batch_docs)} != {len(batch_queries)}"
+            )
+        processed_queries += len(batch_queries)
+        processed_batches += 1
+
+    if processed_queries != len(query_records):
+        raise ValueError(
+            "processed query count differs from input query count: "
+            f"{processed_queries} != {len(query_records)}"
+        )
+    summary = {
+        "format": "retrieval_only_compression_time_v1",
+        "dataset": dataset,
+        "query_file": query_file,
+        "query_count": processed_queries,
+        "batch_size": bsz,
+        "batch_count": processed_batches,
+        "db_dir": db_dir,
+        "top_k": top_k,
+        "compress_method": compress_method,
+        "colbert_window_dir": os.getenv("COLBERT_WINDOW_DIR"),
+        "setup_time_sec": setup_time,
+        "run_time_sec": time.perf_counter() - run_start,
+        "compress_time_sec": compress_elapsed,
+        "compress_ms_per_query": 1000.0 * compress_elapsed / processed_queries,
+        "compress_sec_per_batch": compress_elapsed / processed_batches,
+    }
+    output_path = Path(output_file)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(
+        json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    print(json.dumps(summary, ensure_ascii=False, indent=2))
+    print(
+        "compress time per batch | "
+        f"total: {compress_elapsed:.4f}, "
+        f"avg: {compress_elapsed / processed_batches:.4f}"
+    )
+
+
 def run_retrieval_only_evaluation(
     *,
     dataset: str,
@@ -84,6 +159,7 @@ def run_retrieval_only_evaluation(
     labels_by_id = load_text_evidence_labels(evidence_path)
     scorer = TextEvidenceCoverageScorer(metric_tokenizer=tokenizer)
     records = []
+    compress_elapsed = 0.0
     for start in tqdm(
         range(0, len(query_records), bsz),
         total=(len(query_records) + bsz - 1) // bsz,
@@ -91,11 +167,14 @@ def run_retrieval_only_evaluation(
         batch_query_records = query_records[start : start + bsz]
         batch_queries = [record["query"] for record in batch_query_records]
         batch_docs = vectordb.find_top_k_docs(top_k=top_k, queries=batch_queries)
-        compressed_batch_docs = (
-            compress_docs(batch_queries, batch_docs, option=compress_method)
-            if compress_method
-            else batch_docs
-        )
+        if compress_method:
+            compress_start = time.perf_counter()
+            compressed_batch_docs = compress_docs(
+                batch_queries, batch_docs, option=compress_method
+            )
+            compress_elapsed += time.perf_counter() - compress_start
+        else:
+            compressed_batch_docs = batch_docs
 
         for query_record, retrieved_docs, compressed_docs in zip(
             batch_query_records, batch_docs, compressed_batch_docs
@@ -172,6 +251,10 @@ def run_retrieval_only_evaluation(
             "model_name": model_name,
             "setup_time_sec": setup_time,
             "run_time_sec": time.perf_counter() - run_start,
+            "compress_time_sec": compress_elapsed,
+            "compress_ms_per_query": 1000.0 * compress_elapsed / len(query_records),
+            "compress_sec_per_batch": compress_elapsed
+            / ((len(query_records) + bsz - 1) // bsz),
         }
     )
     output_path = Path(output_file)
@@ -181,6 +264,11 @@ def run_retrieval_only_evaluation(
     )
     if details_file:
         write_jsonl(Path(details_file), records)
+    print(
+        "compress time per batch | "
+        f"total: {compress_elapsed:.4f}, "
+        f"avg: {compress_elapsed / ((len(query_records) + bsz - 1) // bsz):.4f}"
+    )
     print(json.dumps(summary, ensure_ascii=False, indent=2))
 
 
@@ -192,17 +280,17 @@ def main(
     probe_query_limit: int | None,
     bsz: int,
     compress_method: str | None,
-    evidence_file: str,
+    evidence_file: str | None,
+    compression_only: bool,
     model_name: str,
     output_file: str,
     details_file: str | None,
 ) -> None:
     logging.set_verbosity_error()
-    evidence_path = Path(evidence_file)
     query_records = load_jsonl_query_records(
         Path(query_file), probe_query_limit=probe_query_limit
     )
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    tokenizer = None if compression_only else AutoTokenizer.from_pretrained(model_name)
     vectordb = ChromaDB(db_dir=db_dir)
 
     setup_start = time.perf_counter()
@@ -220,6 +308,27 @@ def main(
         else None
     )
     setup_time = time.perf_counter() - setup_start
+
+    if compression_only:
+        if compress_method is None:
+            raise ValueError("compression_only requires compress_method")
+        run_compression_only(
+            dataset=dataset,
+            query_records=query_records,
+            vectordb=vectordb,
+            query_file=query_file,
+            db_dir=db_dir,
+            top_k=top_k,
+            bsz=bsz,
+            compress_method=compress_method,
+            setup_time=setup_time,
+            output_file=output_file,
+        )
+        return
+
+    if evidence_file is None:
+        raise ValueError("evidence_file is required unless compression_only is set")
+    evidence_path = Path(evidence_file)
 
     run_start = time.perf_counter()
     run_retrieval_only_evaluation(
@@ -251,7 +360,8 @@ if __name__ == "__main__":
     parser.add_argument("--probe_query_limit", type=int, default=None)
     parser.add_argument("--bsz", type=int, default=4)
     parser.add_argument("--compress_method", default=None)
-    parser.add_argument("--evidence_file", required=True)
+    parser.add_argument("--evidence_file", default=None)
+    parser.add_argument("--compression_only", action="store_true")
     parser.add_argument("--model_name", default="meta-llama/Llama-3.1-8B-Instruct")
     parser.add_argument("--output_file", default="outputs/retrieval-only-summary.json")
     parser.add_argument("--details_file", default=None)

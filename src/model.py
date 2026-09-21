@@ -36,7 +36,6 @@ class LLMModel:
         "Return only the shortest exact answer phrase supported by the passages. "
         "Do not explain, do not repeat the question, and do not output options or full sentences."
     )
-    PASSAGE_PREFIX = ""
 
     def __init__(
         self,
@@ -95,7 +94,6 @@ class LLMModel:
         self.prompt_processor = PromptProcessor(
             tokenizer=self.tokenizer,
             system_prompt=self.SYSTEM_PROMPT,
-            passage_prefix=self.PASSAGE_PREFIX,
             prompt_format=self.prompt_format,
         )
 

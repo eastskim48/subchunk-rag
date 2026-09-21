@@ -53,7 +53,7 @@ class _DenseEmbeddingSelector(TokenBudgetMixin, Compressor):
     @staticmethod
     def _dense_cacheable_key(cacheable: CacheableChunk) -> tuple[str, str | int]:
         cacheable_id = getattr(cacheable, "id", None)
-        if cacheable_id:
+        if cacheable_id is not None:
             return ("id", str(cacheable_id))
         return ("anonymous", id(cacheable))
 
@@ -136,7 +136,7 @@ class _TokenBudgetDenseSelector(_DenseEmbeddingSelector):
     """Apply a shared token budget after ranking dense sentence candidates."""
 
     def __init__(self):
-        self._initialize_token_budget()
+        self._initialize_token_budget(db_dir=_configured_db_dir())
         super().__init__()
 
     def _build_unselected_document(self, doc: RetrievableChunk) -> RetrievableChunk:
@@ -182,7 +182,7 @@ class _TokenBudgetDenseSelector(_DenseEmbeddingSelector):
             scores = [score_tensor[flat_idx] for score_tensor in score_tensors]
             primary_score = sum(score.to(torch.float32) for score in scores)
 
-            if cacheable_id:
+            if cacheable_id is not None:
                 existing_idx = index_by_cacheable_id.get(cacheable_id)
                 if existing_idx is not None:
                     existing_primary = sum(
@@ -469,7 +469,7 @@ class _DenseSlidingRegionCompressor(
 
     def __init__(self):
         Compressor.__init__(self)
-        self._initialize_token_budget()
+        self._initialize_token_budget(db_dir=_configured_db_dir())
         self.last_profile: dict[str, float | int] = {}
         self._sliding_region_spec_cache = {}
         self.region_group_order = _configured_region_group_order()

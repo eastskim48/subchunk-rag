@@ -5,9 +5,6 @@ from chunk import RetrievableChunk
 
 from compressor.methods.colbert import (
     ColBERTSubchunkCompressor,
-    ColBERTRerankAndRegionCompressor,
-    ColBERTRerankCompressor,
-    FixedChunkColBERTRerankCompressor,
     ColBERTSlidingRegionCompressor,
 )
 from compressor.methods.dense import (
@@ -38,10 +35,7 @@ COMPRESSOR_TYPES = {
     "dense_sliding_region_max": DenseSlidingRegionMaxCompressor,
     "dense_sliding_region_avg": DenseSlidingRegionAvgCompressor,
     "colbert_subchunk": ColBERTSubchunkCompressor,
-    "colbert_rerank": ColBERTRerankCompressor,
-    "colbert_chunk_rerank": FixedChunkColBERTRerankCompressor,
     "colbert_sliding_region": ColBERTSlidingRegionCompressor,
-    "rerank_and_region": ColBERTRerankAndRegionCompressor,
     "exit": EXITCompressor,
     "provence": ProvenceCompressor,
     "xrag_jina": XRAGJinaRerankerCompressor,

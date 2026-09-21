@@ -51,14 +51,9 @@ def _resolve_configured_retrieval_chunk_size() -> int:
 class ColBERTWindowCompressorBase(TokenBudgetMixin, Compressor):
     """Load the contextualized artifact and query encoder used online."""
 
-    def __init__(
-        self,
-        *,
-        initialize_token_budget: bool = True,
-    ):
+    def __init__(self):
         super().__init__()
-        if initialize_token_budget:
-            self._initialize_token_budget()
+        self._initialize_token_budget(db_dir=_configured_db_dir())
         self.last_profile: dict[str, float | int] = {}
         artifact_dir = os.getenv("COLBERT_WINDOW_DIR")
         if not artifact_dir:
@@ -85,11 +80,24 @@ class ColBERTWindowCompressorBase(TokenBudgetMixin, Compressor):
                     "the ColBERT artifact DB manifest"
                 )
             self.artifact.validate_db_manifest(db_dir)
-        if initialize_token_budget:
-            print(
-                "ColBERT final budget tokenizer enabled: "
-                f"{self.budget_tokenizer_name!r}"
+            import chromadb
+
+            collection = chromadb.PersistentClient(path=str(db_dir)).get_collection(
+                "doc_collection", embedding_function=None
             )
+            common = collection.metadata or {}
+            if (
+                common.get("regions_ready") is not True
+                or common.get("region_token_budget")
+                != self.artifact.data.region_token_budget
+            ):
+                raise ValueError(
+                    "Chroma region configuration does not match the ColBERT artifact"
+                )
+        print(
+            "ColBERT final budget tokenizer validated: "
+            f"{self.budget_tokenizer_name!r}"
+        )
         artifact_model_name = self.artifact.index.get(
             "checkpoint_name"
         ) or self.artifact.index.get("model_name")

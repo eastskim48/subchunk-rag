@@ -12,7 +12,6 @@ class PromptProcessor:
         self,
         tokenizer,
         system_prompt: str,
-        passage_prefix: str = "",
         prompt_format: str = "raw_chunk_first",
     ):
         if prompt_format not in self.SUPPORTED_FORMATS:
@@ -22,11 +21,10 @@ class PromptProcessor:
             )
         self.tokenizer = tokenizer
         self.system_prompt = system_prompt
-        self.passage_prefix = passage_prefix
         self.prompt_format = prompt_format
 
     def format_passage_chunk(self, passage: str) -> str:
-        return f"{self.passage_prefix}{passage.strip()}\n\n"
+        return f"{passage.strip()}\n\n"
 
     def format_passages(self, passages: List[str]) -> str:
         return "".join(

@@ -7,20 +7,13 @@ import torch
 from tqdm import tqdm
 from typing import List
 import time
-# from deepspeed.ops.op_builder import AsyncIOBuilder
-# from deepspeed.ops.op_builder import GDSBuilder
+from transformers import AutoTokenizer
 
 from vectordb import VectorDB
 from model import LLMModel
-from chunk import Chunk, CacheableChunk, RetrievableChunk
-from materialize.splitter import (
-    FixedSizeSplitter,
-    SentenceWiseSplitter,
-    SemanticSplitter,
-    build_grouper,
-)
-
-# from utils import file_write
+from chunk import Chunk, CacheableChunk
+from materialize.splitter import SentenceWiseSplitter
+from subchunk_store import SubchunkWriter
 
 
 class DocumentPreprocessor:
@@ -28,20 +21,17 @@ class DocumentPreprocessor:
 
     def __init__(
         self,
-        vectordb: VectorDB | None,
-        model: LLMModel,
         docs_dir: str,
+        vectordb: VectorDB | None,
+        model_name: str,
         cache_dir: str,
-        cacheable_chunk_size: int | None = 1024,
+        cacheable_chunk_size: int | None = None,
         retrievable_chunk_size: int | None = None,
         batch_size: int = 1,
         db_batch_size: int = 256,
         dummy_bos_count: int = 0,
-        splitter: str = "fixed_size",
-        merger: str | None = None,
         materialize_cache: bool = True,
         materialize_db: bool = True,
-        sentence_cache_token_format: str = "legacy",
         resume_from_cache: bool = False,
         deduplicate_documents_by_hash: bool = False,
         max_subchunk_tokens: int | None = None,
@@ -53,11 +43,8 @@ class DocumentPreprocessor:
         self.batch_size = batch_size
         self.db_batch_size = db_batch_size
         self.dummy_bos_count = dummy_bos_count
-        self.splitter_name = splitter
-        self.grouper_name = merger
         self.materialize_cache = materialize_cache
         self.materialize_db = materialize_db
-        self.sentence_cache_token_format = sentence_cache_token_format
         self.resume_from_cache = resume_from_cache
         self.deduplicate_documents_by_hash = deduplicate_documents_by_hash
         self.max_subchunk_tokens = max_subchunk_tokens
@@ -70,7 +57,6 @@ class DocumentPreprocessor:
             raise ValueError("vectordb must be set when materialize_db=True")
         if self.db_batch_size <= 0:
             raise ValueError("db_batch_size must be positive")
-        self.model = model
         self.total_doc_tokens = 0
         self.processed_doc_count = 0
         self.docs_over_chunk_size = 0
@@ -78,125 +64,57 @@ class DocumentPreprocessor:
         self.max_chunk_tokens = 0
         self.skipped_existing_chunk_count = 0
         self.rebuilt_invalid_chunk_count = 0
-        if self.dummy_bos_count > 0 and self.model.tokenizer.bos_token_id is None:
+
+        if materialize_cache:
+            self.model = LLMModel(model_name)
+            self.tokenizer = self.model.tokenizer
+        else:
+            self.tokenizer = AutoTokenizer.from_pretrained(
+                model_name, padding_side="right"
+            )
+
+        if self.dummy_bos_count > 0 and self.tokenizer.bos_token_id is None:
             raise ValueError(
                 "dummy_bos_count requires tokenizer.bos_token_id to be set"
             )
-        if self.splitter_name not in {
-            "fixed_size",
-            "fixed_subchunk",
-            "sentence",
-            "semantic",
-        }:
-            raise ValueError(f"unsupported splitter: {self.splitter_name}")
-        if self.grouper_name is not None and self.splitter_name != "semantic":
-            raise ValueError("merger can only be set when splitter=semantic")
-        if self.splitter_name == "semantic" and self.grouper_name is None:
-            raise ValueError("splitter=semantic requires merger to be set")
-        if self.sentence_cache_token_format not in {
-            "legacy",
-            "space_prefix_newline_suffix",
-            "merged_space_prefix_newline_suffix",
-            "merged_space_prefix_space_newline_suffix",
-        }:
-            raise ValueError(
-                f"unsupported sentence_cache_token_format: {self.sentence_cache_token_format}"
-            )
-        self.visible_prefix_token_ids = self.model.tokenizer.encode(
-            self.model.PASSAGE_PREFIX,
-            add_special_tokens=False,
-        )
-        self.visible_suffix_token_ids = self.model.tokenizer.encode(
+        self.visible_suffix_token_ids = self.tokenizer.encode(
             "\n\n",
             add_special_tokens=False,
         )
-        self.space_token_ids = self.model.tokenizer.encode(
-            " ", add_special_tokens=False
-        )
-        if len(self.space_token_ids) != 1:
-            raise ValueError(
-                f"expected a single-token space separator, got ids={self.space_token_ids}"
-            )
-        if len(self.visible_suffix_token_ids) != 1:
-            raise ValueError(
-                f"expected a single-token newline suffix, got ids={self.visible_suffix_token_ids}"
-            )
-        self.visible_token_overhead = len(self.visible_prefix_token_ids) + len(
-            self.visible_suffix_token_ids
-        )
-        if self.cacheable_chunk_size is None and self.retrievable_chunk_size is None:
-            if self.splitter_name not in {
-                "sentence",
-                "semantic",
-            }:
-                raise NotImplementedError(
-                    "splitter='fixed_size' requires cacheable_chunk_size and retrievable_chunk_size to both be set to the same integer"
-                )
-            self.content_chunk_size = None
-        elif (
-            self.cacheable_chunk_size is None
-            and self.retrievable_chunk_size is not None
-        ):
-            if self.splitter_name not in {
-                "sentence",
-                "semantic",
-            }:
-                raise NotImplementedError(
-                    "cacheable_chunk_size=None with retrievable_chunk_size set is only supported for sentence/semantic splitters"
-                )
-            self.content_chunk_size = None
-        elif (
+        if (
             self.cacheable_chunk_size is not None
-            and self.retrievable_chunk_size is not None
+            and self.retrievable_chunk_size is None
         ):
-            if (
-                self.splitter_name in {"fixed_size", "fixed_subchunk"}
-                and self.cacheable_chunk_size <= self.visible_token_overhead
-            ):
-                raise ValueError(
-                    f"cacheable_chunk_size ({self.cacheable_chunk_size}) must be larger than visible token overhead "
-                    f"({self.visible_token_overhead})"
-                )
-            self.content_chunk_size = (
-                self.cacheable_chunk_size - self.visible_token_overhead
-                if self.splitter_name in {"fixed_size", "fixed_subchunk"}
-                else None
-            )
-        else:
             raise NotImplementedError(
-                "mixed None/non-None retrievable_chunk_size and cacheable_chunk_size combinations are not supported for this splitter"
+                "cacheable_chunk_size set with retrievable_chunk_size=None is not supported"
             )
 
-        if self.splitter_name == "sentence":
-            self.splitter = SentenceWiseSplitter(
-                docs_dir=self.docs_dir,
-                model=self.model,
-                cacheable_chunk_size=self.cacheable_chunk_size,
-                retrievable_chunk_size=self.retrievable_chunk_size,
-                content_chunk_size=self.content_chunk_size,
-                max_subchunk_tokens=self.max_subchunk_tokens,
-            )
-        elif self.splitter_name == "semantic":
-            self.splitter = SemanticSplitter(
-                docs_dir=self.docs_dir,
-                model=self.model,
-                cacheable_chunk_size=self.cacheable_chunk_size,
-                retrievable_chunk_size=self.retrievable_chunk_size,
-                content_chunk_size=self.content_chunk_size,
-                grouper=build_grouper(
-                    self.grouper_name, tokenizer=self.model.tokenizer
-                ),
-            )
-        else:
-            self.splitter = FixedSizeSplitter(
-                docs_dir=self.docs_dir,
-                model=self.model,
-                cacheable_chunk_size=self.cacheable_chunk_size,
-                retrievable_chunk_size=self.retrievable_chunk_size,
-                content_chunk_size=self.content_chunk_size,
-            )
+        self.splitter = SentenceWiseSplitter(
+            docs_dir=self.docs_dir,
+            tokenizer=self.tokenizer,
+            cacheable_chunk_size=self.cacheable_chunk_size,
+            retrievable_chunk_size=self.retrievable_chunk_size,
+            max_subchunk_tokens=self.max_subchunk_tokens,
+        )
 
     def process_documents(self):
+        if not self.materialize_db:
+            return self._process_documents()
+        if self.vectordb.db.count():
+            raise ValueError(
+                "integer subchunk assignment requires an empty retrieval DB"
+            )
+        writer = SubchunkWriter(self.vectordb.db_dir)
+        self.subchunk_writer = writer
+        try:
+            result = self._process_documents()
+            writer.finish()
+            return result
+        finally:
+            writer.close()
+            self.subchunk_writer = None
+
+    def _process_documents(self):
         start_time = time.time()
         files = os.listdir(self.docs_dir)
         if self.deduplicate_documents_by_hash:
@@ -212,6 +130,7 @@ class DocumentPreprocessor:
             if not cacheable_chunks:
                 continue
             if self.materialize_db:
+                self.subchunk_writer.add_document(cacheable_chunks)
                 assert self.vectordb is not None
                 pending_db_chunks.extend(retrievable_chunks)
                 while len(pending_db_chunks) >= self.db_batch_size:
@@ -326,40 +245,13 @@ class DocumentPreprocessor:
         if result.chunks:  # cacheable chunk
             self.total_chunk_count += len(result.chunks)
             self.max_chunk_tokens = max(self.max_chunk_tokens, result.max_chunk_tokens)
-        if self.splitter_name == "fixed_size":
-            retrievable_chunks = [
-                RetrievableChunk(
-                    id=chunk.id,
-                    text=chunk.text,
-                    cacheables=[chunk],
-                    chunk_size=chunk.chunk_size,
-                    token_count=max(
-                        0, int(chunk.chunk_end or 0) - int(chunk.chunk_start or 0)
-                    ),
-                    cache_unit="token",
-                    metadata={
-                        "parent_doc_id": chunk.parent_doc_id,
-                        "source_token_start": chunk.chunk_start,
-                        "source_token_end": chunk.chunk_end,
-                    },
-                )
-                for chunk in result.chunks
-            ]
-        else:
-            retrievable_chunks = list(
-                result.retrievable_chunks
-                or (
-                    []
-                    if result.retrievable_chunk is None
-                    else [result.retrievable_chunk]
-                )
-            )
-        cache_unit = (
-            "sentence" if self.splitter_name in {"sentence", "semantic"} else "token"
+        retrievable_chunks = list(
+            result.retrievable_chunks
+            or ([] if result.retrievable_chunk is None else [result.retrievable_chunk])
         )
         for retrievable_chunk in retrievable_chunks:
             if retrievable_chunk.cache_unit is None:
-                retrievable_chunk.cache_unit = cache_unit
+                retrievable_chunk.cache_unit = "sentence"
         return result.chunks, retrievable_chunks
 
     def _build_cache_inputs(self, chunks: List[CacheableChunk], padding_side: str):
@@ -369,7 +261,7 @@ class DocumentPreprocessor:
         max_length = max(len(sequence) for sequence in visible_sequences)
         input_ids = []
         attention_masks = []
-        pad_token_id = int(self.model.tokenizer.pad_token_id)
+        pad_token_id = int(self.tokenizer.pad_token_id)
         for sequence in visible_sequences:
             pad_len = max_length - len(sequence)
             if padding_side == "left":
@@ -391,7 +283,7 @@ class DocumentPreprocessor:
 
         bos_prefix = torch.full(
             (input_ids.shape[0], self.dummy_bos_count),
-            int(self.model.tokenizer.bos_token_id),
+            int(self.tokenizer.bos_token_id),
             dtype=input_ids.dtype,
         )
         bos_mask = torch.ones(
@@ -406,48 +298,8 @@ class DocumentPreprocessor:
         }
 
     def _build_visible_chunk_token_ids(self, chunk: Chunk) -> List[int]:
-        chunk_token_ids = self.model.tokenizer.encode(
-            chunk.text, add_special_tokens=False
-        )
-        if (
-            self.splitter_name in {"sentence", "semantic"}
-            and self.sentence_cache_token_format == "space_prefix_newline_suffix"
-        ):
-            return (
-                self.space_token_ids + chunk_token_ids + self.visible_suffix_token_ids
-            )
-        if (
-            self.splitter_name in {"sentence", "semantic"}
-            and self.sentence_cache_token_format == "merged_space_prefix_newline_suffix"
-        ):
-            merged_prefix_chunk_token_ids = self.model.tokenizer.encode(
-                f" {chunk.text}",
-                add_special_tokens=False,
-            )
-            return merged_prefix_chunk_token_ids + self.visible_suffix_token_ids
-        if (
-            self.splitter_name in {"sentence", "semantic"}
-            and self.sentence_cache_token_format
-            == "merged_space_prefix_space_newline_suffix"
-        ):
-            merged_prefix_chunk_token_ids = self.model.tokenizer.encode(
-                f" {chunk.text}",
-                add_special_tokens=False,
-            )
-            merged_suffix_token_ids = self.model.tokenizer.encode(
-                " \n\n",
-                add_special_tokens=False,
-            )
-            if len(merged_suffix_token_ids) != 1:
-                raise ValueError(
-                    f"expected a single-token space-newline suffix, got ids={merged_suffix_token_ids}"
-                )
-            return merged_prefix_chunk_token_ids + merged_suffix_token_ids
-        return (
-            self.visible_prefix_token_ids
-            + chunk_token_ids
-            + self.visible_suffix_token_ids
-        )
+        chunk_token_ids = self.tokenizer.encode(chunk.text, add_special_tokens=False)
+        return chunk_token_ids + self.visible_suffix_token_ids
 
     def save_kv_cache(self, chunks: List[CacheableChunk]):
         inputs = self._build_cache_inputs(chunks, padding_side="right")

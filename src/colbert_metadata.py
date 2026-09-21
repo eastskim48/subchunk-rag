@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 import sqlite3
 from pathlib import Path
@@ -10,9 +9,6 @@ from typing import Iterable, Sequence
 
 SCHEMA_VERSION = 1
 SQLITE_LOOKUP_BATCH_SIZE = 900
-CACHEABLE_ROWS_FILE = "cacheable_rows.json"
-WINDOW_IDS_FILE = "window_ids.json"
-REGION_PAYLOADS_FILE = "region_payloads.json"
 
 
 def _encode_json(value) -> str:
@@ -224,19 +220,6 @@ class ColBERTMetadataReader:
             for cacheable_id, row_index in rows:
                 yield str(cacheable_id), int(row_index)
 
-    def iter_cacheable_windows(self, batch_size: int = 8192):
-        cursor = self.connection.execute(
-            "select cacheable_id, window_ids_json from cacheables order by row_index"
-        )
-        while True:
-            rows = cursor.fetchmany(batch_size)
-            if not rows:
-                break
-            for cacheable_id, window_ids_json in rows:
-                yield str(cacheable_id), [
-                    str(item) for item in json.loads(window_ids_json)
-                ]
-
     def iter_region_payloads(self, batch_size: int = 8192):
         cursor = self.connection.execute(
             "select chunk_id, cacheable_ids_json, specs_json from regions"
@@ -257,84 +240,3 @@ class ColBERTMetadataReader:
         if self.connection is not None:
             self.connection.close()
             self.connection = None
-
-
-def _json_bytes(value) -> bytes:
-    return json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-
-
-def _write_object(path: Path, records: Iterable[tuple[str, object]]) -> str:
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    digest = hashlib.sha256()
-    with temporary.open("wb") as handle:
-        handle.write(b"{")
-        digest.update(b"{")
-        first = True
-        for key, value in records:
-            payload = _json_bytes(str(key)) + b":" + _json_bytes(value)
-            if not first:
-                handle.write(b",")
-                digest.update(b",")
-            handle.write(payload)
-            digest.update(payload)
-            first = False
-        handle.write(b"}")
-        digest.update(b"}")
-    temporary.replace(path)
-    return digest.hexdigest()
-
-
-def _write_array(path: Path, values: Iterable[object]) -> str:
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    digest = hashlib.sha256()
-    with temporary.open("wb") as handle:
-        handle.write(b"[")
-        digest.update(b"[")
-        first = True
-        for value in values:
-            payload = _json_bytes(value)
-            if not first:
-                handle.write(b",")
-                digest.update(b",")
-            handle.write(payload)
-            digest.update(payload)
-            first = False
-        handle.write(b"]")
-        digest.update(b"]")
-    temporary.replace(path)
-    return digest.hexdigest()
-
-
-def write_split_metadata_from_sqlite(
-    reader: ColBERTMetadataReader, data_dir: Path
-) -> dict:
-    """Stream finalized metadata from the build database into split JSON."""
-
-    rows_path = data_dir / CACHEABLE_ROWS_FILE
-    windows_path = data_dir / WINDOW_IDS_FILE
-    regions_path = data_dir / REGION_PAYLOADS_FILE
-    rows_sha256 = _write_object(rows_path, reader.iter_cacheable_rows())
-    windows_sha256 = _write_array(
-        windows_path,
-        (window_ids for _, window_ids in reader.iter_cacheable_windows()),
-    )
-    regions_sha256 = _write_object(regions_path, reader.iter_region_payloads())
-    return {
-        "cacheable_rows_file": rows_path.name,
-        "cacheable_rows_sha256": rows_sha256,
-        "window_ids_file": windows_path.name,
-        "window_ids_sha256": windows_sha256,
-        "region_payloads_file": regions_path.name,
-        "region_payloads_sha256": regions_sha256,
-    }
-
-
-def read_json_with_sha256(path: Path, expected_sha256: str):
-    raw = path.read_bytes()
-    actual_sha256 = hashlib.sha256(raw).hexdigest()
-    if actual_sha256 != expected_sha256:
-        raise ValueError(
-            f"ColBERT metadata SHA-256 mismatch: path={path}, "
-            f"expected={expected_sha256}, actual={actual_sha256}"
-        )
-    return json.loads(raw)

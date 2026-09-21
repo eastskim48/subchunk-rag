@@ -2,56 +2,36 @@
 
 from __future__ import annotations
 
-import json
-import sqlite3
 from pathlib import Path
 from typing import Iterable
 
 from chunk import CacheableChunk
+from subchunk_store import load_subchunks, cacheables_from_metadata
 
 
-def _cacheable_source_order(cacheable: CacheableChunk) -> tuple[bool, int, str]:
-    """Sort source-aligned cacheables deterministically within a document."""
+def _cacheable_source_order(cacheable: CacheableChunk) -> int:
+    if type(cacheable.id) is not int or cacheable.id < 0:
+        raise ValueError(f"expected integer subchunk ID, got {cacheable.id!r}")
+    return cacheable.id
 
-    chunk_start = cacheable.chunk_start
-    return (
-        chunk_start is None,
-        int(chunk_start) if chunk_start is not None else 0,
-        str(cacheable.id),
+
+def iter_db_records(db_dir: str | Path, batch_size: int = 2048):
+    """Read Chroma metadata through its array-preserving public interface."""
+    import chromadb
+
+    if batch_size <= 0:
+        raise ValueError("batch_size must be positive")
+    collection = chromadb.PersistentClient(path=str(db_dir)).get_collection(
+        "doc_collection", embedding_function=None
     )
+    for offset in range(0, collection.count(), batch_size):
+        batch = collection.get(limit=batch_size, offset=offset, include=["metadatas"])
+        yield from zip(batch["ids"], batch["metadatas"])
 
 
-def iter_db_cacheables(
-    db_dir: str | Path, batch_size: int = 2048
-) -> Iterable[CacheableChunk]:
-    """Yield cacheables in the retrieval-record order stored by Chroma."""
-
-    sqlite_path = Path(db_dir) / "chroma.sqlite3"
-    if not sqlite_path.exists():
-        raise FileNotFoundError(f"missing Chroma sqlite database: {sqlite_path}")
-
-    connection = sqlite3.connect(f"file:{sqlite_path}?mode=ro", uri=True)
-    try:
-        total_records = connection.execute(
-            "select count(*) from embedding_metadata where key='cacheables_json'"
-        ).fetchone()[0]
-        query = (
-            "select cacheables.string_value "
-            "from embeddings e "
-            "join embedding_metadata cacheables "
-            "  on e.id = cacheables.id and cacheables.key = 'cacheables_json' "
-            "order by e.id "
-            "limit ? offset ?"
-        )
-        for offset in range(0, total_records, batch_size):
-            rows = connection.execute(query, (batch_size, offset)).fetchall()
-            for (cacheables_json,) in rows:
-                payload = json.loads(cacheables_json) if cacheables_json else []
-                for item in payload:
-                    if isinstance(item, dict):
-                        yield CacheableChunk.from_payload(item)
-    finally:
-        connection.close()
+def iter_db_cacheables(db_dir: str | Path, batch_size: int = 2048):
+    for _, cacheables in iter_db_cacheable_groups(db_dir, batch_size):
+        yield from cacheables
 
 
 def group_unique_db_cacheables(
@@ -182,37 +162,8 @@ def iter_unique_db_cacheables_by_document(
         yield finished
 
 
-def iter_db_cacheable_groups(
-    db_dir: str | Path, batch_size: int = 2048
-) -> Iterable[tuple[str, list[CacheableChunk]]]:
-    """Yield each retrieval chunk ID with its ordered cacheable subchunks."""
-
-    sqlite_path = Path(db_dir) / "chroma.sqlite3"
-    if not sqlite_path.exists():
-        raise FileNotFoundError(f"missing Chroma sqlite database: {sqlite_path}")
-
-    connection = sqlite3.connect(f"file:{sqlite_path}?mode=ro", uri=True)
-    try:
-        total_records = connection.execute(
-            "select count(*) from embedding_metadata where key='cacheables_json'"
-        ).fetchone()[0]
-        query = (
-            "select e.embedding_id, cacheables.string_value "
-            "from embeddings e "
-            "join embedding_metadata cacheables "
-            "  on e.id = cacheables.id and cacheables.key = 'cacheables_json' "
-            "order by e.id "
-            "limit ? offset ?"
-        )
-        for offset in range(0, total_records, batch_size):
-            rows = connection.execute(query, (batch_size, offset)).fetchall()
-            for chunk_id, cacheables_json in rows:
-                payload = json.loads(cacheables_json) if cacheables_json else []
-                cacheables = [
-                    CacheableChunk.from_payload(item)
-                    for item in payload
-                    if isinstance(item, dict)
-                ]
-                yield str(chunk_id), cacheables
-    finally:
-        connection.close()
+def iter_db_cacheable_groups(db_dir: str | Path, batch_size: int = 2048):
+    """Yield retrieval chunk IDs and subchunks from the shared row-indexed list."""
+    subchunks = load_subchunks(str(Path(db_dir).resolve()))
+    for chunk_id, metadata in iter_db_records(db_dir, batch_size):
+        yield str(chunk_id), cacheables_from_metadata(metadata, subchunks)

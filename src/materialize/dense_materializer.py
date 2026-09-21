@@ -25,10 +25,8 @@ def _resolve_dense_cache_unit(db_dir: str | Path, cache_unit: str | None) -> str
             f"{Path(db_dir) / 'build_manifest.json'}"
         )
     splitter = manifest.get("splitter")
-    if splitter in {"sentence", "semantic"}:
+    if splitter == "sentence":
         return "sentence"
-    if splitter in {"fixed_size", "fixed_subchunk"}:
-        return "token"
     raise ValueError(
         "cannot derive dense cache unit from DB manifest splitter: " f"{splitter!r}"
     )

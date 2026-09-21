@@ -18,11 +18,14 @@ from transformers import AutoTokenizer
 
 import colbert_artifact
 from colbert_metadata import (
-    CACHEABLE_ROWS_FILE,
     ColBERTMetadataReader,
     ColBERTMetadataWriter,
-    REGION_PAYLOADS_FILE,
-    write_split_metadata_from_sqlite,
+)
+from subchunk_store import (
+    load_subchunks,
+    pack_regions,
+    unpack_regions,
+    pack_subchunk_range,
 )
 from encoder import colbert as colbert_encoder
 from materialize.db_cacheables import (
@@ -344,6 +347,14 @@ class _ColBERTArtifactWriter:
             if self.embedding_dim is None:
                 self.embedding_dim = int(vector.shape[1])
             row_index = self.total_cacheables
+            if (
+                type(item["cacheable_id"]) is not int
+                or item["cacheable_id"] != row_index
+            ):
+                raise ValueError(
+                    "DB subchunk ID does not equal the next ColBERT vector row: "
+                    f"id={item['cacheable_id']!r}, row={row_index}"
+                )
             self.offsets.append(self.total_center_tokens)
             expected_dim = self.embedding_dim or self.encoder.dim
             if int(vector.shape[1]) != expected_dim:
@@ -384,20 +395,12 @@ class _ColBERTArtifactWriter:
 def _validate_center_unit_against_db_manifest(
     db_manifest: dict[str, Any],
     center_unit: str,
-    fixed_chunk_size: int | None,
 ) -> None:
     """Reject artifact candidate units that differ from the persisted DB units."""
 
     splitter = db_manifest.get("splitter")
     if splitter == "sentence":
         allowed = {"subchunk", "subchunk_only"}
-    elif splitter in {"fixed_size", "fixed_subchunk"}:
-        allowed = {"fixed_chunk", "fixed_chunk_window"}
-    elif splitter == "semantic":
-        raise ValueError(
-            "DB splitter='semantic' has no supported ColBERT center_unit; "
-            "materialization must not reinterpret semantic DB cacheables as sentences"
-        )
     else:
         raise ValueError(f"unsupported DB manifest splitter: {splitter!r}")
 
@@ -407,24 +410,6 @@ def _validate_center_unit_against_db_manifest(
             f"splitter={splitter!r}, center_unit={center_unit!r}, "
             f"allowed={sorted(allowed)}"
         )
-
-    if splitter in {"fixed_size", "fixed_subchunk"}:
-        db_chunk_size = db_manifest.get("cacheable_chunk_size")
-        if (
-            isinstance(db_chunk_size, bool)
-            or not isinstance(db_chunk_size, int)
-            or db_chunk_size <= 0
-        ):
-            raise ValueError(
-                "fixed-size DB manifest requires a positive cacheable_chunk_size, "
-                f"got {db_chunk_size!r}"
-            )
-        if fixed_chunk_size != db_chunk_size:
-            raise ValueError(
-                "fixed_chunk_size must match the DB cacheable_chunk_size: "
-                f"fixed_chunk_size={fixed_chunk_size!r}, "
-                f"cacheable_chunk_size={db_chunk_size}"
-            )
 
 
 def build_colbert_window_artifact(
@@ -473,7 +458,6 @@ def build_colbert_window_artifact(
     _validate_center_unit_against_db_manifest(
         db_manifest=db_manifest,
         center_unit=center_unit,
-        fixed_chunk_size=fixed_chunk_size,
     )
     repo_path = repo_path or colbert_encoder.default_colbert_repo_path()
     if overwrite and artifact_dir.exists():
@@ -484,13 +468,7 @@ def build_colbert_window_artifact(
     index_path = artifact_dir / "index.json"
     data_index_path = data_dir / "index.json"
     metadata_path = data_dir / ".build_metadata.sqlite3"
-    if (
-        index_path.exists()
-        and data_index_path.exists()
-        and (data_dir / CACHEABLE_ROWS_FILE).exists()
-        and (data_dir / REGION_PAYLOADS_FILE).exists()
-        and not overwrite
-    ):
+    if index_path.exists() and data_index_path.exists() and not overwrite:
         existing = json.loads(index_path.read_text(encoding="utf-8"))
         if existing.get("format") != colbert_artifact.ARTIFACT_FORMAT:
             raise ValueError(
@@ -503,16 +481,14 @@ def build_colbert_window_artifact(
         colbert_artifact.read_referenced_db_manifest(
             artifact_dir=artifact_dir, reference=existing_reference
         )
-        if existing_reference.get("sha256") != db_manifest_reference["sha256"]:
-            raise ValueError(
-                "existing ColBERT artifact does not match the requested DB manifest"
-            )
         data_existing = json.loads(data_index_path.read_text(encoding="utf-8"))
         if data_existing.get("format") != colbert_artifact.DATA_ARTIFACT_FORMAT:
             raise ValueError(
                 "existing ColBERT data has unsupported format: "
                 f"{data_existing.get('format')}"
             )
+        if data_existing.get("subchunk_id_layout") != "vector_row":
+            raise ValueError("existing artifact requires integer-ID conversion")
         return existing
 
     start_time = time.perf_counter()
@@ -580,7 +556,7 @@ def build_colbert_window_artifact(
                     source_text = (docs_path / doc_id).read_text(encoding="utf-8")
 
                 units = [cacheable.text for cacheable in cacheables]
-                cacheable_ids = [str(cacheable.id) for cacheable in cacheables]
+                cacheable_ids = [cacheable.id for cacheable in cacheables]
                 region_membership_specs = None
                 if center_unit in {"subchunk", "subchunk_only"}:
                     if center_unit == "subchunk_only":
@@ -655,8 +631,7 @@ def build_colbert_window_artifact(
                             )
                         )
             except Exception as exc:
-                failed_docs.append({"doc_id": doc_id, "error": repr(exc)})
-                continue
+                raise ValueError(f"cannot materialize DB document {doc_id!r}") from exc
 
             writer.add_document(
                 doc_id=doc_id,
@@ -669,6 +644,8 @@ def build_colbert_window_artifact(
         writer.close()
         raise
 
+    if writer.total_cacheables != len(load_subchunks(str(Path(db_dir).resolve()))):
+        raise ValueError("ColBERT output does not cover every assigned subchunk ID")
     final_offsets = np.asarray(
         writer.offsets + [writer.total_center_tokens], dtype=np.int64
     )
@@ -715,7 +692,7 @@ def build_colbert_window_artifact(
             {
                 "artifact_variant": "subchunk_only_encoding_contextual_regions",
                 "embedding_source": "data/vectors.fp16.bin",
-                "region_membership_source": "data/region_payloads.json",
+                "region_membership_source": "chroma.doc_collection",
             }
         )
     index_path.write_text(
@@ -751,7 +728,7 @@ def validate_colbert_candidate_ids_against_db(
     """Require the materialized candidate IDs to match the DB exactly."""
 
     artifact = colbert_artifact.ColBERTWindowArtifact(artifact_dir)
-    artifact_cacheable_count = len(artifact.data.id_to_row)
+    artifact_cacheable_count = artifact.data.num_cacheables
     temporary_file = tempfile.NamedTemporaryFile(
         prefix=".candidate_validation_",
         suffix=".sqlite3",
@@ -791,7 +768,7 @@ def validate_colbert_candidate_ids_against_db(
         connection.commit()
         connection.execute("create table artifact_ids (cacheable_id text primary key)")
         pending_artifact_ids = []
-        for cacheable_id in artifact.data.id_to_row:
+        for cacheable_id in range(artifact.data.num_cacheables):
             pending_artifact_ids.append((str(cacheable_id),))
             if len(pending_artifact_ids) >= batch_size:
                 connection.executemany(
@@ -920,9 +897,21 @@ def add_region_specs_to_colbert_window_data(
             index.get("region_token_budget") == int(region_token_budget)
             and int(index.get("region_spec_chunk_count", 0)) > 0
         ):
+            import chromadb
+
+            collection = chromadb.PersistentClient(path=str(db_dir)).get_collection(
+                "doc_collection", embedding_function=None
+            )
+            common = collection.metadata or {}
+            if common.get("regions_ready") is not True or common.get(
+                "region_token_budget"
+            ) != int(region_token_budget):
+                raise ValueError(
+                    "Chroma region materialization is incomplete or incompatible"
+                )
             return index
         raise ValueError(
-            "finalized ColBERT split-JSON metadata cannot rebuild regions in "
+            "finalized ColBERT metadata cannot rebuild regions in "
             "place; rebuild the candidate store with overwrite enabled"
         )
     if index.get("format") != "colbert_window_data_build_v1":
@@ -956,6 +945,13 @@ def add_region_specs_to_colbert_window_data(
     if not isinstance(metadata_file, str) or not metadata_file:
         raise ValueError("ColBERT data requires a metadata_file")
     metadata_path = data_path / metadata_file
+    import chromadb
+
+    collection = chromadb.PersistentClient(path=str(db_dir)).get_collection(
+        "doc_collection", embedding_function=None
+    )
+    common_metadata = dict(collection.metadata or {})
+    collection.modify(metadata={**common_metadata, "regions_ready": False})
     metadata_reader = ColBERTMetadataReader(metadata_path)
     metadata_writer = ColBERTMetadataWriter(metadata_path, create=False)
     metadata_writer.clear_regions()
@@ -973,7 +969,7 @@ def add_region_specs_to_colbert_window_data(
             )
         )
         windows = metadata_reader.window_ids_for_cacheable_ids(unique_ids)
-        windows_by_id = dict(zip(unique_ids, windows))
+        windows_by_id = dict(zip((str(row) for row in unique_ids), windows))
         region_records = []
         for chunk_id, cacheables in pending_groups:
             cacheable_ids = [cacheable.id for cacheable in cacheables]
@@ -1006,10 +1002,23 @@ def add_region_specs_to_colbert_window_data(
     index["region_spec_build_time_sec"] = time.perf_counter() - start_time
     index["region_spec_reuse_mode"] = "document_window_bound"
     export_reader = ColBERTMetadataReader(metadata_path)
+    chunk_ids, metadatas = [], []
     try:
-        index.update(write_split_metadata_from_sqlite(export_reader, data_path))
+        for chunk_id, payload in export_reader.iter_region_payloads():
+            ids = [int(row) for row in payload["cacheable_ids"]]
+            metadata = pack_regions(payload["specs"])
+            metadata.update(pack_subchunk_range(ids))
+            unpack_regions(metadata, ids)
+            chunk_ids.append(chunk_id)
+            metadatas.append(metadata)
+            if len(chunk_ids) >= 2048:
+                collection.update(ids=chunk_ids, metadatas=metadatas)
+                chunk_ids, metadatas = [], []
+        if chunk_ids:
+            collection.update(ids=chunk_ids, metadatas=metadatas)
     finally:
         export_reader.close()
+    index["subchunk_id_layout"] = "vector_row"
     index["format"] = colbert_artifact.DATA_ARTIFACT_FORMAT
     index.pop("metadata_file", None)
     index.pop("region_spec_validation_mismatch_count", None)
@@ -1017,6 +1026,13 @@ def add_region_specs_to_colbert_window_data(
     index.pop("region_spec_doc_token_overhead", None)
     index_path.write_text(
         json.dumps(index, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    collection.modify(
+        metadata={
+            **common_metadata,
+            "regions_ready": True,
+            "region_token_budget": int(region_token_budget),
+        }
     )
     metadata_path.unlink()
     return index

@@ -19,7 +19,6 @@ export BATCH_SIZE="${BATCH_SIZE:-36}"
 export DB_BATCH_SIZE="${DB_BATCH_SIZE:-256}"
 export RESUME_FROM_CACHE="${RESUME_FROM_CACHE:-False}"
 export SPLITTER="${SPLITTER:-sentence}"
-export MERGER="${MERGER-}"
 export DEDUPLICATE_DOCUMENTS_BY_HASH="${DEDUPLICATE_DOCUMENTS_BY_HASH:-False}"
 export MAX_SUBCHUNK_TOKENS="${MAX_SUBCHUNK_TOKENS:-180}"
 export CACHEABLE_CHUNK_SIZE="${CACHEABLE_CHUNK_SIZE:-None}"
@@ -43,10 +42,6 @@ if is_enabled "$MATERIALIZE_DB"; then
     mkdir -p "$DB_DIR"
 fi
 
-MERGER_ARGS=()
-if [ -n "$MERGER" ]; then
-    MERGER_ARGS=(--merger "$MERGER")
-fi
 
 torchrun --nproc_per_node 1 --master_port "$TORCHRUN_MASTER_PORT" src/entrypoint/preprocess.py \
     --db_dir="$DB_DIR" \
@@ -56,7 +51,6 @@ torchrun --nproc_per_node 1 --master_port "$TORCHRUN_MASTER_PORT" src/entrypoint
     --cacheable_chunk_size="$CACHEABLE_CHUNK_SIZE" \
     --retrievable_chunk_size="$RETRIEVABLE_CHUNK_SIZE" \
     --splitter "$SPLITTER" \
-    "${MERGER_ARGS[@]}" \
     --deduplicate_documents_by_hash "$DEDUPLICATE_DOCUMENTS_BY_HASH" \
     --max_subchunk_tokens "$MAX_SUBCHUNK_TOKENS" \
     --batch_size "$BATCH_SIZE" \
