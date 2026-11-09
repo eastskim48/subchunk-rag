@@ -1,0 +1,52 @@
+run_name: nq
+run_id: direct_subchunking
+dataset: dapr-nq-open
+dataset_prefix: /mnt/nvme1/datasets
+eval_script: /mnt/nvme1/dongseob/subchunk/outputs/aaa_icde/direct_subchunking/code/run/eval_direct_subchunk.sh
+results_root: /mnt/nvme1/dongseob/subchunk/outputs/aaa_icde/direct_subchunking
+fixed_env:
+  MODEL_NAME: meta-llama/Llama-3.1-8B-Instruct
+  MODEL_LOAD_IN_4BIT: 'False'
+  MAX_NEW_TOKENS: '20'
+  MEASURE_PROMPT_STATS: 'True'
+  PROMPT_FORMAT: chat_system_user
+  DATA_SUBDIR: sent-bge-small-v1.5-512-splitlong100-lateon
+  DATASET_PATH: /mnt/nvme1/datasets/dapr-nq-open
+  DATASET: dapr-nq-open
+  HF_HUB_OFFLINE: '1'
+  TRANSFORMERS_OFFLINE: '1'
+  TOKENIZERS_PARALLELISM: 'false'
+  OMP_NUM_THREADS: '32'
+  MKL_NUM_THREADS: '32'
+  OPENBLAS_NUM_THREADS: '32'
+  CUDA_VISIBLE_DEVICES: '0'
+  QUERY_FILE: /mnt/nvme1/datasets/dapr-nq-open/questions/query.jsonl
+  ANSWER_FILE: /mnt/nvme1/datasets/dapr-nq-open/answers/answer.jsonl
+  EVAL_SEED: '123'
+  EVAL_CPU_THREADS: '32'
+  DB_DIR: /mnt/nvme1/datasets/dapr-nq-open/sent-bge-small-v1.5-512-splitlong100-lateon/bge_small_direct_region180_vectors_20261103/db
+  DIRECT_SOURCE_DB: /mnt/nvme1/datasets/dapr-nq-open/sent-bge-small-v1.5-512-splitlong100-lateon/db
+  DIRECT_EVAL_RUNNER: /mnt/nvme1/dongseob/subchunk/outputs/aaa_icde/direct_subchunking/code/run/eval_direct_subchunk.py
+  DIRECT_INITIAL_SEARCH_DEPTH: '10'
+  TOP_K: adaptive
+  COMPRESS_METHOD: bge_small_direct_subchunk
+  FINAL_TOKEN_BUDGET: '1000'
+  RETAIN_TOKEN_RATIO: ''
+  EVAL_BSZ: '24'
+  EVAL_USE_PAST_CACHE: 'False'
+  USE_CLEANER: 'False'
+  RUN_ID: direct_subchunking
+  PYTHONPATH: /mnt/nvme1/dongseob/subchunk/outputs/aaa_icde/direct_subchunking/code/src
+  CACHE_DIR: /mnt/nvme1/dongseob/subchunk/outputs/aaa_icde/direct_subchunking/nq/cache_unused
+  EVAL_DATASET: dapr-nq-open
+  TOTAL_NUM: ''
+eval_fixed_env:
+  USE_CLEANER: 'False'
+  EVAL_USE_PAST_CACHE: 'False'
+eval_groups:
+- name: context_only_chat
+eval_cases:
+- TOP_K: adaptive
+  FINAL_TOKEN_BUDGET: '1000'
+  EVAL_BSZ: '24'
+  COMPRESS_METHOD: bge_small_direct_subchunk

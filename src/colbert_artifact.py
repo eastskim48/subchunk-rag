@@ -256,6 +256,11 @@ class ColBERTWindowData:
                 packed_residuals=np.asarray(self.residuals[start:end]),
                 centroids=np.asarray(self.centroids),
                 bucket_weights=np.asarray(self.bucket_weights),
+                token_norms=(
+                    np.asarray(self.token_norms[start:end])
+                    if self.token_norms is not None
+                    else None
+                ),
             )
 
         row_start = time.perf_counter()
@@ -268,6 +273,11 @@ class ColBERTWindowData:
             centroids=np.asarray(self.centroids),
             bucket_weights=np.asarray(self.bucket_weights),
             profile=self._decompression_profile,
+            token_norms=(
+                np.asarray(self.token_norms[start:end])
+                if self.token_norms is not None
+                else None
+            ),
         )
         profile = self._decompression_profile
         profile["row_slice_setup_sec"] = (
@@ -298,7 +308,9 @@ class ColBERTWindowData:
             return None
         return validate_row(subchunk_id, self.num_cacheables)
 
-    def vectors_for_cacheable_ids(self, cacheable_ids) -> list[torch.Tensor]:
+    def vectors_for_cacheable_ids(
+        self, cacheable_ids, *, batch_decode: bool = False
+    ) -> list[torch.Tensor]:
         if self.embedding_storage == "fp16":
             vectors = []
             for cacheable_id in cacheable_ids:
@@ -326,6 +338,52 @@ class ColBERTWindowData:
             end = int(self.offsets[row + 1])
             if end > start:
                 resolved_rows.append((output_idx, start, end))
+
+        if batch_decode and resolved_rows:
+            from materialize.colbert_residual import decompress_2bit_rows
+
+            row_start = time.perf_counter()
+            ranges = []
+            for _, start, end in resolved_rows:
+                if ranges and ranges[-1][1] == start:
+                    ranges[-1] = (ranges[-1][0], end)
+                else:
+                    ranges.append((start, end))
+
+            def gather(values):
+                if len(ranges) == 1:
+                    start, end = ranges[0]
+                    return np.asarray(values[start:end])
+                return np.concatenate([values[start:end] for start, end in ranges])
+
+            codes = gather(self.codes)
+            residuals = gather(self.residuals)
+            norms = gather(self.token_norms) if self.token_norms is not None else None
+            setup_sec = time.perf_counter() - row_start
+            combined = decompress_2bit_rows(
+                codes=codes,
+                packed_residuals=residuals,
+                centroids=self.centroids,
+                bucket_weights=self.bucket_weights,
+                token_norms=norms,
+                profile=self._decompression_profile,
+            )
+            relative_start = 0
+            for output_idx, start, end in resolved_rows:
+                length = end - start
+                vectors[output_idx] = combined[relative_start : relative_start + length]
+                relative_start += length
+            if self._decompression_profile is not None:
+                profile = self._decompression_profile
+                for key, value in (
+                    ("row_slice_setup_sec", setup_sec),
+                    ("row_total_sec", time.perf_counter() - row_start),
+                    ("decoded_encoding_unit_count", len(resolved_rows)),
+                    ("coalesced_group_count", 1),
+                    ("multi_unit_group_count", int(len(resolved_rows) > 1)),
+                ):
+                    profile[key] = profile.get(key, 0) + value
+            return vectors
 
         group_start_idx = 0
         while group_start_idx < len(resolved_rows):
@@ -447,6 +505,32 @@ class ColBERTWindowArtifact:
         vectors = self.data.vectors_for_cacheable_ids(cacheable_ids)
         self.retrievable_vectors_cache[cache_key] = vectors
         return vectors
+
+    def prefetch_docs(self, docs) -> None:
+        """Decode requested 2-bit rows together, preserving each document's order."""
+        if self.data.embedding_storage not in {
+            LEGACY_RESIDUAL_STORAGE_FORMAT,
+            RESIDUAL_STORAGE_FORMAT,
+        }:
+            return
+        pending = {}
+        for doc in docs:
+            cacheables = getattr(doc, "cacheables", []) or []
+            if not any(cacheable.text for cacheable in cacheables):
+                continue
+            ids = tuple(getattr(cacheable, "id", None) for cacheable in cacheables)
+            key = (str(getattr(doc, "id", "")), ids)
+            if key not in self.retrievable_vectors_cache:
+                pending[key] = ids
+        if not pending:
+            return
+        vectors = self.data.vectors_for_cacheable_ids(
+            [cid for ids in pending.values() for cid in ids], batch_decode=True
+        )
+        offset = 0
+        for key, ids in pending.items():
+            self.retrievable_vectors_cache[key] = vectors[offset : offset + len(ids)]
+            offset += len(ids)
 
     def enable_decompression_profile(self) -> None:
         self.data.enable_decompression_profile()

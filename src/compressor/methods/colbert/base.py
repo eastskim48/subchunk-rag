@@ -1,4 +1,4 @@
-"""Shared runtime for compressors backed by a ColBERT candidate store."""
+"""Shared runtime for compressors backed by a ColBERT subchunk store."""
 
 import os
 import time
@@ -175,6 +175,11 @@ class ColBERTWindowCompressorBase(TokenBudgetMixin, Compressor):
 
     @staticmethod
     def _build_unselected_document(doc: RetrievableChunk) -> RetrievableChunk:
-        cloned = doc.clone()
-        cloned.cacheables = []
-        return cloned
+        return RetrievableChunk(
+            **doc._clone_common_kwargs(),
+            cacheables=[],
+            chunk_size=doc.chunk_size,
+            token_count=doc.token_count,
+            cache_unit=doc.cache_unit,
+            token_budget=doc.token_budget,
+        )

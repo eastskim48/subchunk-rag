@@ -84,7 +84,7 @@ class ColBERTSubchunkCompressor(ColBERTWindowCompressorBase):
                 selected_ids.add(cacheable_id)
                 selected_candidates.append((score, candidate))
                 used_tokens += self._cacheable_token_len(cacheables[cacheable_idx])
-                # Selection policy includes the current candidate, then stops
+                # Selection policy includes the current subchunk, then stops
                 # once the accumulated prompt-visible tokens reach the budget.
                 if used_tokens >= final_token_budget:
                     break

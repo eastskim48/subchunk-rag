@@ -10,7 +10,7 @@ from materialize.splitter.parser import SentenceParser, UnitParser
 
 @dataclass
 class SplitDocumentResult:
-    """Retriever chunks plus their fine-grained cacheable candidates."""
+    """Retriever chunks plus their fine-grained cacheable subchunks."""
 
     chunks: List[CacheableChunk]
     retrievable_chunk: RetrievableChunk | None
@@ -155,7 +155,7 @@ class DocumentSplitter:
 
 
 class SentenceWiseSplitter(DocumentSplitter):
-    """Create one cacheable candidate per parsed sentence unit."""
+    """Create one cacheable subchunk per parsed sentence unit."""
 
     def __init__(
         self,
@@ -181,6 +181,7 @@ class SentenceWiseSplitter(DocumentSplitter):
             units,
             token_ids,
             max_unit_tokens=self.max_subchunk_tokens,
+            source_text=text,
         )
 
         chunks = []

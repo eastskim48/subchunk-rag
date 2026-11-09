@@ -296,8 +296,8 @@ def _summarize_passage_matches(
         "token_exact_recall": mean(token_exact),
         "any_char_exact": float(any(char_exact)),
         "any_token_exact": float(any(token_exact)),
-        "all_char_exact": float(all(char_exact)),
-        "all_token_exact": float(all(token_exact)),
+        "all_char_exact": float(bool(char_exact) and all(char_exact)),
+        "all_token_exact": float(bool(token_exact) and all(token_exact)),
         "char_contiguous_partial_recall": mean(char_partial),
         "token_contiguous_partial_recall": mean(token_partial),
     }

@@ -32,9 +32,13 @@ class LLMModel:
     """Wrap a Hugging Face causal LM with project-specific prompt/cache logic."""
 
     SYSTEM_PROMPT = (
-        "You answer questions using only the provided passages. "
-        "Return only the shortest exact answer phrase supported by the passages. "
-        "Do not explain, do not repeat the question, and do not output options or full sentences."
+        "Answer the question using only the provided context.\n"
+        "You may combine facts from different parts of the context, but do not use "
+        "outside knowledge or guess missing facts.\n"
+        "If the context does not provide enough information to answer the question, "
+        'output exactly "Insufficient information".\n'
+        "Otherwise, output only a short, direct answer.\n"
+        "Do not include explanations or repeat the question."
     )
 
     def __init__(

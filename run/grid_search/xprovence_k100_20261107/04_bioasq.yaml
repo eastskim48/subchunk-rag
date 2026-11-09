@@ -1,0 +1,64 @@
+run_name: bioasq
+run_id: xprovence_k100
+dataset: bioasq
+dataset_prefix: /mnt/nvme1/datasets
+eval_script: /mnt/nvme1/dongseob/subchunk/outputs/aaa_icde/xprovence_k100/code/run/eval.sh
+results_root: /mnt/nvme1/dongseob/subchunk/outputs/aaa_icde/xprovence_k100
+fixed_env:
+  ANSWER_FILE: /mnt/nvme1/dongseob/subchunk/outputs/bioasq_non_summary_20261027/answers/answer.jsonl
+  CACHE_DIR: /mnt/nvme1/dongseob/subchunk/outputs/aaa_icde/xprovence_k100/bioasq/cache_unused
+  CHROMA_EMBED_BACKEND: bge_small_v1_5
+  CHROMA_EMBED_DEVICE: cpu
+  COMPRESS_METHOD: provence
+  CUDA_VISIBLE_DEVICES: '0'
+  DATASET: bioasq
+  DATASET_PATH: /mnt/nvme1/datasets/bioasq14b-linked-documents
+  DATA_SUBDIR: sent-bge-small-v1.5-512-splitlong100-lateon
+  DB_DIR: /mnt/nvme1/datasets/bioasq14b-linked-documents/sent-bge-small-v1.5-512-splitlong100-lateon/db
+  EVAL_BSZ: '1'
+  EVAL_CPU_THREADS: '32'
+  EVAL_SEED: '123'
+  EVAL_USE_PAST_CACHE: 'False'
+  FINAL_TOKEN_BUDGET: ''
+  HF_HUB_OFFLINE: '1'
+  MAX_NEW_TOKENS: '20'
+  MEASURE_PROMPT_STATS: 'True'
+  MKL_NUM_THREADS: '32'
+  MODEL_LOAD_IN_4BIT: 'False'
+  MODEL_NAME: meta-llama/Llama-3.1-8B-Instruct
+  OMP_NUM_THREADS: '32'
+  OPENBLAS_NUM_THREADS: '32'
+  PARENT_MAPPING_FILE: ''
+  PROMPT_FORMAT: chat_system_user
+  PROVENCE_BATCH_SIZE: '100'
+  PROVENCE_DEVICE: cuda
+  PROVENCE_DTYPE: float16
+  PROVENCE_MODEL_NAME: /home/dongseob/.cache/huggingface/hub/models--naver--xprovence-reranker-bgem3-v2/snapshots/f2798d357213c40164bdd79557d6d2e43ca7d8d2
+  PROVENCE_REORDER: 'True'
+  PROVENCE_THRESHOLD: '0.4'
+  PYTHONPATH: /mnt/nvme1/dongseob/subchunk/outputs/aaa_icde/xprovence_k100/code/src
+  QUERY_FILE: /mnt/nvme1/dongseob/subchunk/outputs/bioasq_non_summary_20261027/questions/query.jsonl
+  RAYON_NUM_THREADS: '32'
+  RETAIN_TOKEN_RATIO: ''
+  RETRIEVAL_INCLUDE_DOCUMENTS: 'True'
+  RETRIEVAL_SNAPSHOT: ''
+  RUN_ID: xprovence_k100
+  TOKENIZERS_PARALLELISM: 'true'
+  TOP_K: '100'
+  TORCHRUN_MASTER_PORT: '29654'
+  TOTAL_NUM: ''
+  TRANSFORMERS_OFFLINE: '1'
+  USE_CLEANER: 'False'
+  XPROVENCE_OPTIMIZED_PROCESSING: 'True'
+  PYTORCH_CUDA_ALLOC_CONF: expandable_segments:False
+  COLBERT_REPO_PATH: /mnt/nvme1/dongseob/subchunk/third_party/ColBERT
+eval_fixed_env:
+  USE_CLEANER: 'False'
+  EVAL_USE_PAST_CACHE: 'False'
+eval_groups:
+- name: context_only_chat
+eval_cases:
+- TOP_K: '100'
+  PROVENCE_THRESHOLD: '0.4'
+  PROVENCE_REORDER: 'True'
+  EVAL_BSZ: '1'

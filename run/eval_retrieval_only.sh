@@ -45,7 +45,7 @@ OUTPUT_SUFFIX="topk${TOP_K}"
 
 USES_TOKEN_BUDGET=False
 case "$COMPRESS_METHOD" in
-    dense|colbert_subchunk|colbert_sliding_region|rerank_and_region)
+    dense|colbert_subchunk|colbert_sliding_region)
         USES_TOKEN_BUDGET=True
         ;;
 esac
@@ -62,15 +62,9 @@ if [ "$USES_TOKEN_BUDGET" = "True" ]; then
         OUTPUT_SUFFIX="ftb${FINAL_TOKEN_BUDGET}-$OUTPUT_SUFFIX"
     fi
 fi
-if [ "$COMPRESS_METHOD" = "colbert_chunk_rerank" ] && [ -n "${COLBERT_CHUNK_RERANK_KEEP:-}" ]; then
-    OUTPUT_SUFFIX="ccrk${COLBERT_CHUNK_RERANK_KEEP}-$OUTPUT_SUFFIX"
-fi
-if { [ "$COMPRESS_METHOD" = "colbert_rerank" ] || [ "$COMPRESS_METHOD" = "rerank_and_region" ]; } && [ -n "${COLBERT_RERANK_KEEP:-}" ]; then
-    OUTPUT_SUFFIX="crk${COLBERT_RERANK_KEEP}-$OUTPUT_SUFFIX"
-fi
 
 METHOD_SUFFIX="${COMPRESS_METHOD:-none}"
-if [[ "$COMPRESS_METHOD" == colbert_* || "$COMPRESS_METHOD" == "rerank_and_region" ]]; then
+if [[ "$COMPRESS_METHOD" == colbert_* ]]; then
     if [ -n "$COLBERT_QUERY_MAXLEN" ]; then
         OUTPUT_SUFFIX="qmax${COLBERT_QUERY_MAXLEN}-$OUTPUT_SUFFIX"
     fi

@@ -8,6 +8,7 @@ import json
 import os
 import shutil
 import tempfile
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -41,6 +42,44 @@ _UNPACK_2BIT_LUT = np.asarray(
     dtype=np.uint8,
 )
 
+_DECODE_SCRATCH = threading.local()
+
+
+def _residual_values_into_buffer(quantized, bucket_weights):
+    """Reuse scratch storage; returned data is consumed before the next decode."""
+    buffer = getattr(_DECODE_SCRATCH, "residuals", None)
+    if buffer is None or buffer.size < quantized.size:
+        buffer = np.empty(quantized.size, dtype=np.float32)
+        _DECODE_SCRATCH.residuals = buffer
+    values = buffer[: quantized.size].reshape(quantized.shape)
+    # Unpacking guarantees indices 0..3. clip avoids take's raise-mode copy.
+    np.take(bucket_weights, quantized, out=values, mode="clip")
+    return values
+
+
+def _packed_residual_values_into_buffer(packed, embedding_dim, bucket_weights):
+    """Map each packed byte directly to four FP32 residuals."""
+    packed = np.asarray(packed, dtype=np.uint8)
+    if packed.ndim != 2:
+        raise ValueError("packed residuals must be rank 2")
+    if embedding_dim <= 0 or embedding_dim % 4:
+        raise ValueError("embedding_dim must be positive and divisible by four")
+    if packed.shape[1] != embedding_dim // 4:
+        raise ValueError("packed residual width must match embedding_dim")
+    weights_key = bucket_weights.tobytes()
+    if getattr(_DECODE_SCRATCH, "weights_key", None) != weights_key:
+        _DECODE_SCRATCH.float_lut = bucket_weights[_UNPACK_2BIT_LUT]
+        _DECODE_SCRATCH.weights_key = weights_key
+    size = packed.size * 4
+    buffer = getattr(_DECODE_SCRATCH, "residuals", None)
+    if buffer is None or buffer.size < size:
+        buffer = np.empty(size, dtype=np.float32)
+        _DECODE_SCRATCH.residuals = buffer
+    values = buffer[:size].reshape(*packed.shape, 4)
+    # uint8 guarantees valid indices into the 256-row table.
+    np.take(_DECODE_SCRATCH.float_lut, packed, axis=0, out=values, mode="clip")
+    return values.reshape(packed.shape[0], embedding_dim)
+
 
 def _default_num_centroids(num_tokens: int) -> int:
     if num_tokens <= 0:
@@ -67,13 +106,24 @@ def _normalize_rows(values: np.ndarray) -> np.ndarray:
     return values / np.maximum(norms, np.finfo(np.float32).eps)
 
 
-def _normalize_rows_inplace(values: np.ndarray) -> np.ndarray:
+def _normalize_rows_inplace(
+    values: np.ndarray, token_norms: np.ndarray | None = None
+) -> np.ndarray:
     """Normalize a writable float32 row matrix without another row matrix."""
 
     if values.dtype != np.float32 or not values.flags.writeable:
         raise ValueError("in-place normalization requires writable float32 values")
-    norms = np.linalg.norm(values, axis=1, keepdims=True)
-    np.maximum(norms, np.finfo(np.float32).eps, out=norms)
+    if token_norms is None:
+        norms = np.einsum("ij,ij->i", values, values)[:, None]
+        np.sqrt(norms, out=norms)
+        np.maximum(norms, np.finfo(np.float32).eps, out=norms)
+    else:
+        token_norms = np.asarray(token_norms, dtype=np.float32)
+        if token_norms.shape != (values.shape[0],):
+            raise ValueError("stored token norms must match the decoded row count")
+        if not np.isfinite(token_norms).all() or np.any(token_norms <= 0):
+            raise ValueError("stored token norms must be finite and positive")
+        norms = token_norms[:, None]
     np.divide(values, norms, out=values)
     return values
 
@@ -122,6 +172,7 @@ def decompress_2bit_rows(
     centroids: np.ndarray,
     bucket_weights: np.ndarray,
     profile: dict[str, float | int] | None = None,
+    token_norms: np.ndarray | None = None,
 ) -> torch.Tensor:
     """Reconstruct and normalize selected ColBERT token vectors on CPU."""
 
@@ -132,6 +183,7 @@ def decompress_2bit_rows(
             centroids=centroids,
             bucket_weights=bucket_weights,
             profile=profile,
+            token_norms=token_norms,
         )
 
     codes = np.asarray(codes, dtype=np.int64)
@@ -147,10 +199,15 @@ def decompress_2bit_rows(
         )
     if codes.size and (int(codes.min()) < 0 or int(codes.max()) >= len(centroids)):
         raise ValueError("centroid code is outside the stored centroid table")
-    quantized = unpack_2bit_values(packed_residuals, centroids.shape[1])
     reconstructed = centroids[codes]
-    np.add(reconstructed, bucket_weights[quantized], out=reconstructed)
-    return torch.from_numpy(_normalize_rows_inplace(reconstructed))
+    np.add(
+        reconstructed,
+        _packed_residual_values_into_buffer(
+            packed_residuals, centroids.shape[1], bucket_weights
+        ),
+        out=reconstructed,
+    )
+    return torch.from_numpy(_normalize_rows_inplace(reconstructed, token_norms))
 
 
 def _profile_add(profile: dict[str, float | int], key: str, value: float | int) -> None:
@@ -164,6 +221,7 @@ def _decompress_2bit_rows_profiled(
     centroids: np.ndarray,
     bucket_weights: np.ndarray,
     profile: dict[str, float | int],
+    token_norms: np.ndarray | None = None,
 ) -> torch.Tensor:
     total_start = time.perf_counter()
 
@@ -186,16 +244,17 @@ def _decompress_2bit_rows_profiled(
         raise ValueError("centroid code is outside the stored centroid table")
     _profile_add(profile, "validation_sec", time.perf_counter() - stage_start)
 
-    stage_start = time.perf_counter()
-    quantized = unpack_2bit_values(packed_residuals, centroids.shape[1])
-    _profile_add(profile, "unpack_sec", time.perf_counter() - stage_start)
+    # Bit unpack and residual lookup are fused; time is in residual_lookup_sec.
+    _profile_add(profile, "unpack_sec", 0.0)
 
     stage_start = time.perf_counter()
     reconstructed = centroids[codes]
     _profile_add(profile, "centroid_gather_sec", time.perf_counter() - stage_start)
 
     stage_start = time.perf_counter()
-    residual_values = bucket_weights[quantized]
+    residual_values = _packed_residual_values_into_buffer(
+        packed_residuals, centroids.shape[1], bucket_weights
+    )
     _profile_add(profile, "residual_lookup_sec", time.perf_counter() - stage_start)
 
     stage_start = time.perf_counter()
@@ -204,7 +263,7 @@ def _decompress_2bit_rows_profiled(
     _profile_add(profile, "add_sec", time.perf_counter() - stage_start)
 
     stage_start = time.perf_counter()
-    normalized = _normalize_rows_inplace(reconstructed)
+    normalized = _normalize_rows_inplace(reconstructed, token_norms)
     _profile_add(profile, "normalize_sec", time.perf_counter() - stage_start)
 
     stage_start = time.perf_counter()
@@ -260,13 +319,44 @@ def _train_codec(
     rng = np.random.default_rng(seed)
     sample_indices = rng.choice(num_tokens, size=sample_size, replace=False)
     sample = np.asarray(vectors[sample_indices], dtype=np.float32)
+    permutation = rng.permutation(sample_size)
+    return _train_codec_from_sample(
+        sample,
+        permutation=permutation,
+        num_centroids=num_centroids,
+        seed=seed,
+        kmeans_niters=kmeans_niters,
+        use_gpu=use_gpu,
+    )
+
+
+def _train_codec_from_sample(
+    sample: np.ndarray,
+    *,
+    permutation: np.ndarray,
+    num_centroids: int,
+    seed: int,
+    kmeans_niters: int,
+    use_gpu: bool,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Train on the same ordered global-token sample in either build path."""
+    faiss = _import_faiss()
+    if use_gpu and not hasattr(faiss, "StandardGpuResources"):
+        raise RuntimeError(
+            "GPU residual compression requires a GPU-enabled FAISS build"
+        )
+    sample = np.asarray(sample, dtype=np.float32)
+    sample_size, embedding_dim = sample.shape
+    if not 1 < num_centroids <= sample_size:
+        raise ValueError("num_centroids must be in (1, sample_size]")
+    if permutation.shape != (sample_size,):
+        raise ValueError("sample permutation has the wrong size")
     heldout_size = min(max(1, int(0.05 * sample_size)), 50_000)
     if sample_size - heldout_size < num_centroids:
         raise ValueError(
             "training sample after the held-out split must contain at least one "
             "row per centroid"
         )
-    permutation = rng.permutation(sample_size)
     heldout = np.ascontiguousarray(sample[permutation[:heldout_size]])
     training = np.ascontiguousarray(sample[permutation[heldout_size:]])
     kmeans = faiss.Kmeans(

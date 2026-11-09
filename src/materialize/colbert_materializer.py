@@ -1,4 +1,4 @@
-"""Build contextualized ColBERT candidate stores and region sidecar metadata."""
+"""Build contextualized ColBERT subchunk stores and region sidecar metadata."""
 
 from __future__ import annotations
 
@@ -37,7 +37,7 @@ from materialize.db_cacheables import (
 
 @dataclass
 class WindowSpec:
-    """Text window plus the token span belonging to its center candidate."""
+    """Text window plus the token span belonging to its center subchunk."""
 
     text: str
     center_start: int
@@ -274,7 +274,7 @@ class ColBERTWindowEncoder(colbert_encoder.ColBERTEncoder):
 
 
 class _ColBERTArtifactWriter:
-    """Batch window encoding and persist the compact candidate index."""
+    """Batch window encoding and persist the compact subchunk index."""
 
     def __init__(
         self,
@@ -396,7 +396,7 @@ def _validate_center_unit_against_db_manifest(
     db_manifest: dict[str, Any],
     center_unit: str,
 ) -> None:
-    """Reject artifact candidate units that differ from the persisted DB units."""
+    """Reject artifact subchunk units that differ from the persisted DB units."""
 
     splitter = db_manifest.get("splitter")
     if splitter == "sentence":
@@ -429,7 +429,7 @@ def build_colbert_window_artifact(
     center_unit: str = "subchunk_only",
     fixed_chunk_size: int | None = None,
 ) -> dict[str, Any]:
-    """Encode source windows and write the contextualized candidate store."""
+    """Encode source windows and write the contextualized subchunk store."""
 
     if center_unit not in {
         "subchunk",
@@ -654,7 +654,7 @@ def build_colbert_window_artifact(
 
     summary = {
         "format": colbert_artifact.ARTIFACT_FORMAT,
-        "encoder_impl": "official_colbert_checkpoint",
+        "encoder_impl": getattr(encoder, "encoder_impl", "official_colbert_checkpoint"),
         "data_dir": "data",
         "docs_dir": str(docs_path),
         "db_manifest": db_manifest_reference,
@@ -720,17 +720,17 @@ def build_colbert_window_artifact(
     return summary
 
 
-def validate_colbert_candidate_ids_against_db(
+def validate_colbert_subchunk_ids_against_db(
     artifact_dir: str,
     db_dir: str,
     batch_size: int = 2048,
 ) -> dict[str, Any]:
-    """Require the materialized candidate IDs to match the DB exactly."""
+    """Require the materialized subchunk IDs to match the DB exactly."""
 
     artifact = colbert_artifact.ColBERTWindowArtifact(artifact_dir)
     artifact_cacheable_count = artifact.data.num_cacheables
     temporary_file = tempfile.NamedTemporaryFile(
-        prefix=".candidate_validation_",
+        prefix=".subchunk_validation_",
         suffix=".sqlite3",
         dir=artifact.data.data_dir,
         delete=False,
@@ -912,7 +912,7 @@ def add_region_specs_to_colbert_window_data(
             return index
         raise ValueError(
             "finalized ColBERT metadata cannot rebuild regions in "
-            "place; rebuild the candidate store with overwrite enabled"
+            "place; rebuild the subchunk store with overwrite enabled"
         )
     if index.get("format") != "colbert_window_data_build_v1":
         raise ValueError(

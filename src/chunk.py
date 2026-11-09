@@ -84,7 +84,7 @@ class CacheableChunk(Chunk):
 
 
 class RetrievableChunk(Chunk):
-    """Coarse retrieval unit containing candidate cacheable subchunks."""
+    """Coarse retrieval unit containing subchunk cacheable subchunks."""
 
     def __init__(
         self,

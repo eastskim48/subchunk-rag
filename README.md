@@ -76,11 +76,11 @@ Then build the matching ColBERT artifact:
 DATASET_PREFIX=. \
 DATASET=dapr-nq-open \
 PREPROCESS_SUBDIR=sent-bge-small-v1.5-512-splitlong180 \
-CANDIDATE_STORE_BACKEND=colbert \
+SUBCHUNK_MATERIALIZATION_BACKEND=colbert \
 COLBERT_WINDOW_BATCH_SIZE=6144 \
 COLBERT_WINDOW_TOKEN_BUDGET=180 \
 COLBERT_WINDOW_CENTER_UNIT=subchunk_only \
-bash ./run/materialize_candidate_store.sh
+bash ./run/materialize_subchunks.sh
 ```
 
 This writes the artifact to

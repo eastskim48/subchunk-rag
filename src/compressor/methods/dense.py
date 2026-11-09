@@ -19,7 +19,13 @@ from compressor.methods.colbert.region import (
     _validate_retrieval_chunk_larger_than_region,
 )
 from compressor.token_budget import TokenBudgetMixin
-from encoder.dense import BGE_M3_MODEL, DenseTextEmbedder, default_query_prefix
+from encoder.dense import (
+    BGE_M3_MODEL,
+    DENSEON_MODEL,
+    DenseTextEmbedder,
+    default_query_prefix,
+    default_passage_prefix,
+)
 
 QUERY_PREFIX = default_query_prefix(BGE_M3_MODEL)
 
@@ -60,7 +66,7 @@ class _DenseEmbeddingSelector(TokenBudgetMixin, Compressor):
     def _embed_unique_cacheables(
         self, cacheables: List[CacheableChunk]
     ) -> tuple[torch.Tensor, dict[tuple[str, str | int], int]]:
-        """Embed each stable candidate ID once and retain vectors across batches."""
+        """Embed each stable subchunk ID once and retain vectors across batches."""
 
         cache = getattr(self, "_runtime_cacheable_embeddings", None)
         if cache is None:
@@ -107,8 +113,12 @@ class _DenseEmbeddingSelector(TokenBudgetMixin, Compressor):
             self.runtime_cache_hits += 1
 
         if missing_texts:
+            embedding_texts = missing_texts
+            if getattr(self, "embedding_model", None) == DENSEON_MODEL:
+                prefix = default_passage_prefix(DENSEON_MODEL)
+                embedding_texts = [prefix + text for text in missing_texts]
             missing_embeddings = (
-                self._embed_texts(missing_texts).detach().cpu().to(torch.float32)
+                self._embed_texts(embedding_texts).detach().cpu().to(torch.float32)
             )
             if missing_embeddings.shape[0] != len(missing_keys):
                 raise ValueError(
@@ -133,7 +143,7 @@ class _DenseEmbeddingSelector(TokenBudgetMixin, Compressor):
 
 
 class _TokenBudgetDenseSelector(_DenseEmbeddingSelector):
-    """Apply a shared token budget after ranking dense sentence candidates."""
+    """Apply a shared token budget after ranking dense sentence subchunks."""
 
     def __init__(self):
         self._initialize_token_budget(db_dir=_configured_db_dir())
@@ -406,7 +416,7 @@ class DenseCompressor(_TokenBudgetDenseSelector):
 
 
 class DenseOnlineCompressor(_TokenBudgetDenseSelector):
-    """Score retrieved subchunks by embedding candidates at evaluation time."""
+    """Score retrieved subchunks by embedding subchunks at evaluation time."""
 
     def _score_chunk_texts_for_batch(
         self, batch_top_k_docs: List[List[RetrievableChunk]], batch_queries: List[str]

@@ -1,4 +1,4 @@
-"""Write the dense candidate embedding artifact."""
+"""Write the dense subchunk embedding artifact."""
 
 import os
 from pathlib import Path
@@ -7,7 +7,13 @@ from typing import Dict, List
 import torch
 
 from chunk import CacheableChunk
-from encoder.dense import BGE_M3_MODEL, DenseTextEmbedder, default_query_prefix
+from encoder.dense import (
+    BGE_M3_MODEL,
+    DENSEON_MODEL,
+    DenseTextEmbedder,
+    default_query_prefix,
+    default_passage_prefix,
+)
 from materialize.db_cacheables import load_db_cacheables_by_document
 from materialize.db_manifest import read_db_build_manifest
 
@@ -21,7 +27,7 @@ def _resolve_dense_cache_unit(db_dir: str | Path, cache_unit: str | None) -> str
     manifest = read_db_build_manifest(db_dir)
     if manifest is None:
         raise FileNotFoundError(
-            "dense candidate-store materialization requires "
+            "dense subchunk store materialization requires "
             f"{Path(db_dir) / 'build_manifest.json'}"
         )
     splitter = manifest.get("splitter")
@@ -79,6 +85,9 @@ class DenseEmbeddingWriter:
         return os.path.join(self.output_dir, self.OUTPUT_FILENAME)
 
     def _embed_texts(self, texts: List[str]) -> torch.Tensor:
+        if self.embedding_model_name == DENSEON_MODEL:
+            prefix = default_passage_prefix(DENSEON_MODEL)
+            texts = [prefix + text for text in texts]
         return self.embedding_backend.embed_texts(texts).to(self.embedding_device)
 
     def _embed_texts_batched(self, texts: List[str]) -> torch.Tensor:
@@ -168,7 +177,7 @@ def build_dense_embedding_artifact_from_db(
     cache_unit: str | None = None,
     overwrite: bool = False,
 ) -> dict[str, object]:
-    """Build a dense candidate embedding artifact from persisted DB cacheables."""
+    """Build a dense subchunk embedding artifact from persisted DB cacheables."""
 
     output_path = Path(output_dir) / DenseEmbeddingWriter.OUTPUT_FILENAME
     if output_path.exists() and not overwrite:

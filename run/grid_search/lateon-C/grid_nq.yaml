@@ -1,0 +1,61 @@
+run_name: nq
+run_id: lateon-C
+dataset: dapr-nq-open
+dataset_prefix: /mnt/nvme1/datasets
+eval_script: run/eval.sh
+results_root: /mnt/nvme1/dongseob/subchunk/outputs/aaa_icde/lateon-C
+fixed_env:
+  MODEL_NAME: meta-llama/Llama-3.1-8B-Instruct
+  MODEL_LOAD_IN_4BIT: 'False'
+  MAX_NEW_TOKENS: '20'
+  MEASURE_PROMPT_STATS: 'True'
+  PROMPT_FORMAT: chat_system_user
+  CHROMA_EMBED_BACKEND: bge_small_v1_5
+  CHROMA_EMBED_DEVICE: cpu
+  DATA_SUBDIR: sent-bge-small-v1.5-512-splitlong100-lateon
+  DATASET_PATH: /mnt/nvme1/datasets/dapr-nq-open
+  DATASET: dapr-nq-open
+  DB_DIR: /mnt/nvme1/datasets/dapr-nq-open/sent-bge-small-v1.5-512-splitlong100-lateon/db
+  COLBERT_MODEL_NAME: lightonai/LateOn
+  COLBERT_WINDOW_DIR: /mnt/nvme1/datasets/dapr-nq-open/sent-bge-small-v1.5-512-splitlong100-lateon/colbert_lateon_sentence_2bit
+  COLBERT_QUERY_MAXLEN: '32'
+  COLBERT_QUERY_MINLEN: ''
+  COLBERT_QUERY_TRUNCATION_SIDE: right
+  COLBERT_REGION_GROUP_ORDER: retrieval
+  COLBERT_GLOBAL_MAXSIM_GATE: 'false'
+  COLBERT_GLOBAL_MAXSIM_FILL: 'false'
+  COLBERT_BATCH_SIZE: '24'
+  COLBERT_REPO_PATH: /mnt/nvme1/dongseob/subchunk/third_party/ColBERT
+  FINAL_TOKEN_BUDGET: '1000'
+  RETAIN_TOKEN_RATIO: ''
+  TOTAL_NUM: ''
+  EVAL_BSZ: '28'
+  TOP_K: '100'
+  EVAL_USE_PAST_CACHE: 'False'
+  USE_CLEANER: 'False'
+  HF_HUB_OFFLINE: '1'
+  TRANSFORMERS_OFFLINE: '1'
+  TOKENIZERS_PARALLELISM: 'false'
+  OMP_NUM_THREADS: '32'
+  MKL_NUM_THREADS: '32'
+  OPENBLAS_NUM_THREADS: '32'
+  CUDA_VISIBLE_DEVICES: '0'
+  PYTHONPATH: /mnt/nvme1/dongseob/subchunk/src
+  COMPRESS_METHOD: colbert_expanded_region
+  RUN_ID: lateon-C
+  QUERY_FILE: /mnt/nvme1/datasets/dapr-nq-open/questions/query.jsonl
+  ANSWER_FILE: /mnt/nvme1/datasets/dapr-nq-open/answers/answer.jsonl
+  CACHE_DIR: /mnt/nvme1/dongseob/subchunk/outputs/aaa_icde/lateon-C/nq/cache_unused
+  EVAL_SEED: '123'
+  EVAL_CPU_THREADS: '32'
+  TORCHRUN_MASTER_PORT: '29612'
+  COLBERT_CHUNK_DIR: /mnt/nvme1/datasets/dapr-nq-open/sent-bge-small-v1.5-512-splitlong100-lateon/colbert_lateon_expanded_chunk_2bit
+eval_fixed_env:
+  USE_CLEANER: 'False'
+  EVAL_USE_PAST_CACHE: 'False'
+eval_groups:
+- name: context_only_chat
+eval_cases:
+- TOP_K: '100'
+  FINAL_TOKEN_BUDGET: '1000'
+  EVAL_BSZ: '28'

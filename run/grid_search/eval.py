@@ -160,9 +160,7 @@ class GridRunner:
                 continue
             number = int(text)
             if number <= 0:
-                raise ValueError(
-                    f"batch-size candidates must be positive, got {number}"
-                )
+                raise ValueError(f"batch-size values must be positive, got {number}")
             values.append(number)
         return sorted(set(values))
 
@@ -187,10 +185,10 @@ class GridRunner:
 
     def _auto_bsz_candidates(self) -> list[int]:
         config = self._auto_bsz_config()
-        candidates = self._parse_int_list(config.get("candidates"))
+        candidates = self._parse_int_list(config.get("values"))
         if not candidates:
             candidates = self._parse_int_list(
-                self.fixed_env.get("AUTO_EVAL_BSZ_CANDIDATES")
+                self.fixed_env.get("AUTO_EVAL_BSZ_VALUES")
             )
         if not candidates:
             min_value = config.get("min", self.fixed_env.get("AUTO_EVAL_BSZ_MIN"))
@@ -404,7 +402,7 @@ class GridRunner:
             selected = candidates[-1]
             self._print_status(
                 f"[bsz-selected-without-probe] dataset={dataset} "
-                f"EVAL_BSZ={selected} candidates={candidates}"
+                f"EVAL_BSZ={selected} values={candidates}"
             )
             self._log_event(
                 f"auto_bsz selected_without_probe dataset={dataset} "
@@ -414,7 +412,7 @@ class GridRunner:
 
         search_mode = self._auto_bsz_search_mode()
         self._print_status(
-            f"[bsz-search] dataset={dataset} mode={search_mode} candidates={candidates}"
+            f"[bsz-search] dataset={dataset} mode={search_mode} values={candidates}"
         )
         if search_mode == "binary":
             last_ok = self._select_auto_bsz_binary(
@@ -427,7 +425,7 @@ class GridRunner:
 
         if last_ok is None:
             raise RuntimeError(
-                f"auto batch-size probe failed for every candidate {candidates}; "
+                f"auto batch-size probe failed for every value {candidates}; "
                 f"check {self.bsz_probe_jsonl}"
             )
         self._print_status(f"[bsz-selected] dataset={dataset} EVAL_BSZ={last_ok}")

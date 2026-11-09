@@ -1,0 +1,44 @@
+run_name: newsqa-bge-small-vanilla-top2-b24-20261101
+dataset: newsqa
+dataset_prefix: /mnt/nvme1/datasets
+eval_script: run/eval_vanilla_top2_grid.sh
+results_root: /mnt/nvme1/dongseob/subchunk/outputs/temp/vanilla_top2_four_20261101
+fixed_env:
+  MODEL_NAME: meta-llama/Llama-3.1-8B-Instruct
+  MODEL_LOAD_IN_4BIT: 'False'
+  MAX_NEW_TOKENS: '20'
+  MEASURE_PROMPT_STATS: 'True'
+  PROMPT_FORMAT: chat_system_user
+  CHROMA_EMBED_BACKEND: bge_small_v1_5
+  CHROMA_EMBED_DEVICE: cpu
+  DATA_SUBDIR: sent-bge-small-v1.5-512-splitlong100-lateon
+  DATASET_PATH: /mnt/nvme1/datasets/newsqa
+  DATASET: newsqa
+  DB_DIR: /mnt/nvme1/datasets/newsqa/sent-bge-small-v1.5-512-splitlong100-lateon/db
+  FINAL_TOKEN_BUDGET: ''
+  RETAIN_TOKEN_RATIO: ''
+  TOTAL_NUM: ''
+  EVAL_BSZ: '24'
+  TOP_K: '2'
+  EVAL_USE_PAST_CACHE: 'False'
+  USE_CLEANER: 'False'
+  HF_HUB_OFFLINE: '1'
+  TRANSFORMERS_OFFLINE: '1'
+  TOKENIZERS_PARALLELISM: 'false'
+  OMP_NUM_THREADS: '32'
+  MKL_NUM_THREADS: '32'
+  OPENBLAS_NUM_THREADS: '32'
+  CUDA_VISIBLE_DEVICES: '0'
+  PYTHONPATH: /mnt/nvme1/dongseob/subchunk/outputs/temp/vanilla_top2_four_20261101/code/src
+  QUERY_FILE: /mnt/nvme1/datasets/newsqa/questions/query.jsonl
+  ANSWER_FILE: /mnt/nvme1/datasets/newsqa/answers/answer.jsonl
+  COMPRESS_METHOD: ''
+  VANILLA_TOP2_CODE: /mnt/nvme1/dongseob/subchunk/outputs/temp/vanilla_top2_four_20261101/code
+  VANILLA_TOP2_CONFIG: /mnt/nvme1/dongseob/subchunk/outputs/temp/vanilla_top2_four_20261101/newsqa.json
+eval_fixed_env:
+  USE_CLEANER: 'False'
+  EVAL_USE_PAST_CACHE: 'False'
+eval_groups:
+- name: vanilla_context_chat
+eval_cases:
+- TOP_K: '2'

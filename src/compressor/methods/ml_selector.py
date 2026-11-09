@@ -112,7 +112,7 @@ class OfficialSentenceSelector(Compressor):
 
 
 class ProvenceCompressor(OfficialSentenceSelector):
-    """Select context with the official Provence pruning model."""
+    """Select context with XProvence through the shared Provence interface."""
 
     _RERANK_TOP_K = 5
 
@@ -121,7 +121,7 @@ class ProvenceCompressor(OfficialSentenceSelector):
         load_dotenv()
 
         self.model_name = os.getenv(
-            "PROVENCE_MODEL_NAME", "naver/provence-reranker-debertav3-v1"
+            "PROVENCE_MODEL_NAME", "naver/xprovence-reranker-bgem3-v2"
         )
         self.threshold = float(os.getenv("PROVENCE_THRESHOLD", "0.5"))
         self.batch_size = int(os.getenv("PROVENCE_BATCH_SIZE", "256"))
@@ -139,9 +139,13 @@ class ProvenceCompressor(OfficialSentenceSelector):
         print(
             f"provence compression enabled. Initializing model: {self.model_name} on {self.device}"
         )
+        dtype_name = os.getenv("PROVENCE_DTYPE", "float32").strip().lower()
+        if dtype_name not in {"float32", "float16"}:
+            raise ValueError("PROVENCE_DTYPE must be float32 or float16")
         self.model = AutoModel.from_pretrained(
             self.model_name,
             trust_remote_code=True,
+            torch_dtype=getattr(torch, dtype_name),
         ).to(self.device)
 
     def _extract_pruned_context(self, result) -> str:
@@ -330,20 +334,31 @@ class ProvenceCompressor(OfficialSentenceSelector):
         if not questions:
             return compressed_batches, output_doc_indices
 
-        with (
-            open(os.devnull, "w") as devnull,
-            redirect_stdout(devnull),
-            redirect_stderr(devnull),
-        ):
-            results = self.model.process(
-                question=questions,
-                context=contexts,
-                threshold=self.threshold,
-                batch_size=self.batch_size,
-                always_select_title=True,
-                enable_warnings=False,
-                reorder=False,
+        optimized = (
+            type(self.model).__name__ == "XProvence"
+            and os.getenv("XPROVENCE_OPTIMIZED_PROCESSING", "False").lower() == "true"
+        )
+        if optimized:
+            from compressor.methods.xprovence_processing import process_contexts
+
+            results = process_contexts(
+                self.model, questions, contexts, self.threshold, self.batch_size
             )
+        else:
+            with (
+                open(os.devnull, "w") as devnull,
+                redirect_stdout(devnull),
+                redirect_stderr(devnull),
+            ):
+                results = self.model.process(
+                    question=questions,
+                    context=contexts,
+                    threshold=self.threshold,
+                    batch_size=self.batch_size,
+                    always_select_title=True,
+                    enable_warnings=False,
+                    reorder=False,
+                )
         if not isinstance(results, dict):
             raise ValueError("Provence batch output must be a dictionary.")
         pruned_batches = results.get("pruned_context")

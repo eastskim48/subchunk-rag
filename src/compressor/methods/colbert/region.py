@@ -49,6 +49,12 @@ class ColBERTSlidingRegionCompressor(ColBERTWindowCompressorBase):
     def __init__(self):
         super().__init__()
         self.region_group_order = _configured_region_group_order()
+        self.global_maxsim_gate = (
+            os.getenv("COLBERT_GLOBAL_MAXSIM_GATE", "false").lower() == "true"
+        )
+        self.global_maxsim_fill = (
+            os.getenv("COLBERT_GLOBAL_MAXSIM_FILL", "false").lower() == "true"
+        )
         self._sliding_region_spec_cache = {}
         # Keep 2-bit artifacts on the optimized reconstruct-then-MaxSim path.
         self._use_direct_2bit_maxsim = False
@@ -369,6 +375,11 @@ class ColBERTSlidingRegionCompressor(ColBERTWindowCompressorBase):
             return scores
 
         sentence_scores = sentence_token_maxsim(query_vector, sentence_vectors)
+        if getattr(self, "global_maxsim_gate", False):
+            if fallback_regions:
+                raise ValueError("Global MaxSim gate requires sentence vector mappings")
+            for region, indices in zip(regions, region_sentence_indices):
+                region["query_token_maxima"] = sentence_scores[indices].amax(dim=0)
         scores = aggregate_sentence_maxsim(sentence_scores, region_sentence_indices)
 
         for region_idx in fallback_regions:
@@ -435,7 +446,27 @@ class ColBERTSlidingRegionCompressor(ColBERTWindowCompressorBase):
         selected_cacheables = []
         selected_sentence_ids = set()
         used_tokens = 0
-        for score, region in scored_regions:
+        global_maxima = None
+        gate = getattr(self, "global_maxsim_gate", False)
+        stats = dict(
+            examined=0,
+            zero_gain_skipped=0,
+            selected=0,
+            stop_reason="candidates_exhausted",
+        )
+        deferred_regions = []
+        fill = gate and getattr(self, "global_maxsim_fill", False)
+        if fill:
+            stats["fill_selected"] = 0
+
+        def candidates():
+            for score, region in scored_regions:
+                yield score, region, False
+            if fill:
+                for score, region in deferred_regions:
+                    yield score, region, True
+
+        for score, region, filling in candidates():
             novel_indices = []
             novel_token_count = 0
             allowed_indices = self._region_sentence_indices_to_keep(
@@ -454,9 +485,51 @@ class ColBERTSlidingRegionCompressor(ColBERTWindowCompressorBase):
             if not novel_indices:
                 continue
 
+            if gate and not filling:
+                stats["examined"] += 1
+                # Empty-token regions have no matching evidence to contribute.
+                if not any(
+                    region["source_vectors"][idx].numel() > 0
+                    for idx in region["selected_indices"]
+                ):
+                    continue
+                candidate_maxima = region["query_token_maxima"]
+                if not torch.isfinite(candidate_maxima).all():
+                    raise ValueError("Global MaxSim candidate has nonfinite scores")
+                # The first nonempty region initializes the empty selection.
+                # A strict elementwise improvement is equivalent to positive
+                # gain and avoids cancellation when subtracting total scores.
+                if global_maxima is not None and not torch.any(
+                    candidate_maxima > global_maxima
+                ):
+                    stats["zero_gain_skipped"] += 1
+                    if fill:
+                        deferred_regions.append((score, region))
+                    continue
+            # Tentatively add only novel sentences. Absolute budgets discard
+            # an overflowing candidate and stop; ratio budgets retain overshoot.
+            used_tokens += novel_token_count
+            if (
+                getattr(self, "final_token_budget", None) is not None
+                and used_tokens > final_token_budget
+            ):
+                used_tokens -= novel_token_count
+                stats["stop_reason"] = "budget_exceeded"
+                break
+
+            if gate and not filling:
+                global_maxima = (
+                    candidate_maxima.clone()
+                    if global_maxima is None
+                    else torch.maximum(global_maxima, candidate_maxima)
+                )
+                stats["selected"] += 1
+
+            if filling:
+                stats["fill_selected"] += 1
+
             for idx in novel_indices:
                 selected_sentence_ids.add(region["source_cacheables"][idx].id)
-            used_tokens += novel_token_count
             selected_region_scores_by_chunk.setdefault(region["chunk_idx"], []).append(
                 float(score)
             )
@@ -466,10 +539,13 @@ class ColBERTSlidingRegionCompressor(ColBERTWindowCompressorBase):
                 for cacheable in self._make_region_run_cacheables(region, novel_indices)
             )
 
-            # Match the project-wide add-then-check budget policy.
+            # Exact fits stop in both modes; only ratio budgets keep overshoot.
             if used_tokens >= final_token_budget:
+                stats["stop_reason"] = "budget_reached"
                 break
 
+        if gate:
+            self.last_global_gate_stats = stats
         return selected_cacheables, selected_region_scores_by_chunk
 
     def _select_sliding_regions(
@@ -527,6 +603,12 @@ class ColBERTSlidingRegionCompressor(ColBERTWindowCompressorBase):
             self._profile_add(
                 profile, "budget_time", time.perf_counter() - budget_start
             )
+            if not self._use_direct_2bit_maxsim:
+                lookup_start = time.perf_counter()
+                self.artifact.prefetch_docs(docs)
+                self._profile_add(
+                    profile, "artifact_lookup_time", time.perf_counter() - lookup_start
+                )
             regions = []
             for chunk_idx, doc in enumerate(docs):
                 regions.extend(self._sliding_regions_for_doc(doc, chunk_idx, profile))
@@ -548,6 +630,25 @@ class ColBERTSlidingRegionCompressor(ColBERTWindowCompressorBase):
                     final_token_budget=final_token_budget,
                 )
             )
+            if getattr(self, "global_maxsim_gate", False):
+                for key in ("examined", "zero_gain_skipped", "selected"):
+                    self._profile_add(
+                        profile, "global_gate_" + key, self.last_global_gate_stats[key]
+                    )
+                trace_path = os.getenv("COLBERT_GLOBAL_GATE_TRACE")
+                if trace_path:
+                    import json
+
+                    with open(trace_path, "a") as trace:
+                        trace.write(
+                            json.dumps(
+                                dict(
+                                    question=batch_queries[len(summarized_batches)],
+                                    **self.last_global_gate_stats,
+                                )
+                            )
+                            + "\n"
+                        )
             for chunk_idx, cacheable in selected_cacheables:
                 selected_by_doc.setdefault(chunk_idx, []).append(cacheable)
             self._profile_add(

@@ -1,0 +1,38 @@
+# Custom DAPR-NQ/NQ-open intersection; reuse the existing DB and Jina artifact.
+run_name: nq-jina-colbert-v2-2bit-chat
+dataset: dapr-nq-open
+dataset_prefix: /mnt/nvme1/datasets
+eval_script: run/eval.sh
+results_root: outputs/grid_search
+
+fixed_env:
+  MODEL_NAME: "meta-llama/Llama-3.1-8B-Instruct"
+  MODEL_LOAD_IN_4BIT: "False"
+  MAX_NEW_TOKENS: "20"
+  MEASURE_PROMPT_STATS: "True"
+  PROMPT_FORMAT: "chat_system_user"
+  CHROMA_EMBED_BACKEND: "bge_small_v1_5"
+  CHROMA_EMBED_DEVICE: "cpu"
+  DATA_SUBDIR: sent-bge-small-v1.5-512-splitlong180
+  COLBERT_MODEL_NAME: "jinaai/jina-colbert-v2"
+  COLBERT_WINDOW_DIR: /mnt/nvme1/datasets/dapr-nq-open/sent-bge-small-v1.5-512-splitlong180/jina_colbert_window_2bit
+  # The runtime ColBERT query encoder is fixed to CPU in the existing code.
+  COLBERT_QUERY_MAXLEN: "32"
+  COLBERT_QUERY_MINLEN: ""
+  COLBERT_QUERY_TRUNCATION_SIDE: "right"
+  COLBERT_REGION_GROUP_ORDER: "retrieval"
+  FINAL_TOKEN_BUDGET: ""
+  TOTAL_NUM: ""
+
+eval_fixed_env:
+  USE_CLEANER: "False"
+  EVAL_USE_PAST_CACHE: "False"
+
+eval_groups:
+  - name: custom_dapr_nq_open_jina
+
+eval_cases:
+  - COMPRESS_METHOD: colbert_sliding_region
+    TOP_K: "20"
+    RETAIN_TOKEN_RATIO: "0.25"
+    EVAL_BSZ: "1"

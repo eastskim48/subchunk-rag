@@ -47,7 +47,9 @@ class PromptProcessor:
         return self.build_qa_prompt(query=query, passages=passages)
 
     def _build_chat_prompt(self, query: str, passages: List[str]) -> str:
-        user_content = f"{self.format_passages(passages)}Question: {query.strip()}"
+        user_content = (
+            f"Context:\n{self.format_passages(passages)}Question:\n{query.strip()}"
+        )
         prompt = self.tokenizer.apply_chat_template(
             [
                 {"role": "system", "content": self.system_prompt},

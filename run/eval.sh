@@ -5,6 +5,17 @@
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
+case "${COLBERT_MODEL_NAME:-} ${COLBERT_WINDOW_DIR:-} ${COMPRESS_METHOD:-} ${CONTRIBUTOR_WINDOW_TOKENIZER:-}" in
+    *[Jj][Ii][Nn][Aa]*)
+        echo "Retired model/tokenizer dependency in experiment settings" >&2
+        exit 1
+        ;;
+esac
+if [ -n "${CONTRIBUTOR_WINDOW_TOKENIZER:-}" ]; then
+    echo "Region tokenizer overrides are no longer supported" >&2
+    exit 1
+fi
+
 export DATASET="${DATASET:-longbench-hotpotqa}"
 if [ -n "$DATASET_PREFIX" ]; then
     export DATASET_PATH="$DATASET_PREFIX/$DATASET"
@@ -36,7 +47,9 @@ export MODEL_LOAD_IN_4BIT="${MODEL_LOAD_IN_4BIT:-False}"
 export MEASURE_PROMPT_STATS="${MEASURE_PROMPT_STATS:-True}"
 export RETRIEVAL_INCLUDE_DOCUMENTS="${RETRIEVAL_INCLUDE_DOCUMENTS:-True}"
 export USE_CLEANER="${USE_CLEANER:-False}"
-export PROMPT_FORMAT="${PROMPT_FORMAT:-raw_chunk_first}"
+export PROMPT_FORMAT="${PROMPT_FORMAT:-chat_system_user}"
+export EVAL_SEED="${EVAL_SEED:-123}"
+export EVAL_CPU_THREADS="${EVAL_CPU_THREADS:-32}"
 export EVAL_BSZ="${EVAL_BSZ:-4}"
 export TOP_K="${TOP_K:-20}"
 export TOTAL_NUM="${TOTAL_NUM:-}"
@@ -46,7 +59,7 @@ export TORCHRUN_MASTER_PORT="${TORCHRUN_MASTER_PORT:-29500}"
 
 USES_TOKEN_BUDGET=False
 case "$COMPRESS_METHOD" in
-    dense|dense_online|dense_sliding_region_max|dense_sliding_region_avg|colbert_subchunk|colbert_sliding_region|xrag_jina_cass)
+    colbert_gaussian|dense|dense_online|dense_sliding_subchunk|dense_sliding_region_max|dense_sliding_region_avg|materialized_dense_sliding_subchunk|colbert_subchunk|colbert_sliding_region|colbert_expanded_region|xrag_jina_cass|reranker_cass)
         USES_TOKEN_BUDGET=True
         ;;
 esac
@@ -118,6 +131,13 @@ OUTPUT_FILE="${OUTPUT_FILE:-./outputs/eval-$DATASET-$DATA_SUBDIR${OUTPUT_PATH_SU
 mkdir -p "$(dirname "$OUTPUT_FILE")"
 
 TOTAL_NUM_ARGS=()
+RETRIEVAL_SOURCE_ARGS=()
+if [ -n "${RETRIEVAL_SNAPSHOT:-}" ]; then
+    RETRIEVAL_SOURCE_ARGS+=(--retrieval_snapshot "$RETRIEVAL_SNAPSHOT")
+fi
+if [ -n "${PARENT_MAPPING_FILE:-}" ]; then
+    RETRIEVAL_SOURCE_ARGS+=(--parent_mapping_file "$PARENT_MAPPING_FILE")
+fi
 if [ -n "$TOTAL_NUM" ]; then
     TOTAL_NUM_ARGS=(--total_num "$TOTAL_NUM")
 fi
@@ -134,10 +154,12 @@ torchrun --nproc_per_node 1 --master_port "$TORCHRUN_MASTER_PORT" src/entrypoint
     --use_front_bos_cache "$USE_FRONT_BOS_CACHE" \
     --model_load_in_4bit "$MODEL_LOAD_IN_4BIT" \
     --prompt_format "$PROMPT_FORMAT" \
+    --seed "$EVAL_SEED" --cpu_threads "$EVAL_CPU_THREADS" \
     --output_file "$OUTPUT_FILE" \
     --answer_file "$ANSWER_FILE" \
     --bsz "$EVAL_BSZ" \
     --use_cleaner "$USE_CLEANER" \
+    "${RETRIEVAL_SOURCE_ARGS[@]}" \
     "${TOTAL_NUM_ARGS[@]}" \
     "${COMPRESS_ARGS[@]}"
 ## HOTPOTQA 실험 ##

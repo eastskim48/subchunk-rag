@@ -1,0 +1,35 @@
+run_name: nq-headerless-jina-chunk1024-contributors-chat-top20-bsz4-20261019
+dataset: dapr-nq-open
+dataset_prefix: /mnt/nvme1/datasets
+eval_script: run/eval_colbert_chunk_contributors.sh
+results_root: outputs/grid_search
+fixed_env:
+  MODEL_NAME: meta-llama/Llama-3.1-8B-Instruct
+  MODEL_LOAD_IN_4BIT: 'False'
+  MAX_NEW_TOKENS: '20'
+  MEASURE_PROMPT_STATS: 'True'
+  PROMPT_FORMAT: chat_system_user
+  CHROMA_EMBED_BACKEND: bge_small_v1_5
+  CHROMA_EMBED_DEVICE: cpu
+  DATA_SUBDIR: sent-bge-small-v1.5-512-splitlong180-headerless
+  COLBERT_MODEL_NAME: jinaai/jina-colbert-v2
+  COLBERT_WINDOW_DIR: /mnt/nvme1/datasets/dapr-nq-open/sent-bge-small-v1.5-512-splitlong180-headerless/jina_colbert_chunk1024_2bit
+  COLBERT_QUERY_MAXLEN: '32'
+  COLBERT_QUERY_MINLEN: ''
+  COLBERT_QUERY_TRUNCATION_SIDE: right
+  COLBERT_REGION_GROUP_ORDER: retrieval
+  FINAL_TOKEN_BUDGET: ''
+  TOTAL_NUM: ''
+  DENSE_EMBED_DEVICE: cpu
+  DENSE_EMBED_BATCH_SIZE: '128'
+  COLBERT_CHUNK_CONDITIONED_ARTIFACT: 'True'
+eval_fixed_env:
+  USE_CLEANER: 'False'
+  EVAL_USE_PAST_CACHE: 'False'
+eval_groups:
+- name: custom_nq_chunk_contributors_chat
+eval_cases:
+- COMPRESS_METHOD: colbert_chunk_contributors
+  TOP_K: '20'
+  RETAIN_TOKEN_RATIO: ''
+  EVAL_BSZ: '4'

@@ -9,7 +9,8 @@ _SRC_DIR = Path(__file__).resolve().parents[1]
 if str(_SRC_DIR) not in sys.path:
     sys.path.insert(0, str(_SRC_DIR))
 
-from transformers import logging
+import torch
+from transformers import logging, set_seed
 from engine import QueryProcessor
 from gold_evidence_vectordb import GoldEvidenceVectorDB
 from vectordb import ChromaDB
@@ -36,20 +37,24 @@ def main(
     cache_dir: str,
     dataset: Optional[str] = None,
     top_k: int = 4,
-    use_past_cache: bool = True,
+    use_past_cache: bool = False,
     bsz: int = 1,
-    max_new_tokens: int = 100,
+    max_new_tokens: int = 20,
     total_num: Optional[int] = None,
     output_file: str = "log.jsonl",
     answer_file: str = "answer.jsonl",
-    model_name: str = "meta-llama/Llama-3.1-8B",
+    model_name: str = "meta-llama/Llama-3.1-8B-Instruct",
     compress_method: Optional[str] = None,
-    use_cleaner: bool = True,
+    use_cleaner: bool = False,
     disable_rope: bool = False,
     use_front_bos_cache: bool = False,
     model_load_in_4bit: bool = False,
     gold_evidence_file: Optional[str] = None,
-    prompt_format: str = "raw_chunk_first",
+    prompt_format: str = "chat_system_user",
+    seed: int = 123,
+    cpu_threads: int = 32,
+    retrieval_snapshot: Optional[str] = None,
+    parent_mapping_file: Optional[str] = None,
 ):
     use_past_cache = _coerce_bool(use_past_cache)
     use_cleaner = _coerce_bool(use_cleaner)
@@ -57,10 +62,16 @@ def main(
     use_front_bos_cache = _coerce_bool(use_front_bos_cache)
     model_load_in_4bit = _coerce_bool(model_load_in_4bit)
     if use_past_cache and compress_method in {
+        "colbert_gaussian",
+        "colbert_all_token_gaussian",
+        "colbert_expanded_region",
+        "colbert_sentence_gaussian",
         "provence",
         "exit",
         "xrag_jina",
         "xrag_jina_cass",
+        "reranker",
+        "reranker_cass",
     }:
         raise ValueError(
             f"compress_method='{compress_method}' is cache-off only; "
@@ -72,14 +83,35 @@ def main(
             "artifacts and cache assembly are implemented"
         )
 
+    if Path(output_file).exists():
+        raise FileExistsError(output_file)
+    torch.set_num_threads(cpu_threads)
+    set_seed(seed)
     total_start = time.perf_counter()
     logging.set_verbosity_error()
     init_start = time.perf_counter()
-    vectordb = (
-        GoldEvidenceVectorDB(gold_evidence_file)
-        if gold_evidence_file
-        else ChromaDB(db_dir=db_dir)
-    )
+    if (
+        sum(
+            bool(v)
+            for v in (gold_evidence_file, retrieval_snapshot, parent_mapping_file)
+        )
+        > 1
+    ):
+        raise ValueError("Only one explicit retrieval source may be selected")
+    if retrieval_snapshot:
+        from replay_vectordb import StoredRetrievalVectorDB
+
+        vectordb = StoredRetrievalVectorDB(retrieval_snapshot, query_file)
+    elif parent_mapping_file:
+        from replay_vectordb import ParentChunkVectorDB
+
+        vectordb = ParentChunkVectorDB(db_dir, parent_mapping_file)
+    else:
+        vectordb = (
+            GoldEvidenceVectorDB(gold_evidence_file)
+            if gold_evidence_file
+            else ChromaDB(db_dir=db_dir)
+        )
     processor = QueryProcessor(
         query_file=query_file,
         vectordb=vectordb,
@@ -123,12 +155,17 @@ def main(
                 f"warmup | queries: {warmup_queries}, batch_size: 1, time: {warmup_time:.4f} seconds"
             )
     score_start = time.perf_counter()
-    evaluate(
-        prediction_file=output_file,
-        ground_truth_file=answer_file,
-        dataset=dataset,
-        use_cleaner=use_cleaner,
-    )
+    if dataset == "bioasq":
+        from bioasq_metrics import evaluate_saved_answers
+
+        evaluate_saved_answers(output_file, answer_file, query_file)
+    else:
+        evaluate(
+            prediction_file=output_file,
+            ground_truth_file=answer_file,
+            dataset=dataset,
+            use_cleaner=use_cleaner,
+        )
     score_runtime = time.perf_counter() - score_start
     total_runtime = process_total_runtime + score_runtime
     end_to_end_runtime = time.perf_counter() - total_start

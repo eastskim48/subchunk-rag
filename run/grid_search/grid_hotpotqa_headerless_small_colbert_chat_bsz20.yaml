@@ -1,0 +1,41 @@
+# Custom HotpotQA corpus; shared headerless regions, seed123.
+run_name: hotpotqa-headerless-small-colbert-chat-top20-r025-bsz20-20261019
+dataset: hotpotqa
+dataset_prefix: /mnt/nvme1/datasets
+eval_script: run/eval_full_corpus_regions.sh
+results_root: outputs/grid_search
+fixed_env:
+  MODEL_NAME: meta-llama/Llama-3.1-8B-Instruct
+  MODEL_LOAD_IN_4BIT: 'False'
+  MAX_NEW_TOKENS: '20'
+  MEASURE_PROMPT_STATS: 'True'
+  PROMPT_FORMAT: chat_system_user
+  CHROMA_EMBED_BACKEND: bge_small_v1_5
+  CHROMA_EMBED_DEVICE: cpu
+  DATA_SUBDIR: sent-bge-small-v1.5-512-splitlong180-headerless
+  COLBERT_MODEL_NAME: colbert-ir/colbertv2.0
+  COLBERT_WINDOW_DIR: /mnt/nvme1/datasets/hotpotqa/sent-bge-small-v1.5-512-splitlong180-headerless/colbert_window_2bit
+  COLBERT_QUERY_MAXLEN: '32'
+  COLBERT_QUERY_MINLEN: ''
+  COLBERT_QUERY_TRUNCATION_SIDE: right
+  COLBERT_REGION_GROUP_ORDER: retrieval
+  FINAL_TOKEN_BUDGET: ''
+  TOTAL_NUM: ''
+  DENSE_EMBED_DEVICE: cpu
+  DENSE_EMBED_BATCH_SIZE: '128'
+eval_fixed_env:
+  USE_CLEANER: 'False'
+  EVAL_USE_PAST_CACHE: 'False'
+eval_groups:
+- name: custom_hotpotqa_headerless_chat
+eval_cases:
+- COMPRESS_METHOD: materialized_dense_sliding_subchunk
+  DENSE_EMBED_MODEL: BAAI/bge-small-en-v1.5
+  DENSE_REGION_DIR: /mnt/nvme1/datasets/hotpotqa/sent-bge-small-v1.5-512-splitlong180-headerless/bge_small_regions
+  TOP_K: '20'
+  RETAIN_TOKEN_RATIO: '0.25'
+  EVAL_BSZ: '20'
+- COMPRESS_METHOD: colbert_sliding_region
+  TOP_K: '20'
+  RETAIN_TOKEN_RATIO: '0.25'
+  EVAL_BSZ: '20'

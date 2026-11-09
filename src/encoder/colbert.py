@@ -12,7 +12,7 @@ from tqdm import tqdm
 
 
 def default_colbert_repo_path() -> str:
-    return str(Path(__file__).resolve().parents[1] / "third_party" / "ColBERT")
+    return str(Path(__file__).resolve().parents[2] / "third_party" / "ColBERT")
 
 
 def import_official_colbert(
@@ -56,6 +56,24 @@ def import_official_colbert(
     return Checkpoint, ColBERTConfig
 
 
+def _load_checkpoint(checkpoint_class, model_name, config, device):
+    if "jina" in str(model_name).lower():
+        raise ValueError(f"Removed ColBERT model: {model_name!r}")
+    if model_name == "answerdotai/answerai-colbert-small-v1":
+        from huggingface_hub import snapshot_download
+
+        snapshot = snapshot_download(
+            model_name,
+            revision="934fa8bb4ce2284f4c2baa232d81aca4d076fa5e",
+            allow_patterns=["*.json", "*.txt", "*.safetensors", "artifact.metadata"],
+        )
+        # The published metadata points at an old training repository. Use this
+        # exact downloaded snapshot for both backbone discovery and tokenization.
+        config.configure(model_name=snapshot, checkpoint=snapshot)
+        return checkpoint_class(snapshot, colbert_config=config, verbose=0)
+    return checkpoint_class(model_name, colbert_config=config, verbose=0)
+
+
 def _insert_marker_offsets(offsets: torch.Tensor) -> torch.Tensor:
     marker_offsets = torch.zeros(
         (offsets.size(0), 1, offsets.size(2)),
@@ -83,6 +101,8 @@ class ColBERTEncoder:
         disable_cpu_extension: bool = True,
         verify_tensorization: bool = False,
     ):
+        if "jina" in str(model_name).lower():
+            raise ValueError(f"Removed ColBERT model: {model_name!r}")
         if repo_path is None:
             raise ValueError(
                 "repo_path is required; use the managed official ColBERT repository"
@@ -104,7 +124,24 @@ class ColBERTEncoder:
         config = ColBERTConfig(**config_kwargs)
         if device == "cpu":
             config.gpus = 0
-        self.checkpoint = Checkpoint(model_name, colbert_config=config, verbose=0)
+        if model_name == "lightonai/LateOn":
+            if query_minlen is not None:
+                raise ValueError(
+                    "query_minlen is incompatible with LateOn without expansion"
+                )
+            from encoder.lateon import LateOnCheckpoint
+
+            self.checkpoint = LateOnCheckpoint(
+                device=device,
+                doc_maxlen=doc_maxlen,
+                query_maxlen=query_maxlen,
+                attend_to_mask_tokens=attend_to_mask_tokens,
+                mask_punctuation=mask_punctuation,
+            )
+            self.encoder_impl = "lateon_transformers"
+        else:
+            self.checkpoint = _load_checkpoint(Checkpoint, model_name, config, device)
+            self.encoder_impl = "official_colbert_checkpoint"
         actual_device = next(self.checkpoint.parameters()).device
         requested_device = torch.device(device)
         if actual_device.type != requested_device.type:
@@ -177,6 +214,8 @@ class ColBERTEncoder:
             amp_manager.activated = False
 
     def token_count(self, text: str) -> int:
+        if self.encoder_impl == "lateon_transformers":
+            text = text.strip()
         encoded = self.doc_tokenizer(
             [text],
             padding=False,
@@ -189,6 +228,8 @@ class ColBERTEncoder:
     def token_counts(self, texts: list[str]) -> list[int]:
         if not texts:
             return []
+        if self.encoder_impl == "lateon_transformers":
+            texts = [text.strip() for text in texts]
         encoded = self.doc_tokenizer(
             texts,
             padding=False,
@@ -201,6 +242,8 @@ class ColBERTEncoder:
     def token_counts_without_specials(self, texts: list[str]) -> list[int]:
         if not texts:
             return []
+        if self.encoder_impl == "lateon_transformers":
+            texts = [text.strip() for text in texts]
         encoded = self.doc_tokenizer(
             texts,
             padding=False,
@@ -213,6 +256,13 @@ class ColBERTEncoder:
     def tensorize_docs_with_offsets(
         self, texts: list[str]
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if self.encoder_impl == "lateon_transformers":
+            encoded = self.checkpoint.doc_tokenizer.tokenize(texts, offsets=True)
+            return (
+                encoded["input_ids"],
+                encoded["attention_mask"],
+                encoded["offset_mapping"],
+            )
         encoded = self.doc_tokenizer(
             texts,
             padding="longest",
@@ -344,6 +394,34 @@ class ColBERTEncoder:
                     vectors.append(torch.empty((0, self.dim), dtype=torch.float16))
         return vectors
 
+    def document_span_token_counts(
+        self, texts: list[str], center_spans: list[tuple[int, int]]
+    ) -> list[int]:
+        """Count the exact stored positions without running the transformer."""
+        if len(texts) != len(center_spans):
+            raise ValueError("texts and center_spans must have the same length")
+        counts = []
+        for start in range(0, len(texts), self.batch_size):
+            batch_texts = texts[start : start + self.batch_size]
+            ids, attention, offsets = self.tensorize_docs_with_offsets(batch_texts)
+            self._verify_official_tensorization(batch_texts, ids, attention)
+            if self.encoder_impl == "lateon_transformers":
+                valid = attention.bool()
+                for token_id in self.checkpoint.skiplist:
+                    valid &= ids != token_id
+            else:
+                valid = torch.tensor(
+                    self.checkpoint.mask(ids, skiplist=self.checkpoint.skiplist),
+                    dtype=torch.bool,
+                )
+            for row, (begin, end) in enumerate(
+                center_spans[start : start + self.batch_size]
+            ):
+                counts.append(
+                    len(self._center_positions(offsets[row], valid[row], begin, end))
+                )
+        return counts
+
     def encode_queries(self, queries: list[str]) -> list[torch.Tensor]:
         with torch.inference_mode():
             query_vectors = self.checkpoint.queryFromText(
@@ -351,6 +429,8 @@ class ColBERTEncoder:
                 bsize=self.batch_size,
                 to_cpu=True,
             )
+        if isinstance(query_vectors, list):
+            return [row.to(torch.float32).contiguous() for row in query_vectors]
         if self.query_minlen is None:
             query_vectors = query_vectors.to(torch.float32).contiguous()
             return list(query_vectors.unbind(0))

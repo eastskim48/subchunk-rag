@@ -10,6 +10,7 @@ from transformers import AutoModel, AutoTokenizer
 
 BGE_SMALL_MODEL = "BAAI/bge-small-en-v1.5"
 BGE_M3_MODEL = "BAAI/bge-m3"
+DENSEON_MODEL = "lightonai/DenseOn"
 E5_SMALL_MODEL = "intfloat/e5-small-v2"
 BGE_SMALL_QUERY_PREFIX = "Represent this sentence for searching relevant passages: "
 BGE_M3_QUERY_PREFIX = ""
@@ -18,6 +19,8 @@ E5_PASSAGE_PREFIX = "passage: "
 
 
 def default_query_prefix(model_name: str) -> str:
+    if model_name == DENSEON_MODEL:
+        return "query: "
     if model_name == BGE_M3_MODEL:
         return BGE_M3_QUERY_PREFIX
     if model_name == BGE_SMALL_MODEL:
@@ -28,13 +31,15 @@ def default_query_prefix(model_name: str) -> str:
 
 
 def default_passage_prefix(model_name: str) -> str:
+    if model_name == DENSEON_MODEL:
+        return "document: "
     if model_name == E5_SMALL_MODEL:
         return E5_PASSAGE_PREFIX
     return ""
 
 
 def default_pooling_mode(model_name: str) -> str:
-    if model_name == BGE_SMALL_MODEL:
+    if model_name in {BGE_SMALL_MODEL, DENSEON_MODEL}:
         return "cls"
     return "mean"
 
@@ -69,7 +74,9 @@ class DenseTextEmbedder:
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         self.batch_size = batch_size
         self.max_length = max_length or (
-            8192 if self.model_name == BGE_M3_MODEL else None
+            8192
+            if self.model_name == BGE_M3_MODEL
+            else (512 if self.model_name == DENSEON_MODEL else None)
         )
         self.uses_flag_embedding = self.model_name == BGE_M3_MODEL
         self.pooling_mode = default_pooling_mode(self.model_name)
@@ -90,14 +97,32 @@ class DenseTextEmbedder:
             self.model = BGEM3FlagModel(self.model_name, **kwargs)
             self.tokenizer = None
         else:
-            self.tokenizer = AutoTokenizer.from_pretrained(self.model_name)
+            model_kwargs = (
+                {"revision": "cb9947ebccb33862d24e3c7ca2edb25e51acd887"}
+                if self.model_name == DENSEON_MODEL
+                else {}
+            )
+            self.tokenizer = AutoTokenizer.from_pretrained(
+                self.model_name, **model_kwargs
+            )
             model_dtype = (
-                torch.float16 if self.device.startswith("cuda") else torch.float32
+                torch.float32
+                if self.model_name == DENSEON_MODEL
+                or not self.device.startswith("cuda")
+                else torch.float16
             )
             self.model = AutoModel.from_pretrained(
                 self.model_name,
                 torch_dtype=model_dtype,
+                **model_kwargs,
+                **(
+                    {"attn_implementation": "sdpa"}
+                    if self.model_name == DENSEON_MODEL
+                    else {}
+                ),
             ).to(self.device)
+            if self.model_name == DENSEON_MODEL:
+                self.model.config.reference_compile = False
             self.model.eval()
 
     @property
@@ -130,6 +155,11 @@ class DenseTextEmbedder:
                 )
             else:
                 batch_embeddings = self._embed_texts_transformers(batch)
+            if (
+                self.model_name == DENSEON_MODEL
+                and not torch.isfinite(batch_embeddings).all()
+            ):
+                raise ValueError("DenseOn produced nonfinite embeddings")
             batches.append(batch_embeddings.detach().cpu())
         return torch.cat(batches, dim=0)
 

@@ -1,0 +1,56 @@
+run_name: 03_bioasq_cass_db
+run_id: vanilla_db_comparison_20261105
+dataset: bioasq
+dataset_prefix: /mnt/nvme1/datasets
+eval_script: run/eval.sh
+results_root: /mnt/nvme1/dongseob/subchunk/outputs/temp/vanilla_db_comparison_20261105
+fixed_env:
+  MODEL_NAME: meta-llama/Llama-3.1-8B-Instruct
+  MODEL_LOAD_IN_4BIT: 'False'
+  MAX_NEW_TOKENS: '20'
+  MEASURE_PROMPT_STATS: 'True'
+  PROMPT_FORMAT: chat_system_user
+  CHROMA_EMBED_BACKEND: bge_small_v1_5
+  CHROMA_EMBED_DEVICE: cpu
+  DATASET: bioasq
+  QUERY_FILE: /mnt/nvme1/dongseob/subchunk/outputs/bioasq_non_summary_20261027/questions/query.jsonl
+  ANSWER_FILE: /mnt/nvme1/dongseob/subchunk/outputs/bioasq_non_summary_20261027/answers/answer.jsonl
+  HF_HUB_OFFLINE: '1'
+  TRANSFORMERS_OFFLINE: '1'
+  TOKENIZERS_PARALLELISM: 'false'
+  OMP_NUM_THREADS: '32'
+  MKL_NUM_THREADS: '32'
+  OPENBLAS_NUM_THREADS: '32'
+  DENSE_EMBED_DEVICE: cpu
+  DATA_SUBDIR: sent-bge-small-v1.5-512-splitlong100-lateon
+  DB_DIR: /mnt/nvme1/datasets/bioasq14b-linked-documents/sent-bge-small-v1.5-512-splitlong100-lateon/db
+  EVAL_BSZ: '1'
+  TOP_K: '20'
+  TOTAL_NUM: ''
+  COMPRESS_METHOD: ''
+  FINAL_TOKEN_BUDGET: ''
+  RETAIN_TOKEN_RATIO: ''
+  EVAL_USE_PAST_CACHE: 'False'
+  USE_CLEANER: 'False'
+  CUDA_VISIBLE_DEVICES: '0'
+  PYTHONPATH: /mnt/nvme1/dongseob/subchunk/src
+  RUN_ID: vanilla_db_comparison_20261105
+  CACHE_DIR: /mnt/nvme1/dongseob/subchunk/outputs/temp/vanilla_db_comparison_20261105/03_bioasq_cass_db/cache_unused
+  EVAL_SEED: '123'
+  EVAL_CPU_THREADS: '32'
+  TORCHRUN_MASTER_PORT: '29646'
+  RETRIEVAL_SNAPSHOT: ''
+  PARENT_MAPPING_FILE: ''
+  RETRIEVAL_INCLUDE_DOCUMENTS: 'True'
+  RERANKER_MODEL_NAME: ''
+  RERANKER_TOP_N: ''
+  RERANKER_TRACE_FILE: ''
+  PYTORCH_CUDA_ALLOC_CONF: expandable_segments:False
+eval_fixed_env:
+  USE_CLEANER: 'False'
+  EVAL_USE_PAST_CACHE: 'False'
+eval_groups:
+- name: context_only_chat
+eval_cases:
+- TOP_K: '20'
+  EVAL_BSZ: '1'

@@ -1,3 +1,8 @@
+from compressor.methods.colbert.expanded_region import ColBERTExpandedRegionCompressor
+from compressor.methods.materialized_dense_region import (
+    MaterializedDenseRegionCompressor,
+)
+
 """Create and reuse the compressor selected by an evaluation option."""
 
 from typing import List
@@ -7,6 +12,13 @@ from compressor.methods.colbert import (
     ColBERTSubchunkCompressor,
     ColBERTSlidingRegionCompressor,
 )
+from compressor.methods.colbert.gaussian import ColBERTGaussianCompressor
+from compressor.methods.colbert.gaussian_all_tokens import (
+    ColBERTAllTokenGaussianCompressor,
+)
+from compressor.methods.colbert.gaussian_sentence import (
+    ColBERTSentenceGaussianCompressor,
+)
 from compressor.methods.dense import (
     DenseCompressor,
     DenseOnlineCompressor,
@@ -15,11 +27,8 @@ from compressor.methods.dense import (
     DenseSlidingRegionAvgCompressor,
 )
 from compressor.methods.ml_selector import EXITCompressor, ProvenceCompressor
+from compressor.methods.reranker import RerankerCompressor, RerankerCASSCompressor
 from compressor.methods.summarization import Summarizer
-from compressor.methods.xrag import (
-    XRAGJinaCASSCompressor,
-    XRAGJinaRerankerCompressor,
-)
 
 # Evaluation runs reuse one compressor instance so model/artifact initialization
 # and query-encoder warmup are not repeated for every batch.
@@ -28,6 +37,13 @@ compressor_warmed = False
 
 
 COMPRESSOR_TYPES = {
+    "reranker": RerankerCompressor,
+    "reranker_cass": RerankerCASSCompressor,
+    "materialized_dense_sliding_subchunk": MaterializedDenseRegionCompressor,
+    "colbert_expanded_region": ColBERTExpandedRegionCompressor,
+    "colbert_gaussian": ColBERTGaussianCompressor,
+    "colbert_all_token_gaussian": ColBERTAllTokenGaussianCompressor,
+    "colbert_sentence_gaussian": ColBERTSentenceGaussianCompressor,
     "summ": Summarizer,
     "dense": DenseCompressor,
     "dense_online": DenseOnlineCompressor,
@@ -38,8 +54,6 @@ COMPRESSOR_TYPES = {
     "colbert_sliding_region": ColBERTSlidingRegionCompressor,
     "exit": EXITCompressor,
     "provence": ProvenceCompressor,
-    "xrag_jina": XRAGJinaRerankerCompressor,
-    "xrag_jina_cass": XRAGJinaCASSCompressor,
 }
 
 

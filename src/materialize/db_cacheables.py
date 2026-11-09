@@ -69,7 +69,7 @@ def group_unique_db_cacheables(
         parent_doc_id = cacheable.parent_doc_id
         if not isinstance(parent_doc_id, str) or not parent_doc_id:
             raise ValueError(
-                "DB cacheable requires parent_doc_id for candidate materialization: "
+                "DB cacheable requires parent_doc_id for subchunk materialization: "
                 f"{cacheable.id}"
             )
         grouped.setdefault(parent_doc_id, []).append(cacheable)
@@ -123,7 +123,7 @@ def iter_unique_db_cacheables_by_document(
         parent_doc_id = cacheable.parent_doc_id
         if not isinstance(parent_doc_id, str) or not parent_doc_id:
             raise ValueError(
-                "DB cacheable requires parent_doc_id for candidate materialization: "
+                "DB cacheable requires parent_doc_id for subchunk materialization: "
                 f"{cacheable.id}"
             )
 

@@ -64,10 +64,16 @@ class QueryProcessor:
         if self.compress is not None:
             print(f"using compress method: {self.compress}")
         if self.use_past_cache and self.compress in {
+            "colbert_gaussian",
+            "colbert_all_token_gaussian",
+            "colbert_expanded_region",
+            "colbert_sentence_gaussian",
             "provence",
             "exit",
             "xrag_jina",
             "xrag_jina_cass",
+            "reranker",
+            "reranker_cass",
         }:
             raise ValueError(
                 f"compress_method='{self.compress}' is cache-off only; "

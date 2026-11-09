@@ -1,4 +1,4 @@
-"""XRAG Jina reranking and XRAG-to-CASS composition."""
+"""Retired reranker API retained only for historical helper tests."""
 
 from __future__ import annotations
 
@@ -8,7 +8,6 @@ import time
 from typing import List
 
 import torch
-from transformers import AutoModelForSequenceClassification, AutoTokenizer
 
 from chunk import CacheableChunk, RetrievableChunk
 from compressor.base import Compressor
@@ -16,36 +15,10 @@ from compressor.methods.colbert.region import ColBERTSlidingRegionCompressor
 
 
 class _XRAGJinaReranker:
-    """Reproduce XRAG's pinned FlagReranker path with Jina loading enabled."""
+    """Reject construction of the retired reranker."""
 
     def __init__(self) -> None:
-        self.model_name = os.getenv(
-            "XRAG_MODEL_NAME", "jinaai/jina-reranker-v2-base-multilingual"
-        )
-        self.top_n = int(os.getenv("XRAG_TOP_N", "10"))
-        if self.top_n <= 0:
-            raise ValueError("XRAG_TOP_N must be positive")
-
-        self.batch_size = 256
-        self.max_length = int(os.getenv("XRAG_MAX_LENGTH", "1024"))
-        if self.max_length <= 0:
-            raise ValueError("XRAG_MAX_LENGTH must be positive")
-        self.device = os.getenv(
-            "XRAG_DEVICE", "cuda" if torch.cuda.is_available() else "cpu"
-        )
-        print(
-            "XRAG Jina reranking enabled. "
-            f"Initializing model: {self.model_name} on {self.device}; "
-            f"top_n={self.top_n}, max_length={self.max_length}, use_fp16=False"
-        )
-        self.tokenizer = AutoTokenizer.from_pretrained(self.model_name)
-        # XRAG pins FlagEmbedding 1.2.10, whose FlagReranker omits this required
-        # Jina loader flag. The model and scoring path are otherwise unchanged.
-        self.model = AutoModelForSequenceClassification.from_pretrained(
-            self.model_name,
-            trust_remote_code=True,
-        ).to(self.device)
-        self.model.eval()
+        raise ValueError("This reranker has been removed from experiment support")
 
     @staticmethod
     def _document_text(doc: RetrievableChunk) -> str:

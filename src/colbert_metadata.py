@@ -1,4 +1,4 @@
-"""Disk-backed metadata for ColBERT candidate-store artifacts."""
+"""Disk-backed metadata for ColBERT subchunk store artifacts."""
 
 from __future__ import annotations
 
