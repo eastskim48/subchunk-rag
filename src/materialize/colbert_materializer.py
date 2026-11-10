@@ -416,7 +416,7 @@ def build_colbert_window_artifact(
     docs_dir: str,
     output_dir: str,
     db_dir: str,
-    model_name: str = "colbert-ir/colbertv2.0",
+    model_name: str = "lightonai/LateOn",
     device: str | None = None,
     batch_size: int = 32,
     db_batch_size: int = 2048,

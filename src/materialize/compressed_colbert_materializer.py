@@ -193,7 +193,7 @@ def build_compressed_colbert_subchunks(
     db_dir: str,
     num_centroids: int | None = None,
     training_subchunks: int | None = None,
-    model_name: str = "colbert-ir/colbertv2.0",
+    model_name: str = "lightonai/LateOn",
     batch_size: int = 32,
     db_batch_size: int = 2048,
     window_token_budget: int = 180,

@@ -66,7 +66,7 @@ class ColBERTWindowCompressorBase(TokenBudgetMixin, Compressor):
                 )
             artifact_dir = os.path.join(dataset_path, data_subdir, "colbert_window")
 
-        model_name = os.getenv("COLBERT_MODEL_NAME", "colbert-ir/colbertv2.0")
+        model_name = os.getenv("COLBERT_MODEL_NAME", "lightonai/LateOn")
         batch_size = int(os.getenv("COLBERT_BATCH_SIZE", "32"))
         repo_path = os.getenv("COLBERT_REPO_PATH") or default_colbert_repo_path()
 

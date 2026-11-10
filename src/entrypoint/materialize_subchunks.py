@@ -23,7 +23,7 @@ from materialize.compressed_colbert_materializer import (  # noqa: E402
     build_compressed_colbert_subchunks,
 )
 
-COLBERT_MODEL_NAME = "colbert-ir/colbertv2.0"
+COLBERT_MODEL_NAME = "lightonai/LateOn"
 
 
 def main(
