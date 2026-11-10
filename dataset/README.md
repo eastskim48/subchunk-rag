@@ -134,13 +134,13 @@ Complete the [environment setup](../README.md#setup), including GPU FAISS and
 Llama model access, before running these builds.
 
 ```bash
-bash run/preprocess_baseline.sh \
+bash run/preprocess.sh \
     --dataset nq --dataset-root "$DATASET_PREFIX/dapr-nq-open"
-bash run/preprocess_baseline.sh \
+bash run/preprocess.sh \
     --dataset bioasq --dataset-root "$DATASET_PREFIX/bioasq14b-linked-documents"
-bash run/preprocess_baseline.sh \
+bash run/preprocess.sh \
     --dataset newsqa --dataset-root "$DATASET_PREFIX/newsqa"
-bash run/preprocess_baseline.sh \
+bash run/preprocess.sh \
     --dataset covid-qa --dataset-root "$DATASET_PREFIX/covid-qa-full-test"
 ```
 
@@ -149,7 +149,7 @@ Each command performs:
 1. The existing sentence preprocessor creates the source 512-Llama-token search
    chunks using BGE-small, initially with the ordinary 180-Llama-token sentence cap.
 2. The existing offline metadata rebuild copies the DB and applies the separate
-   LateOn 100-token sentence cap and 180-token region construction. Source indexed
+   LateOn 100-token sentence cap and 180-token subchunk construction. Source indexed
    texts, retrieval vectors, and the graph are preserved in this copy.
 3. The existing materializer encodes each sentence with LateOn and stores 128-
    dimensional vectors using 2-bit residual compression and seed 123. It uses the
@@ -159,15 +159,14 @@ The initial upsert/embedding batch defaults are 5461/5461 for NQ and NewsQA,
 256/128 for BioASQ, and 256/256 for COVID-QA, following the stored construction
 settings. The new indexes are rebuilds; they are not the original physical
 indexes. Each build records its settings. `--db-batch-size`,
-`--embedding-batch-size`, `--encoding-batch-size`, and `--embedding-device` make
-resource settings explicit; changed insertion batches may produce a different
-approximate search graph. Selection rules and evaluation metrics are unchanged.
-`--embedding-device` controls retrieval-vector construction. The existing LateOn
-materializer still uses CUDA; this option does not make every stage CPU-only.
+`--embedding-batch-size` and `--encoding-batch-size` make batch sizes explicit;
+changed insertion batches may produce a different approximate search graph.
+Selection rules and evaluation metrics are unchanged.
+Retrieval-vector construction and the LateOn materializer both use CUDA.
 
 Use `--dry-run` to save/print the command plan without loading models or touching
 dataset artifacts. `--source-db` explicitly skips source-index construction and
-reuses an existing idle retrieval DB. `--stage retrieval`, `--stage regions`, or
+reuses an existing idle retrieval DB. `--stage retrieval`, `--stage subchunks`, or
 `--stage embeddings` runs only that stage. Existing output paths are refused;
 there is no implicit resume, overwrite, GPU fallback, or evaluation run.
 
@@ -184,5 +183,5 @@ mode can guard hardware use if needed:
 
 ```bash
 bash run/run_grid.sh --gpu 0 --wait-gpu --wait-lock --no-exclusive -- \
-    bash run/preprocess_baseline.sh --dataset nq --dataset-root "$DATASET_PREFIX/dapr-nq-open"
+    bash run/preprocess.sh --dataset nq --dataset-root "$DATASET_PREFIX/dapr-nq-open"
 ```

@@ -4,18 +4,10 @@ Subchunk-RAG is a research codebase for optimizing retrieval-augmented
 generation (RAG). It retrieves coarse chunks from a vector database, then uses
 lightweight subchunk selection to construct a compact, query-relevant prompt.
 
-The default evidence encoder is `lightonai/LateOn`. The representative custom
-configuration uses a **100-token sentence-splitting limit** and a **180-token
-selection window**, both measured with the LateOn tokenizer. These are separate
-settings: 100 limits individual sentence units, while 180 limits the surrounding
-sentence region used for selection. Retrieval chunks and the final prompt budget
-are measured with the Llama tokenizer.
-
 ## Setup
 
-The default build and evaluation commands target Linux x86_64 with Python 3.13
-and an NVIDIA driver compatible with PyTorch's CUDA 12.4 runtime. LateOn artifact
-construction requires a GPU even when retrieval embeddings use `--embedding-device cpu`.
+The default build and evaluation commands target Python 3.13 and an NVIDIA driver compatible with PyTorch's CUDA 12.4 runtime. 
+Retrieval-vector construction and representation payload construction both use the GPU.
 
 After cloning, initialize the ColBERT submodule:
 
@@ -30,24 +22,10 @@ python -m pip install -r requirements.txt
 ```
 
 The requirements include GPU-enabled FAISS for 2-bit residual compression and
-GitPython for the source ColBERT adapter. The pinned
-[`faiss-gpu-cu12` wheel](https://github.com/Di-Is/faiss-gpu-wheels) supports
+GitPython for the source ColBERT adapter. The pinned [`faiss-gpu-cu12` wheel](https://github.com/Di-Is/faiss-gpu-wheels) supports
 NVIDIA compute capabilities 7.0–8.9 and uses the CUDA 12 libraries installed with
 PyTorch. A CPU-only FAISS package cannot run the default artifact builder.
 
-Check GPU availability in that environment:
-
-```bash
-python - <<'PY'
-import faiss
-import torch
-
-assert torch.cuda.is_available(), "PyTorch cannot access an NVIDIA GPU"
-assert hasattr(faiss, "StandardGpuResources"), "GPU-enabled FAISS is required"
-resources = faiss.StandardGpuResources()
-index = faiss.GpuIndexFlatIP(resources, 128)
-print(f"PyTorch {torch.__version__}; GPU FAISS {faiss.__version__} ready")
-PY
 ```
 
 Before the first DB build or evaluation, request access to
@@ -92,27 +70,20 @@ DATASET_PREFIX=. ./dataset/get_nq.sh
 then constructs the 108,626-document corpus with all 2,390 custom intersection
 questions and answers under `./dapr-nq-open`.
 
-This is a custom dataset constructed by this project by exact question matching
-between the DAPR-NQ test split and the NQ-open development split; it is not an
-official Natural Questions benchmark setting. Dataset construction does not
-build the vector database or ColBERT artifact.
-
 `DATASET_PREFIX` selects the parent directory that contains the
 `dapr-nq-open` dataset directory. The examples below use `DATASET_PREFIX=.`
 consistently; replace `.` with another parent directory when needed.
 
 ## Preprocess
 
-The common launcher runs the existing three construction steps: build a BGE-small
-512-Llama-token retrieval DB, copy it and rebuild sentence/region metadata with
-LateOn limits 100/180, then encode the sentences and store 2-bit residual vectors.
-The source DB is retained. The metadata step reuses its indexed texts, vectors,
+The common launcher runs the existing three construction steps: build retrieval DB, copy it and rebuild subchunk catalog with
+LateOn, then encode the sentences and store vectors. The subchunk catalog step reuses its indexed texts, vectors,
 and retrieval graph; it does not generate new retrieval embeddings.
 
 For example, after constructing NQ:
 
 ```bash
-bash run/preprocess_baseline.sh \
+bash run/preprocess.sh \
     --dataset nq \
     --dataset-root ./dapr-nq-open
 ```
@@ -120,15 +91,15 @@ bash run/preprocess_baseline.sh \
 The other dataset roots use the same launcher:
 
 ```bash
-bash run/preprocess_baseline.sh --dataset bioasq --dataset-root ./bioasq14b-linked-documents
-bash run/preprocess_baseline.sh --dataset newsqa --dataset-root ./newsqa
-bash run/preprocess_baseline.sh --dataset covid-qa --dataset-root ./covid-qa-full-test
+bash run/preprocess.sh --dataset bioasq --dataset-root ./bioasq14b-linked-documents
+bash run/preprocess.sh --dataset newsqa --dataset-root ./newsqa
+bash run/preprocess.sh --dataset covid-qa --dataset-root ./covid-qa-full-test
 ```
 
 Inspect the exact commands without loading models or creating dataset artifacts:
 
 ```bash
-bash run/preprocess_baseline.sh \
+bash run/preprocess.sh \
     --dataset nq --dataset-root ./dapr-nq-open --dry-run
 ```
 
@@ -140,11 +111,8 @@ sent-bge-small-v1.5-512-splitlong100-lateon/colbert_window
 ```
 
 Logs and the command plan are saved under `outputs/temp/`. Existing outputs are
-refused. Use `--stage retrieval|regions|embeddings` to run one stage, or supply
+refused. Use `--stage retrieval|subchunks|embeddings` to run one stage, or supply
 `--source-db /path/to/an/existing/idle/db` to reuse a retrieval DB explicitly.
-The default materialization encoder is `lightonai/LateOn`, with sentence-only
-encoding, region window 180 and compression seed 123. The `COLBERT_*` variable
-names and `colbert` backend name remain the shared interface names.
 
 ## Representative Experiment
 
@@ -174,11 +142,6 @@ dataset and preprocessing commands above:
 ./dapr-nq-open/sent-bge-small-v1.5-512-splitlong100-lateon/db
 ./dapr-nq-open/sent-bge-small-v1.5-512-splitlong100-lateon/colbert_window
 ```
-
-To reuse an existing artifact stored under another name, set
-`COLBERT_WINDOW_DIR` to its directory. For example, the recent local execution
-test used the same database family with an existing artifact named
-`colbert_lateon_sentence_2bit`, whose recorded selection window is 180 tokens.
 
 All remaining evaluation settings use the defaults in `run/eval.sh`.
 Evaluation outputs are written to `outputs/` unless `OUTPUT_FILE` is set.

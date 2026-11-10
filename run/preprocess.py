@@ -63,18 +63,18 @@ def build_plan(args) -> list[dict]:
                     "--db_batch_size",
                     str(db_batch),
                     "--chroma_embed_device",
-                    args.embedding_device,
+                    "cuda",
                     "--chroma_embed_batch_size",
                     str(embedding_batch),
                 ],
                 "environment": {
                     "CHROMA_EMBED_BACKEND": "bge_small_v1_5",
-                    "CHROMA_EMBED_DEVICE": args.embedding_device,
+                    "CHROMA_EMBED_DEVICE": "cuda",
                     "CHROMA_EMBED_BATCH_SIZE": str(embedding_batch),
                 },
             }
         )
-    if args.stage in {"all", "regions", "embeddings"}:
+    if args.stage in {"all", "subchunks", "embeddings"}:
         plan.append(
             {
                 "name": "download_lateon",
@@ -87,14 +87,14 @@ def build_plan(args) -> list[dict]:
                 "environment": {},
             }
         )
-    if args.stage in {"all", "regions"}:
+    if args.stage in {"all", "subchunks"}:
         plan.append(
             {
-                "name": "regions",
+                "name": "subchunks",
                 "new_output": str(final / "db"),
                 "command": [
                     sys.executable,
-                    str(ROOT / "run/rebuild_sentence_region_metadata.py"),
+                    str(ROOT / "run/build_subchunk_catalog.py"),
                     "--source-db",
                     str(source),
                     "--docs-dir",
@@ -102,7 +102,7 @@ def build_plan(args) -> list[dict]:
                     "--output-db",
                     str(final / "db"),
                     "--log-dir",
-                    str(args.log_dir / "region_build"),
+                    str(args.log_dir / "subchunk_build"),
                     "--max-unit-tokens",
                     "100",
                     "--region-tokens",
@@ -191,13 +191,9 @@ def main():
         help="Explicitly reuse an existing idle retrieval DB instead of rebuilding it",
     )
     parser.add_argument(
-        "--stage", choices=("all", "retrieval", "regions", "embeddings"), default="all"
-    )
-    parser.add_argument(
-        "--embedding-device",
-        choices=("cuda", "cpu"),
-        default="cuda",
-        help="Retrieval embedding device; the existing LateOn materializer uses CUDA",
+        "--stage",
+        choices=("all", "retrieval", "subchunks", "embeddings"),
+        default="all",
     )
     parser.add_argument("--db-batch-size", type=int)
     parser.add_argument("--embedding-batch-size", type=int)
@@ -207,7 +203,7 @@ def main():
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
     if args.stage == "retrieval" and args.source_db:
-        parser.error("--source-db is for reusing retrieval in the regions/all stages")
+        parser.error("--source-db is for reusing retrieval in the subchunks/all stages")
     for name in (
         "db_batch_size",
         "embedding_batch_size",
