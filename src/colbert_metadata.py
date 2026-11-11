@@ -141,35 +141,6 @@ class ColBERTMetadataReader:
         if not {"cacheables", "regions"}.issubset(table_names):
             raise ValueError("ColBERT metadata database is missing required tables")
 
-    def rows_for_cacheable_ids(
-        self, cacheable_ids: Sequence[str | None]
-    ) -> list[int | None]:
-        normalized_ids = [
-            str(cacheable_id)
-            for cacheable_id in cacheable_ids
-            if cacheable_id is not None
-        ]
-        if not normalized_ids:
-            return [None] * len(cacheable_ids)
-        rows_by_id = {}
-        for start in range(0, len(normalized_ids), SQLITE_LOOKUP_BATCH_SIZE):
-            lookup_ids = normalized_ids[start : start + SQLITE_LOOKUP_BATCH_SIZE]
-            placeholders = ",".join("?" for _ in lookup_ids)
-            rows_by_id.update(
-                {
-                    str(cacheable_id): int(row_index)
-                    for cacheable_id, row_index in self.connection.execute(
-                        "select cacheable_id, row_index from cacheables "
-                        f"where cacheable_id in ({placeholders})",
-                        lookup_ids,
-                    )
-                }
-            )
-        return [
-            rows_by_id.get(str(cacheable_id)) if cacheable_id is not None else None
-            for cacheable_id in cacheable_ids
-        ]
-
     def window_ids_for_cacheable_ids(
         self, cacheable_ids: Sequence[str | None]
     ) -> list[list[str]]:
@@ -204,21 +175,6 @@ class ColBERTMetadataReader:
             )
             for cacheable_id in cacheable_ids
         ]
-
-    def iter_cacheable_ids(self, batch_size: int = 8192):
-        for cacheable_id, _ in self.iter_cacheable_rows(batch_size=batch_size):
-            yield cacheable_id
-
-    def iter_cacheable_rows(self, batch_size: int = 8192):
-        cursor = self.connection.execute(
-            "select cacheable_id, row_index from cacheables order by row_index"
-        )
-        while True:
-            rows = cursor.fetchmany(batch_size)
-            if not rows:
-                break
-            for cacheable_id, row_index in rows:
-                yield str(cacheable_id), int(row_index)
 
     def iter_region_payloads(self, batch_size: int = 8192):
         cursor = self.connection.execute(

@@ -1,4 +1,4 @@
-"""CLI entrypoint for building chunks, caches, and the retrieval database."""
+"""CLI entrypoint for building chunks and the retrieval database."""
 
 import sys
 import os
@@ -10,7 +10,6 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from model import LLMModel
 from vectordb import ChromaDB
 from materialize.materialize import DocumentPreprocessor
 from materialize.db_manifest import build_db_manifest, write_db_build_manifest
@@ -19,18 +18,13 @@ from materialize.db_manifest import build_db_manifest, write_db_build_manifest
 def main(
     docs_dir: str,
     db_dir: str,
-    cache_dir: str,
     model_name: str = "meta-llama/Llama-3.1-8B-Instruct",
     cacheable_chunk_size: int | None = None,
     retrievable_chunk_size: int | None = None,
-    batch_size: int = 1,
     db_batch_size: int = 256,
     chroma_embed_device: str = "cpu",
     chroma_embed_batch_size: int = 32,
-    dummy_bos_count: int = 0,
-    materialize_cache: bool = True,
     materialize_db: bool = True,
-    resume_from_cache: bool = False,
     deduplicate_documents_by_hash: bool = False,
     max_subchunk_tokens: int | None = None,
 ):
@@ -46,15 +40,10 @@ def main(
             else None
         ),
         model_name=model_name,
-        cache_dir=cache_dir,
         cacheable_chunk_size=cacheable_chunk_size,
         retrievable_chunk_size=retrievable_chunk_size,
-        batch_size=batch_size,
         db_batch_size=db_batch_size,
-        dummy_bos_count=dummy_bos_count,
-        materialize_cache=materialize_cache,
         materialize_db=materialize_db,
-        resume_from_cache=resume_from_cache,
         deduplicate_documents_by_hash=deduplicate_documents_by_hash,
         max_subchunk_tokens=max_subchunk_tokens,
     )

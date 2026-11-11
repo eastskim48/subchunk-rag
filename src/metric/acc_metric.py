@@ -41,6 +41,8 @@ SUPPORTED_DATASETS = {
     "dapr-nq-open": "dapr-nq-open",
     "nq-open": "dapr-nq-open",
     "newsqa": "newsqa",
+    "covid-qa": "covid-qa",
+    "covid-qa-full-test": "covid-qa",
 }
 
 
@@ -203,14 +205,6 @@ def load_json_records(path: str):
                 f"failed to parse JSONL {path} at line {line_no}: {exc}"
             ) from exc
     return records
-
-
-def load_predictions(prediction_file: str, use_clean_prediction: bool) -> list[str]:
-    records = load_json_records(prediction_file)
-    return [
-        extract_prediction_from_record(record, use_clean_prediction)
-        for record in records
-    ]
 
 
 def validate_aligned_record_ids(
@@ -728,7 +722,7 @@ def build_evaluator(dataset: Optional[str]) -> BaseEvaluator:
         return ConditionalQAAnswerOnlyEvaluator()
     if normalized_dataset == "dapr-nq-open":
         return NQOpenOfficialEvaluator()
-    if normalized_dataset == "newsqa":
+    if normalized_dataset in {"newsqa", "covid-qa"}:
         return NewsQAOfficialEvaluator()
     raise ValueError(f"no evaluator configured for dataset '{dataset}'")
 

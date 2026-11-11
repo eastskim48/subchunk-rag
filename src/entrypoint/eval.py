@@ -12,10 +12,9 @@ if str(_SRC_DIR) not in sys.path:
 import torch
 from transformers import logging, set_seed
 from engine import QueryProcessor
-from gold_evidence_vectordb import GoldEvidenceVectorDB
 from vectordb import ChromaDB
 from model import LLMModel
-from acc_metric import evaluate
+from metric.acc_metric import evaluate
 from typing import Optional
 
 
@@ -34,10 +33,8 @@ def _coerce_bool(value):
 def main(
     query_file: str,
     db_dir: str,
-    cache_dir: str,
     dataset: Optional[str] = None,
     top_k: int = 4,
-    use_past_cache: bool = False,
     bsz: int = 1,
     max_new_tokens: int = 20,
     total_num: Optional[int] = None,
@@ -46,42 +43,13 @@ def main(
     model_name: str = "meta-llama/Llama-3.1-8B-Instruct",
     compress_method: Optional[str] = None,
     use_cleaner: bool = False,
-    disable_rope: bool = False,
-    use_front_bos_cache: bool = False,
     model_load_in_4bit: bool = False,
-    gold_evidence_file: Optional[str] = None,
     prompt_format: str = "chat_system_user",
     seed: int = 123,
     cpu_threads: int = 32,
-    retrieval_snapshot: Optional[str] = None,
-    parent_mapping_file: Optional[str] = None,
 ):
-    use_past_cache = _coerce_bool(use_past_cache)
     use_cleaner = _coerce_bool(use_cleaner)
-    disable_rope = _coerce_bool(disable_rope)
-    use_front_bos_cache = _coerce_bool(use_front_bos_cache)
     model_load_in_4bit = _coerce_bool(model_load_in_4bit)
-    if use_past_cache and compress_method in {
-        "colbert_gaussian",
-        "colbert_all_token_gaussian",
-        "colbert_expanded_region",
-        "colbert_sentence_gaussian",
-        "provence",
-        "exit",
-        "xrag_jina",
-        "xrag_jina_cass",
-        "reranker",
-        "reranker_cass",
-    }:
-        raise ValueError(
-            f"compress_method='{compress_method}' is cache-off only; "
-            "set use_past_cache=False."
-        )
-    if use_past_cache and prompt_format != "raw_chunk_first":
-        raise ValueError(
-            "Non-default prompt formats are cache-off only until matching KV "
-            "artifacts and cache assembly are implemented"
-        )
 
     if Path(output_file).exists():
         raise FileExistsError(output_file)
@@ -90,44 +58,18 @@ def main(
     total_start = time.perf_counter()
     logging.set_verbosity_error()
     init_start = time.perf_counter()
-    if (
-        sum(
-            bool(v)
-            for v in (gold_evidence_file, retrieval_snapshot, parent_mapping_file)
-        )
-        > 1
-    ):
-        raise ValueError("Only one explicit retrieval source may be selected")
-    if retrieval_snapshot:
-        from replay_vectordb import StoredRetrievalVectorDB
-
-        vectordb = StoredRetrievalVectorDB(retrieval_snapshot, query_file)
-    elif parent_mapping_file:
-        from replay_vectordb import ParentChunkVectorDB
-
-        vectordb = ParentChunkVectorDB(db_dir, parent_mapping_file)
-    else:
-        vectordb = (
-            GoldEvidenceVectorDB(gold_evidence_file)
-            if gold_evidence_file
-            else ChromaDB(db_dir=db_dir)
-        )
+    vectordb = ChromaDB(db_dir=db_dir)
     processor = QueryProcessor(
         query_file=query_file,
         vectordb=vectordb,
         model=LLMModel(
             model_name=model_name,
-            disable_rope=disable_rope,
-            use_front_bos_cache=use_front_bos_cache,
             load_in_4bit=model_load_in_4bit,
             prompt_format=prompt_format,
         ),
-        cache_dir=cache_dir,
         top_k=top_k,
-        use_past_cache=use_past_cache,
         output_file=output_file,
         compress_method=compress_method,
-        disable_rope=disable_rope,
     )
     init_runtime = time.perf_counter() - init_start
     run_stats = processor.process_query(
@@ -156,7 +98,7 @@ def main(
             )
     score_start = time.perf_counter()
     if dataset == "bioasq":
-        from bioasq_metrics import evaluate_saved_answers
+        from metric.bioasq_metrics import evaluate_saved_answers
 
         evaluate_saved_answers(output_file, answer_file, query_file)
     else:

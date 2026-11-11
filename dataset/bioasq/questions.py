@@ -4,7 +4,6 @@ Keep original annotations and IDs. This does not retrieve, generate answers,
 flatten list references, or parse generated list answers.
 """
 
-import argparse
 from collections import Counter
 import hashlib
 import json

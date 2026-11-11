@@ -1,7 +1,5 @@
 #!/bin/bash
 
-# torchrun --nproc_per_node 1 --master_port=29500 eval_batch.py --db_dir=/mnt/raid0/kunwooshin/data/db --cache_dir=/mnt/raid0/kunwooshin/data/cache --query_file=./questions/query.jsonl --top_k 2 --use_past_cache=True --bsz 32 --max_new_tokens 30 --total_num 128
-
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
@@ -28,9 +26,7 @@ fi
 export DEFAULT_MODEL_NAME="meta-llama/Llama-3.1-8B-Instruct"
 export MODEL_NAME="${MODEL_NAME:-$DEFAULT_MODEL_NAME}"
 export DATA_SUBDIR="${DATA_SUBDIR:-sent}"
-export CACHE_SUBDIR="${CACHE_SUBDIR:-cache}"
 export DB_DIR="${DB_DIR:-$DATASET_PATH/$DATA_SUBDIR/db}"
-export CACHE_DIR="${CACHE_DIR:-$DATASET_PATH/$DATA_SUBDIR/$CACHE_SUBDIR}"
 export QUERY_FILE="${QUERY_FILE:-$DATASET_PATH/questions/query.jsonl}"
 export ANSWER_FILE="${ANSWER_FILE:-$DATASET_PATH/answers/answer.jsonl}"
 export CHROMA_EMBED_BACKEND="${CHROMA_EMBED_BACKEND:-bge_small_v1_5}"
@@ -38,11 +34,7 @@ export CHROMA_EMBED_DEVICE="${CHROMA_EMBED_DEVICE:-cpu}"
 export COLBERT_WINDOW_DIR="${COLBERT_WINDOW_DIR:-$DATASET_PATH/$DATA_SUBDIR/colbert_window}"
 export COLBERT_MODEL_NAME="${COLBERT_MODEL_NAME:-lightonai/LateOn}"
 export COLBERT_BATCH_SIZE="${COLBERT_BATCH_SIZE:-32}"
-export COLBERT_REGION_GROUP_ORDER="${COLBERT_REGION_GROUP_ORDER:-retrieval}"
 export COLBERT_REPO_PATH="${COLBERT_REPO_PATH:-$REPO_ROOT/third_party/ColBERT}"
-export EVAL_USE_PAST_CACHE="${EVAL_USE_PAST_CACHE:-False}"
-export DISABLE_ROPE="${DISABLE_ROPE:-False}"
-export USE_FRONT_BOS_CACHE="${USE_FRONT_BOS_CACHE:-False}"
 export MODEL_LOAD_IN_4BIT="${MODEL_LOAD_IN_4BIT:-False}"
 export MEASURE_PROMPT_STATS="${MEASURE_PROMPT_STATS:-True}"
 export RETRIEVAL_INCLUDE_DOCUMENTS="${RETRIEVAL_INCLUDE_DOCUMENTS:-True}"
@@ -59,52 +51,26 @@ export TORCHRUN_MASTER_PORT="${TORCHRUN_MASTER_PORT:-29500}"
 
 USES_TOKEN_BUDGET=False
 case "$COMPRESS_METHOD" in
-    colbert_gaussian|dense|dense_online|dense_sliding_subchunk|dense_sliding_region_max|dense_sliding_region_avg|materialized_dense_sliding_subchunk|colbert_subchunk|colbert_sliding_region|colbert_expanded_region|xrag_jina_cass|reranker_cass)
+    colbert_subchunk|colbert_sliding_region)
         USES_TOKEN_BUDGET=True
         ;;
 esac
 
 if [ "$USES_TOKEN_BUDGET" = "True" ]; then
-    if { [ -n "${RETAIN_TOKEN_RATIO:-}" ] && [ -n "${FINAL_TOKEN_BUDGET:-}" ]; } || \
-       { [ -z "${RETAIN_TOKEN_RATIO:-}" ] && [ -z "${FINAL_TOKEN_BUDGET:-}" ]; }; then
-        echo "exactly one of RETAIN_TOKEN_RATIO or FINAL_TOKEN_BUDGET must be set for $COMPRESS_METHOD" >&2
+    if [ -z "${FINAL_TOKEN_BUDGET:-}" ]; then
+        echo "FINAL_TOKEN_BUDGET must be set for $COMPRESS_METHOD" >&2
         exit 1
     fi
 fi
 
-CARROT_USES_TOKEN_BUDGET=False
-if [ "$COMPRESS_METHOD" = "carrot" ]; then
-    if [ -n "${RETAIN_TOKEN_RATIO:-}" ] && [ -n "${FINAL_TOKEN_BUDGET:-}" ]; then
-        echo "at most one of RETAIN_TOKEN_RATIO or FINAL_TOKEN_BUDGET may be set for carrot" >&2
-        exit 1
-    fi
-    if [ -n "${RETAIN_TOKEN_RATIO:-}" ] || [ -n "${FINAL_TOKEN_BUDGET:-}" ]; then
-        CARROT_USES_TOKEN_BUDGET=True
-    fi
-fi
-
-if [ "$EVAL_USE_PAST_CACHE" = "True" ]; then
-    OUTPUT_SUFFIX="cacheon"
-else
-    OUTPUT_SUFFIX="cacheoff"
-fi
+OUTPUT_SUFFIX="cacheoff"
 if [ "$PROMPT_FORMAT" != "raw_chunk_first" ]; then
     PROMPT_FORMAT_TAG="${PROMPT_FORMAT//\//_}"
     PROMPT_FORMAT_TAG="${PROMPT_FORMAT_TAG// /_}"
     OUTPUT_SUFFIX="pf${PROMPT_FORMAT_TAG}-$OUTPUT_SUFFIX"
 fi
-if [ "$USES_TOKEN_BUDGET" = "True" ] || [ "$CARROT_USES_TOKEN_BUDGET" = "True" ]; then
-    if [ -n "${RETAIN_TOKEN_RATIO:-}" ]; then
-        OUTPUT_SUFFIX="rtr${RETAIN_TOKEN_RATIO}-$OUTPUT_SUFFIX"
-    elif [ -n "${FINAL_TOKEN_BUDGET:-}" ]; then
-        OUTPUT_SUFFIX="ftb${FINAL_TOKEN_BUDGET}-$OUTPUT_SUFFIX"
-    fi
-fi
-if [ "$COMPRESS_METHOD" = "colbert_sliding_region" ] && [ "$COLBERT_REGION_GROUP_ORDER" != "retrieval" ]; then
-    OUTPUT_SUFFIX="rgo${COLBERT_REGION_GROUP_ORDER}-$OUTPUT_SUFFIX"
-fi
-if { [ "$COMPRESS_METHOD" = "xrag_jina" ] || [ "$COMPRESS_METHOD" = "xrag_jina_cass" ]; } && [ -n "${XRAG_TOP_N:-}" ] && [ -n "${XRAG_MAX_LENGTH:-}" ]; then
-    OUTPUT_SUFFIX="xrtopn${XRAG_TOP_N}-xrml${XRAG_MAX_LENGTH}-$OUTPUT_SUFFIX"
+if [ "$USES_TOKEN_BUDGET" = "True" ]; then
+    OUTPUT_SUFFIX="ftb${FINAL_TOKEN_BUDGET}-$OUTPUT_SUFFIX"
 fi
 if [ "$MODEL_LOAD_IN_4BIT" = "True" ] || [ "$MODEL_LOAD_IN_4BIT" = "true" ] || [ "$MODEL_LOAD_IN_4BIT" = "1" ]; then
     OUTPUT_SUFFIX="llm4bit-$OUTPUT_SUFFIX"
@@ -131,13 +97,6 @@ OUTPUT_FILE="${OUTPUT_FILE:-./outputs/eval-$DATASET-$DATA_SUBDIR${OUTPUT_PATH_SU
 mkdir -p "$(dirname "$OUTPUT_FILE")"
 
 TOTAL_NUM_ARGS=()
-RETRIEVAL_SOURCE_ARGS=()
-if [ -n "${RETRIEVAL_SNAPSHOT:-}" ]; then
-    RETRIEVAL_SOURCE_ARGS+=(--retrieval_snapshot "$RETRIEVAL_SNAPSHOT")
-fi
-if [ -n "${PARENT_MAPPING_FILE:-}" ]; then
-    RETRIEVAL_SOURCE_ARGS+=(--parent_mapping_file "$PARENT_MAPPING_FILE")
-fi
 if [ -n "$TOTAL_NUM" ]; then
     TOTAL_NUM_ARGS=(--total_num "$TOTAL_NUM")
 fi
@@ -145,13 +104,9 @@ fi
 torchrun --nproc_per_node 1 --master_port "$TORCHRUN_MASTER_PORT" src/entrypoint/eval.py \
     --dataset="$DATASET" \
     --db_dir="$DB_DIR" \
-    --cache_dir="$CACHE_DIR" \
     --query_file="$QUERY_FILE" \
     --top_k "$TOP_K" --max_new_tokens "$MAX_NEW_TOKENS" \
     --model_name "$MODEL_NAME" \
-    --use_past_cache="$EVAL_USE_PAST_CACHE" \
-    --disable_rope "$DISABLE_ROPE" \
-    --use_front_bos_cache "$USE_FRONT_BOS_CACHE" \
     --model_load_in_4bit "$MODEL_LOAD_IN_4BIT" \
     --prompt_format "$PROMPT_FORMAT" \
     --seed "$EVAL_SEED" --cpu_threads "$EVAL_CPU_THREADS" \
@@ -159,7 +114,6 @@ torchrun --nproc_per_node 1 --master_port "$TORCHRUN_MASTER_PORT" src/entrypoint
     --answer_file "$ANSWER_FILE" \
     --bsz "$EVAL_BSZ" \
     --use_cleaner "$USE_CLEANER" \
-    "${RETRIEVAL_SOURCE_ARGS[@]}" \
     "${TOTAL_NUM_ARGS[@]}" \
     "${COMPRESS_ARGS[@]}"
 ## HOTPOTQA 실험 ##

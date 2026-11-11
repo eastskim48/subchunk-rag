@@ -13,91 +13,16 @@ from chunk import RetrievableChunk, CacheableChunk
 from subchunk_store import load_subchunks, cacheables_from_metadata, pack_subchunk_range
 from encoder.dense import (
     BGE_SMALL_MODEL,
-    BGE_M3_MODEL,
     DenseTextEmbedder,
-    E5_SMALL_MODEL,
-    default_passage_prefix,
     default_query_prefix,
     env_int,
 )
 
 
-class DevicePinnedDefaultEmbeddingFunction:
-    """Run Chroma's default MiniLM ONNX graph on an explicit provider."""
-
-    def __init__(self, device: str = "cpu", batch_size: int = 32):
-        from chromadb.utils.embedding_functions.onnx_mini_lm_l6_v2 import (
-            ONNXMiniLM_L6_V2,
-        )
-
-        normalized_device = device.strip().lower()
-        if normalized_device == "cpu":
-            providers = ["CPUExecutionProvider"]
-        elif normalized_device == "cuda":
-            providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
-        else:
-            raise ValueError(f"unsupported default Chroma embedding device: {device!r}")
-        if batch_size <= 0:
-            raise ValueError("default Chroma embedding batch_size must be positive")
-
-        self.device = normalized_device
-        self.batch_size = batch_size
-        self.embedder = ONNXMiniLM_L6_V2(preferred_providers=providers)
-        available_providers = set(self.embedder.ort.get_available_providers())
-        if not set(providers).issubset(available_providers):
-            raise RuntimeError(
-                f"requested ONNX providers {providers}, but only "
-                f"{sorted(available_providers)} are available"
-            )
-
-    def __call__(self, input):
-        texts = list(input)
-        if not texts:
-            return []
-        self.embedder._download_model_if_not_exists()
-        embeddings = self.embedder._forward(texts, batch_size=self.batch_size)
-        return [np.array(row, dtype=np.float32) for row in embeddings]
-
-    def embed_query(self, input):
-        return self(input)
-
-    @staticmethod
-    def name() -> str:
-        return "default"
-
-    @staticmethod
-    def default_space() -> str:
-        return "cosine"
-
-    @staticmethod
-    def supported_spaces() -> List[str]:
-        return ["cosine", "l2", "ip"]
-
-    @staticmethod
-    def build_from_config(config: Dict[str, object]):
-        return DevicePinnedDefaultEmbeddingFunction()
-
-    @staticmethod
-    def get_config() -> Dict[str, object]:
-        return {}
-
-    @staticmethod
-    def validate_config(config: Dict[str, object]) -> None:
-        return
-
-    @staticmethod
-    def is_legacy() -> bool:
-        return False
-
-    @staticmethod
-    def max_tokens() -> int:
-        return 256
-
-
 class DenseEmbeddingFunction:
     """Expose the shared dense encoder through Chroma's embedding interface."""
 
-    MODEL_NAME = BGE_M3_MODEL
+    MODEL_NAME = BGE_SMALL_MODEL
 
     def __init__(
         self,
@@ -110,15 +35,12 @@ class DenseEmbeddingFunction:
         self.model_name = model_name
         self.device = device or os.getenv("CHROMA_EMBED_DEVICE")
         self.batch_size = env_int("CHROMA_EMBED_BATCH_SIZE", batch_size)
-        self.function_name = function_name or (
-            "bge_m3" if model_name == BGE_M3_MODEL else None
-        )
+        self.function_name = function_name
         self.query_prefix = (
             default_query_prefix(self.model_name)
             if query_prefix is None
             else query_prefix
         )
-        self.passage_prefix = default_passage_prefix(self.model_name)
         self.embedder = DenseTextEmbedder(
             model_name=self.model_name,
             device=self.device,
@@ -127,9 +49,7 @@ class DenseEmbeddingFunction:
         self.device = self.embedder.device
 
     def __call__(self, input):
-        return self._embed_texts_batched(
-            [f"{self.passage_prefix}{text}" for text in input]
-        )
+        return self._embed_texts_batched(list(input))
 
     def embed_query(self, input):
         return self._embed_texts_batched(
@@ -144,8 +64,6 @@ class DenseEmbeddingFunction:
         return [np.array(row, dtype=np.float32) for row in embeddings]
 
     def name(self) -> str:
-        if self.model_name == BGE_M3_MODEL:
-            return self.function_name or "bge_m3"
         sanitized = "".join(
             character if character.isalnum() else "_"
             for character in self.model_name.lower()
@@ -211,17 +129,11 @@ class VectorDB(abc.ABC):
 class ChromaDB(VectorDB):
     """Persist and retrieve coarse chunks with Chroma vector search."""
 
-    BGE_M3_EMBED_BACKEND = "bge_m3"
     BGE_SMALL_EMBED_BACKEND = "bge_small_v1_5"
-    E5_SMALL_EMBED_BACKEND = "e5_small_v2"
     DEFAULT_EMBED_BACKEND = BGE_SMALL_EMBED_BACKEND
     DENSE_EMBED_BACKENDS = {
-        BGE_M3_EMBED_BACKEND: BGE_M3_MODEL,
         BGE_SMALL_EMBED_BACKEND: BGE_SMALL_MODEL,
-        E5_SMALL_EMBED_BACKEND: E5_SMALL_MODEL,
     }
-    # Applied only to the DenseTextEmbedder/SentenceTransformers choices above.
-    # The `default` ONNX MiniLM path intentionally uses Chroma's HNSW defaults.
     DEFAULT_COLLECTION_CONFIGURATION = {
         "hnsw": {
             "space": "cosine",
@@ -298,20 +210,11 @@ class ChromaDB(VectorDB):
             .strip()
             .lower()
         )
-        if embed_backend in {"default", "chroma_default"}:
-            return chroma_client.get_or_create_collection(
-                name="doc_collection",
-                embedding_function=DevicePinnedDefaultEmbeddingFunction(
-                    device=embedding_device,
-                    batch_size=embedding_batch_size,
-                ),
-            )
         model_name = ChromaDB.DENSE_EMBED_BACKENDS.get(embed_backend)
         if model_name is None:
             raise ValueError(
                 f"unsupported CHROMA_EMBED_BACKEND={embed_backend!r}; "
-                "expected 'default', 'chroma_default', 'bge_m3', "
-                "'bge_small_v1_5', or 'e5_small_v2'"
+                "expected 'bge_small_v1_5'"
             )
         return chroma_client.get_or_create_collection(
             name="doc_collection",

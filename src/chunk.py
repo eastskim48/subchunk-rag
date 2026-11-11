@@ -69,19 +69,6 @@ class CacheableChunk(Chunk):
             "prompt_token_count": self.prompt_token_count,
         }
 
-    @classmethod
-    def from_payload(cls, payload: Dict[str, Any]) -> CacheableChunk:
-        return cls(
-            id=payload["id"],
-            text=payload["text"],
-            parent_doc_id=payload.get("parent_doc_id"),
-            chunk_start=payload.get("chunk_start"),
-            chunk_end=payload.get("chunk_end"),
-            sentence_ids=payload.get("sentence_ids"),
-            sentence_texts=payload.get("sentence_texts"),
-            prompt_token_count=payload.get("prompt_token_count"),
-        )
-
 
 class RetrievableChunk(Chunk):
     """Coarse retrieval unit containing subchunk cacheable subchunks."""

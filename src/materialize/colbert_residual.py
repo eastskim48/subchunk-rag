@@ -45,18 +45,6 @@ _UNPACK_2BIT_LUT = np.asarray(
 _DECODE_SCRATCH = threading.local()
 
 
-def _residual_values_into_buffer(quantized, bucket_weights):
-    """Reuse scratch storage; returned data is consumed before the next decode."""
-    buffer = getattr(_DECODE_SCRATCH, "residuals", None)
-    if buffer is None or buffer.size < quantized.size:
-        buffer = np.empty(quantized.size, dtype=np.float32)
-        _DECODE_SCRATCH.residuals = buffer
-    values = buffer[: quantized.size].reshape(quantized.shape)
-    # Unpacking guarantees indices 0..3. clip avoids take's raise-mode copy.
-    np.take(bucket_weights, quantized, out=values, mode="clip")
-    return values
-
-
 def _packed_residual_values_into_buffer(packed, embedding_dim, bucket_weights):
     """Map each packed byte directly to four FP32 residuals."""
     packed = np.asarray(packed, dtype=np.uint8)
@@ -145,46 +133,14 @@ def pack_2bit_values(values: np.ndarray) -> np.ndarray:
     return np.packbits(bits.reshape(values.shape[0], -1), axis=1)
 
 
-def unpack_2bit_values(packed: np.ndarray, embedding_dim: int) -> np.ndarray:
-    """Unpack official ResidualCodec bit order into values in [0, 3]."""
-
-    packed = np.asarray(packed, dtype=np.uint8)
-    if packed.ndim != 2:
-        raise ValueError(f"packed residuals must be rank 2, got shape={packed.shape}")
-    if embedding_dim <= 0 or embedding_dim % 4 != 0:
-        raise ValueError(
-            "embedding_dim must be a positive multiple of four, " f"got {embedding_dim}"
-        )
-    expected_width = embedding_dim // 4
-    if packed.shape[1] != expected_width:
-        raise ValueError(
-            "packed residual width does not match embedding_dim: "
-            f"packed={packed.shape[1]}, expected={expected_width}"
-        )
-    return np.take(_UNPACK_2BIT_LUT, packed, axis=0).reshape(
-        packed.shape[0], embedding_dim
-    )
-
-
 def decompress_2bit_rows(
     codes: np.ndarray,
     packed_residuals: np.ndarray,
     centroids: np.ndarray,
     bucket_weights: np.ndarray,
-    profile: dict[str, float | int] | None = None,
     token_norms: np.ndarray | None = None,
 ) -> torch.Tensor:
     """Reconstruct and normalize selected ColBERT token vectors on CPU."""
-
-    if profile is not None:
-        return _decompress_2bit_rows_profiled(
-            codes=codes,
-            packed_residuals=packed_residuals,
-            centroids=centroids,
-            bucket_weights=bucket_weights,
-            profile=profile,
-            token_norms=token_norms,
-        )
 
     codes = np.asarray(codes, dtype=np.int64)
     if codes.ndim != 1:
@@ -208,74 +164,6 @@ def decompress_2bit_rows(
         out=reconstructed,
     )
     return torch.from_numpy(_normalize_rows_inplace(reconstructed, token_norms))
-
-
-def _profile_add(profile: dict[str, float | int], key: str, value: float | int) -> None:
-    profile[key] = profile.get(key, 0) + value
-
-
-def _decompress_2bit_rows_profiled(
-    *,
-    codes: np.ndarray,
-    packed_residuals: np.ndarray,
-    centroids: np.ndarray,
-    bucket_weights: np.ndarray,
-    profile: dict[str, float | int],
-    token_norms: np.ndarray | None = None,
-) -> torch.Tensor:
-    total_start = time.perf_counter()
-
-    stage_start = time.perf_counter()
-    codes = np.asarray(codes, dtype=np.int64)
-    centroids = np.asarray(centroids, dtype=np.float32)
-    bucket_weights = np.asarray(bucket_weights, dtype=np.float32)
-    _profile_add(profile, "input_prepare_sec", time.perf_counter() - stage_start)
-
-    stage_start = time.perf_counter()
-    if codes.ndim != 1:
-        raise ValueError(f"centroid codes must be rank 1, got shape={codes.shape}")
-    if centroids.ndim != 2:
-        raise ValueError(f"centroids must be rank 2, got shape={centroids.shape}")
-    if bucket_weights.shape != (4,):
-        raise ValueError(
-            f"2-bit bucket weights must have shape (4,), got {bucket_weights.shape}"
-        )
-    if codes.size and (int(codes.min()) < 0 or int(codes.max()) >= len(centroids)):
-        raise ValueError("centroid code is outside the stored centroid table")
-    _profile_add(profile, "validation_sec", time.perf_counter() - stage_start)
-
-    # Bit unpack and residual lookup are fused; time is in residual_lookup_sec.
-    _profile_add(profile, "unpack_sec", 0.0)
-
-    stage_start = time.perf_counter()
-    reconstructed = centroids[codes]
-    _profile_add(profile, "centroid_gather_sec", time.perf_counter() - stage_start)
-
-    stage_start = time.perf_counter()
-    residual_values = _packed_residual_values_into_buffer(
-        packed_residuals, centroids.shape[1], bucket_weights
-    )
-    _profile_add(profile, "residual_lookup_sec", time.perf_counter() - stage_start)
-
-    stage_start = time.perf_counter()
-    np.add(reconstructed, residual_values, out=reconstructed)
-    del residual_values
-    _profile_add(profile, "add_sec", time.perf_counter() - stage_start)
-
-    stage_start = time.perf_counter()
-    normalized = _normalize_rows_inplace(reconstructed, token_norms)
-    _profile_add(profile, "normalize_sec", time.perf_counter() - stage_start)
-
-    stage_start = time.perf_counter()
-    result = torch.from_numpy(normalized)
-    _profile_add(profile, "tensor_wrap_sec", time.perf_counter() - stage_start)
-
-    _profile_add(profile, "decompression_calls", 1)
-    _profile_add(profile, "token_vectors", int(codes.shape[0]))
-    _profile_add(profile, "code_input_bytes", int(codes.shape[0] * 4))
-    _profile_add(profile, "packed_residual_input_bytes", int(packed_residuals.nbytes))
-    _profile_add(profile, "decompress_total_sec", time.perf_counter() - total_start)
-    return result
 
 
 def _make_faiss_index(faiss, centroids: np.ndarray, use_gpu: bool):

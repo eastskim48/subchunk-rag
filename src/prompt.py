@@ -1,10 +1,10 @@
-"""Canonical prompt construction shared by preprocessing and inference."""
+"""Canonical prompt construction for inference."""
 
 from typing import List
 
 
 class PromptProcessor:
-    """Build prompt-visible passage and query text in cache-compatible order."""
+    """Build prompt-visible passage and query text in the selected format."""
 
     SUPPORTED_FORMATS = {"raw_chunk_first", "chat_system_user"}
 
@@ -42,9 +42,6 @@ class PromptProcessor:
         if self.prompt_format == "chat_system_user":
             return self._build_chat_prompt(query=query, passages=passages)
         return f"{self.format_passages(passages)}{self.build_query_prompt(query)}"
-
-    def build_cache_aligned_qa_prompt(self, query: str, passages: List[str]) -> str:
-        return self.build_qa_prompt(query=query, passages=passages)
 
     def _build_chat_prompt(self, query: str, passages: List[str]) -> str:
         user_content = (

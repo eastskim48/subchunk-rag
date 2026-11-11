@@ -7,7 +7,6 @@ as well as runtime access to the artifact's embedding and region sidecars.
 
 import json
 import os
-import time
 from pathlib import Path
 from typing import Any
 
@@ -82,7 +81,6 @@ class ColBERTWindowData:
 
     def __init__(self, data_dir: str | Path):
         self.data_dir = Path(data_dir)
-        self._decompression_profile: dict[str, float | int] | None = None
         self.index_path = self.data_dir / "index.json"
         if not self.index_path.exists():
             raise FileNotFoundError(f"missing ColBERT data index: {self.index_path}")
@@ -250,58 +248,17 @@ class ColBERTWindowData:
             return torch.from_numpy(self.vectors[start:end]).to(torch.float16)
         from materialize.colbert_residual import decompress_2bit_rows
 
-        if self._decompression_profile is None:
-            return decompress_2bit_rows(
-                codes=np.asarray(self.codes[start:end]),
-                packed_residuals=np.asarray(self.residuals[start:end]),
-                centroids=np.asarray(self.centroids),
-                bucket_weights=np.asarray(self.bucket_weights),
-                token_norms=(
-                    np.asarray(self.token_norms[start:end])
-                    if self.token_norms is not None
-                    else None
-                ),
-            )
-
-        row_start = time.perf_counter()
-        codes = np.asarray(self.codes[start:end])
-        packed_residuals = np.asarray(self.residuals[start:end])
-        slice_setup_sec = time.perf_counter() - row_start
-        result = decompress_2bit_rows(
-            codes=codes,
-            packed_residuals=packed_residuals,
+        return decompress_2bit_rows(
+            codes=np.asarray(self.codes[start:end]),
+            packed_residuals=np.asarray(self.residuals[start:end]),
             centroids=np.asarray(self.centroids),
             bucket_weights=np.asarray(self.bucket_weights),
-            profile=self._decompression_profile,
             token_norms=(
                 np.asarray(self.token_norms[start:end])
                 if self.token_norms is not None
                 else None
             ),
         )
-        profile = self._decompression_profile
-        profile["row_slice_setup_sec"] = (
-            profile.get("row_slice_setup_sec", 0.0) + slice_setup_sec
-        )
-        profile["row_total_sec"] = (
-            profile.get("row_total_sec", 0.0) + time.perf_counter() - row_start
-        )
-        return result
-
-    def enable_decompression_profile(self) -> None:
-        if self.embedding_storage not in {
-            LEGACY_RESIDUAL_STORAGE_FORMAT,
-            RESIDUAL_STORAGE_FORMAT,
-        }:
-            raise ValueError("decompression profiling requires 2-bit residual storage")
-        self._decompression_profile = {}
-
-    def reset_decompression_profile(self) -> None:
-        if self._decompression_profile is not None:
-            self._decompression_profile.clear()
-
-    def decompression_profile(self) -> dict[str, float | int]:
-        return dict(self._decompression_profile or {})
 
     def row_for_id(self, subchunk_id):
         if subchunk_id is None:
@@ -342,7 +299,6 @@ class ColBERTWindowData:
         if batch_decode and resolved_rows:
             from materialize.colbert_residual import decompress_2bit_rows
 
-            row_start = time.perf_counter()
             ranges = []
             for _, start, end in resolved_rows:
                 if ranges and ranges[-1][1] == start:
@@ -359,30 +315,18 @@ class ColBERTWindowData:
             codes = gather(self.codes)
             residuals = gather(self.residuals)
             norms = gather(self.token_norms) if self.token_norms is not None else None
-            setup_sec = time.perf_counter() - row_start
             combined = decompress_2bit_rows(
                 codes=codes,
                 packed_residuals=residuals,
                 centroids=self.centroids,
                 bucket_weights=self.bucket_weights,
                 token_norms=norms,
-                profile=self._decompression_profile,
             )
             relative_start = 0
             for output_idx, start, end in resolved_rows:
                 length = end - start
                 vectors[output_idx] = combined[relative_start : relative_start + length]
                 relative_start += length
-            if self._decompression_profile is not None:
-                profile = self._decompression_profile
-                for key, value in (
-                    ("row_slice_setup_sec", setup_sec),
-                    ("row_total_sec", time.perf_counter() - row_start),
-                    ("decoded_encoding_unit_count", len(resolved_rows)),
-                    ("coalesced_group_count", 1),
-                    ("multi_unit_group_count", int(len(resolved_rows) > 1)),
-                ):
-                    profile[key] = profile.get(key, 0) + value
             return vectors
 
         group_start_idx = 0
@@ -406,19 +350,6 @@ class ColBERTWindowData:
                     relative_start : relative_start + row_length
                 ]
                 relative_start += row_length
-
-            if self._decompression_profile is not None:
-                profile = self._decompression_profile
-                profile["decoded_encoding_unit_count"] = profile.get(
-                    "decoded_encoding_unit_count", 0
-                ) + len(group_rows)
-                profile["coalesced_group_count"] = (
-                    profile.get("coalesced_group_count", 0) + 1
-                )
-                if len(group_rows) > 1:
-                    profile["multi_unit_group_count"] = (
-                        profile.get("multi_unit_group_count", 0) + 1
-                    )
 
             group_start_idx = group_end_idx
         return vectors
@@ -531,15 +462,6 @@ class ColBERTWindowArtifact:
         for key, ids in pending.items():
             self.retrievable_vectors_cache[key] = vectors[offset : offset + len(ids)]
             offset += len(ids)
-
-    def enable_decompression_profile(self) -> None:
-        self.data.enable_decompression_profile()
-
-    def reset_decompression_profile(self) -> None:
-        self.data.reset_decompression_profile()
-
-    def decompression_profile(self) -> dict[str, float | int]:
-        return self.data.decompression_profile()
 
     def region_specs_for_doc(self, doc, token_budget: int):
         return self.data.region_specs_for_doc(doc, token_budget)

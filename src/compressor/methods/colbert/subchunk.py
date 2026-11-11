@@ -68,7 +68,7 @@ class ColBERTSubchunkCompressor(ColBERTWindowCompressorBase):
             ]
             scored_candidates = self._deduplicate_scored_candidates(scored_candidates)
             selected_by_doc: dict[int, list[int]] = {}
-            final_token_budget = self._resolve_final_token_budget(docs)
+            final_token_budget = self.final_token_budget
             selected_candidates = []
             selected_ids = set()
             used_tokens = 0

@@ -3,12 +3,10 @@
 
 from __future__ import annotations
 
-import argparse
 import csv
 import hashlib
 import io
 import json
-import random
 import zipfile
 from collections import Counter
 from pathlib import Path

@@ -10,14 +10,10 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from encoder.colbert import default_colbert_repo_path  # noqa: E402
-from encoder.dense import BGE_M3_MODEL  # noqa: E402
 from materialize.colbert_materializer import (  # noqa: E402
     add_region_specs_to_colbert_window_data,
     build_colbert_window_artifact,
     validate_colbert_subchunk_ids_against_db,
-)
-from materialize.dense_materializer import (  # noqa: E402
-    build_dense_embedding_artifact_from_db,
 )
 from materialize.compressed_colbert_materializer import (  # noqa: E402
     build_compressed_colbert_subchunks,
@@ -49,21 +45,9 @@ def main(
     batch_tokens: int = 4096,
 ):
     normalized_backend = backend.strip().lower()
-    if normalized_backend == "dense":
-        summary = build_dense_embedding_artifact_from_db(
-            db_dir=db_dir,
-            output_dir=output_dir,
-            embedding_model=model_name or BGE_M3_MODEL,
-            embedding_batch_size=128 if batch_size is None else batch_size,
-            db_batch_size=db_batch_size,
-            cache_unit=None,
-            overwrite=overwrite,
-        )
-        print(f"Dense embedding artifact materialized: {summary}")
-        return
     if normalized_backend != "colbert":
         raise ValueError(
-            "subchunk store backend must be 'colbert' or 'dense', " f"got {backend!r}"
+            "subchunk store backend must be 'colbert', " f"got {backend!r}"
         )
     if not docs_dir:
         raise ValueError("docs_dir must be set for backend='colbert'")

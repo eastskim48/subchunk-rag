@@ -12,7 +12,7 @@ import json
 from pathlib import Path
 from statistics import mean
 
-from acc_metric import NewsQAOfficialEvaluator
+from .acc_metric import NewsQAOfficialEvaluator
 
 
 def evaluate_saved_answers(prediction_file, ground_truth_file, query_file):

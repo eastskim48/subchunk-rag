@@ -28,11 +28,6 @@ export COLBERT_WINDOW_CENTER_UNIT="${COLBERT_WINDOW_CENTER_UNIT:-subchunk_only}"
 export COLBERT_WINDOW_FIXED_CHUNK_SIZE="${COLBERT_WINDOW_FIXED_CHUNK_SIZE:-}"
 export COLBERT_EMBEDDING_STORAGE="${COLBERT_EMBEDDING_STORAGE:-residual_2bit}"
 export COLBERT_COMPRESSION_SEED="${COLBERT_COMPRESSION_SEED:-123}"
-export DENSE_EMBED_DIR="${DENSE_EMBED_DIR:-$DATASET_PATH/$PREPROCESS_SUBDIR/dense_embed}"
-export DENSE_EMBED_MODEL="${DENSE_EMBED_MODEL:-BAAI/bge-m3}"
-export DENSE_EMBED_BATCH_SIZE="${DENSE_EMBED_BATCH_SIZE:-128}"
-export DENSE_DB_BATCH_SIZE="${DENSE_DB_BATCH_SIZE:-2048}"
-export DENSE_EMBED_OVERWRITE="${DENSE_EMBED_OVERWRITE:-False}"
 
 case "$SUBCHUNK_MATERIALIZATION_BACKEND" in
     colbert)
@@ -55,18 +50,6 @@ case "$SUBCHUNK_MATERIALIZATION_BACKEND" in
         if [ -n "$COLBERT_WINDOW_FIXED_CHUNK_SIZE" ]; then
             args+=(--fixed_chunk_size "$COLBERT_WINDOW_FIXED_CHUNK_SIZE")
         fi
-        ;;
-    dense)
-        mkdir -p "$DENSE_EMBED_DIR"
-        args=(
-            --backend dense
-            --output_dir "$DENSE_EMBED_DIR"
-            --db_dir "$DB_DIR"
-            --model_name "$DENSE_EMBED_MODEL"
-            --batch_size "$DENSE_EMBED_BATCH_SIZE"
-            --db_batch_size "$DENSE_DB_BATCH_SIZE"
-            --overwrite "$DENSE_EMBED_OVERWRITE"
-        )
         ;;
     *)
         echo "unsupported SUBCHUNK_MATERIALIZATION_BACKEND=$SUBCHUNK_MATERIALIZATION_BACKEND" >&2

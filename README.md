@@ -79,6 +79,8 @@ consistently; replace `.` with another parent directory when needed.
 The common launcher runs the existing three construction steps: build retrieval DB, copy it and rebuild subchunk catalog with
 LateOn, then encode the sentences and store vectors. The subchunk catalog step reuses its indexed texts, vectors,
 and retrieval graph; it does not generate new retrieval embeddings.
+These offline outputs are retrieval and token-embedding artifacts. Inference
+processes the complete selected text prompt for each request.
 
 For example, after constructing NQ:
 
@@ -116,7 +118,7 @@ refused. Use `--stage retrieval|subchunks|embeddings` to run one stage, or suppl
 
 ## Representative Experiment
 
-Run the cache-off Subchunk-RAG experiment over all 2,390 questions:
+Run the Subchunk-RAG experiment over all 2,390 questions:
 
 ```bash
 DATASET_PREFIX=. \
@@ -126,9 +128,8 @@ COMPRESS_METHOD=colbert_sliding_region \
 COLBERT_MODEL_NAME=lightonai/LateOn \
 CHROMA_EMBED_BACKEND=bge_small_v1_5 \
 MODEL_NAME=meta-llama/Llama-3.1-8B-Instruct \
-EVAL_USE_PAST_CACHE=False \
 TOP_K=20 \
-RETAIN_TOKEN_RATIO=0.25 \
+FINAL_TOKEN_BUDGET=1000 \
 TOTAL_NUM=2390 \
 ./run/eval.sh
 ```
@@ -143,5 +144,7 @@ dataset and preprocessing commands above:
 ./dapr-nq-open/sent-bge-small-v1.5-512-splitlong100-lateon/colbert_window
 ```
 
+`FINAL_TOKEN_BUDGET` is required when compression is enabled. It specifies a
+fixed context-token budget; the example above uses 1,000 tokens.
 All remaining evaluation settings use the defaults in `run/eval.sh`.
 Evaluation outputs are written to `outputs/` unless `OUTPUT_FILE` is set.

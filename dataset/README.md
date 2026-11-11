@@ -178,10 +178,4 @@ sent-bge-small-v1.5-512-splitlong100-lateon/colbert_window
 ```
 
 Use `COLBERT_WINDOW_DIR` explicitly when reusing an older artifact with another
-name, such as `colbert_lateon_sentence_2bit`. The retained `run/run_grid.sh` command
-mode can guard hardware use if needed:
-
-```bash
-bash run/run_grid.sh --gpu 0 --wait-gpu --wait-lock --no-exclusive -- \
-    bash run/preprocess.sh --dataset nq --dataset-root "$DATASET_PREFIX/dapr-nq-open"
-```
+name, such as `colbert_lateon_sentence_2bit`.

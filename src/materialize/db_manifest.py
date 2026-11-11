@@ -12,10 +12,7 @@ DB_BUILD_MANIFEST_VERSION = 1
 
 
 def normalize_embedding_backend(embedding_backend: str) -> str:
-    normalized = embedding_backend.strip().lower()
-    if normalized == "chroma_default":
-        return "default"
-    return normalized
+    return embedding_backend.strip().lower()
 
 
 def build_db_manifest(

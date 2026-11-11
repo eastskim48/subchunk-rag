@@ -225,20 +225,6 @@ class ColBERTEncoder:
         )
         return len(encoded["input_ids"][0]) + 1
 
-    def token_counts(self, texts: list[str]) -> list[int]:
-        if not texts:
-            return []
-        if self.encoder_impl == "lateon_transformers":
-            texts = [text.strip() for text in texts]
-        encoded = self.doc_tokenizer(
-            texts,
-            padding=False,
-            truncation=False,
-            add_special_tokens=True,
-            verbose=False,
-        )
-        return [len(input_ids) + 1 for input_ids in encoded["input_ids"]]
-
     def token_counts_without_specials(self, texts: list[str]) -> list[int]:
         if not texts:
             return []
@@ -393,34 +379,6 @@ class ColBERTEncoder:
                 else:
                     vectors.append(torch.empty((0, self.dim), dtype=torch.float16))
         return vectors
-
-    def document_span_token_counts(
-        self, texts: list[str], center_spans: list[tuple[int, int]]
-    ) -> list[int]:
-        """Count the exact stored positions without running the transformer."""
-        if len(texts) != len(center_spans):
-            raise ValueError("texts and center_spans must have the same length")
-        counts = []
-        for start in range(0, len(texts), self.batch_size):
-            batch_texts = texts[start : start + self.batch_size]
-            ids, attention, offsets = self.tensorize_docs_with_offsets(batch_texts)
-            self._verify_official_tensorization(batch_texts, ids, attention)
-            if self.encoder_impl == "lateon_transformers":
-                valid = attention.bool()
-                for token_id in self.checkpoint.skiplist:
-                    valid &= ids != token_id
-            else:
-                valid = torch.tensor(
-                    self.checkpoint.mask(ids, skiplist=self.checkpoint.skiplist),
-                    dtype=torch.bool,
-                )
-            for row, (begin, end) in enumerate(
-                center_spans[start : start + self.batch_size]
-            ):
-                counts.append(
-                    len(self._center_positions(offsets[row], valid[row], begin, end))
-                )
-        return counts
 
     def encode_queries(self, queries: list[str]) -> list[torch.Tensor]:
         with torch.inference_mode():
