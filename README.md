@@ -24,7 +24,7 @@ python -m pip install -r requirements.txt
 The requirements include GPU-enabled FAISS for 2-bit residual compression and
 GitPython for the source ColBERT adapter. The pinned [`faiss-gpu-cu12` wheel](https://github.com/Di-Is/faiss-gpu-wheels) supports
 NVIDIA compute capabilities 7.0–8.9 and uses the CUDA 12 libraries installed with
-PyTorch. A CPU-only FAISS package cannot run the default artifact builder.
+PyTorch.
 
 ```
 
@@ -36,39 +36,19 @@ on Hugging Face and authenticate with an account that has access:
 hf auth login
 ```
 
-DB construction downloads the Llama tokenizer; evaluation also downloads the
-model weights. Model files already present in the local cache can be reused.
-
 Run every command below from the repository root. With `DATASET_PREFIX=.`, the
 dataset and its preprocessing artifacts are stored under `./dapr-nq-open`.
 
 ## Dataset Construction
 
-The four baseline datasets have separate download/construction launchers and
-share one preprocessing launcher. All four configurations are custom:
-
-| Dataset | Launcher | Documents / questions | Required local input |
-| --- | --- | --- | --- |
-| NQ | `dataset/get_nq.sh` | 108,626 / 2,390 | None; pinned public sources are downloaded |
-| BioASQ | `dataset/get_bioasq.sh` | 58,012 / 4,366 | Manually downloaded training14b ZIP passed with `--archive` |
-| NewsQA | `dataset/get_newsqa.sh` | 12,744 / 4,293 | None; both original archives are downloaded and verified |
-| COVID-QA | `dataset/get_covid_qa.sh` | 147 / 2,019 | None; the preserved official JSON version is downloaded |
-
-See [dataset preparation](dataset/README.md#four-baseline-datasets) for all
-commands, BioASQ manual download steps, and exact construction scope. These
-entrypoints preserve the existing question/document rules; they do not evaluate
-models. Existing dataset directories are not overwritten.
-
-Build the project's custom Document-Aware Passage Retrieval Natural Questions
-(DAPR-NQ)/Natural Questions Open (NQ-open) dataset:
+See [dataset preparation](dataset/README.md#four-baseline-datasets) for all commands, BioASQ manual download steps, and exact construction scope.
 
 ```bash
 DATASET_PREFIX=. ./dataset/get_nq.sh
 ```
 
 `get_nq.sh` downloads and verifies the pinned DAPR-NQ and NQ-open source files,
-then constructs the 108,626-document corpus with all 2,390 custom intersection
-questions and answers under `./dapr-nq-open`.
+then constructs the corpus under `./dapr-nq-open`.
 
 `DATASET_PREFIX` selects the parent directory that contains the
 `dapr-nq-open` dataset directory. The examples below use `DATASET_PREFIX=.`
@@ -76,11 +56,8 @@ consistently; replace `.` with another parent directory when needed.
 
 ## Preprocess
 
-The common launcher runs the existing three construction steps: build retrieval DB, copy it and rebuild subchunk catalog with
-LateOn, then encode the sentences and store vectors. The subchunk catalog step reuses its indexed texts, vectors,
-and retrieval graph; it does not generate new retrieval embeddings.
-These offline outputs are retrieval and token-embedding artifacts. Inference
-processes the complete selected text prompt for each request.
+The common launcher runs the existing three construction steps: build retrieval DB, build subchunk catalog with
+LateOn, then encode the sentences and store vectors.
 
 For example, after constructing NQ:
 
@@ -112,8 +89,7 @@ sent-bge-small-v1.5-512-splitlong100-lateon/db
 sent-bge-small-v1.5-512-splitlong100-lateon/colbert_window
 ```
 
-Logs and the command plan are saved under `outputs/temp/`. Existing outputs are
-refused. Use `--stage retrieval|subchunks|embeddings` to run one stage, or supply
+Use `--stage retrieval|subchunks|embeddings` to run one stage, or supply
 `--source-db /path/to/an/existing/idle/db` to reuse a retrieval DB explicitly.
 
 ## Representative Experiment
